@@ -296,13 +296,8 @@ impl DnsHandler {
     }
 }
 
-/// Compute cache TTL using the server → zone → global cascade.
-///
-/// The authoritative TTL is the upper bound: RFC 1035 §3.2.1 forbids serving
-/// a record longer than its original TTL. `min_ttl` therefore only applies
-/// when the upstream explicitly opts out of caching (TTL=0) — it gives
-/// operators a knob to short-circuit that without overriding authoritative
-/// lifetimes for everything else.
+/// `min_ttl` only applies when the upstream sends TTL=0; otherwise the
+/// authoritative TTL is honored and capped by `max_ttl`.
 fn resolve_cache_ttl(
     server_cfg: Option<&DnsServerConfig>,
     zone: Option<&ZoneConfig>,
@@ -547,9 +542,6 @@ mod tests {
 
     #[test]
     fn authoritative_ttl_is_not_extended_by_min_ttl() {
-        // Regression: previously, a record TTL of 10s was clamped UP to the
-        // 60s min_ttl floor, causing leshy to serve stale records well past
-        // the authoritative expiry. The fix honors authoritative TTL as-is.
         let cfg = make_server_config(60, 3600, 30);
         let response = make_response_with_ttl(10);
 
@@ -568,8 +560,6 @@ mod tests {
 
     #[test]
     fn record_ttl_zero_falls_back_to_min_ttl() {
-        // Upstream TTL=0 means "do not cache". `min_ttl` is the operator's
-        // override knob to keep some short cache anyway.
         let cfg = make_server_config(45, 3600, 30);
         let response = make_response_with_ttl(0);
 

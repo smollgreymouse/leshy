@@ -43,14 +43,6 @@ impl DnsCache {
             let elapsed = entry.inserted_at.elapsed();
             if elapsed < entry.ttl {
                 let mut msg = entry.message.clone();
-                // RFC 1035 §3.2.1 / RFC 2181 §8: a record's TTL is "time
-                // remaining", not "original lifetime". Without decrementing,
-                // downstream resolvers re-cache the original TTL and total
-                // staleness compounds past the authoritative expiry.
-                // Sub-second elapsed truncates to 0, so within the first
-                // second after insert we may hand back the original TTL —
-                // accepted as a 1s rounding error rather than tracking
-                // millisecond TTLs that resolvers can't represent anyway.
                 decrement_record_ttls(&mut msg, elapsed.as_secs() as u32);
                 return Some(msg);
             }
@@ -217,40 +209,30 @@ mod tests {
 
     #[test]
     fn lookup_decrements_record_ttl_by_elapsed() {
-        // Regression: previously the cached message was returned verbatim,
-        // so downstream resolvers re-cached the original TTL and total
-        // staleness compounded past the authoritative expiry.
         let cache = DnsCache::new(100);
         let msg = make_response("example.com.", Ipv4Addr::new(1, 2, 3, 4), 300);
 
         cache.insert("example.com.", RecordType::A, msg, Duration::from_secs(300));
-
         std::thread::sleep(Duration::from_millis(1100));
 
-        let cached = cache.lookup("example.com.", RecordType::A).unwrap();
-        let returned_ttl = cached.answers()[0].ttl();
-        // The point is that decrement happened (TTL strictly less than the
-        // original 300). We don't pin a tight window because heavily loaded
-        // CI runners can sleep noticeably longer than requested.
-        assert!(
-            returned_ttl < 300,
-            "expected TTL < 300 after decrement, got {returned_ttl}"
-        );
+        let returned_ttl = cache
+            .lookup("example.com.", RecordType::A)
+            .unwrap()
+            .answers()[0]
+            .ttl();
+        assert!(returned_ttl < 300, "expected TTL < 300, got {returned_ttl}");
         assert!(
             returned_ttl >= 290,
-            "expected TTL >= 290 (at most 10s of scheduler slack), got {returned_ttl}"
+            "expected TTL >= 290, got {returned_ttl}"
         );
     }
 
     #[test]
     fn lookup_saturates_at_zero_for_old_records() {
-        // If for some reason a record's encoded TTL is shorter than the
-        // cache TTL, decrement must not underflow.
         let cache = DnsCache::new(100);
         let msg = make_response("example.com.", Ipv4Addr::new(1, 2, 3, 4), 0);
 
         cache.insert("example.com.", RecordType::A, msg, Duration::from_secs(60));
-
         std::thread::sleep(Duration::from_millis(1100));
 
         let cached = cache.lookup("example.com.", RecordType::A).unwrap();
