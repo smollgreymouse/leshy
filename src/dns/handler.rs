@@ -297,6 +297,12 @@ impl DnsHandler {
 }
 
 /// Compute cache TTL using the server → zone → global cascade.
+///
+/// The authoritative TTL is the upper bound: RFC 1035 §3.2.1 forbids serving
+/// a record longer than its original TTL. `min_ttl` therefore only applies
+/// when the upstream explicitly opts out of caching (TTL=0) — it gives
+/// operators a knob to short-circuit that without overriding authoritative
+/// lifetimes for everything else.
 fn resolve_cache_ttl(
     server_cfg: Option<&DnsServerConfig>,
     zone: Option<&ZoneConfig>,
@@ -324,8 +330,9 @@ fn resolve_cache_ttl(
             .iter()
             .map(|r| r.ttl() as u64)
             .min()
-            .unwrap_or(min_ttl);
-        Duration::from_secs(record_min.clamp(min_ttl, max_ttl))
+            .unwrap_or(0);
+        let ttl = if record_min == 0 { min_ttl } else { record_min };
+        Duration::from_secs(ttl.min(max_ttl))
     }
 }
 
@@ -491,5 +498,100 @@ impl RequestHandler for DnsHandler {
                 response_handle.send_response(response).await.unwrap()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RouteFailureMode;
+    use hickory_proto::rr::{Name, RData, Record};
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+
+    fn make_server_config(min_ttl: u64, max_ttl: u64, negative_ttl: u64) -> ServerConfig {
+        ServerConfig {
+            listen_address: "0.0.0.0:53".parse().unwrap(),
+            default_upstream: vec!["1.1.1.1:53".parse().unwrap()],
+            route_failure_mode: RouteFailureMode::Fallback,
+            auto_reload: false,
+            config_dir: None,
+            cache_size: 1000,
+            cache_min_ttl: min_ttl,
+            cache_max_ttl: max_ttl,
+            cache_negative_ttl: negative_ttl,
+            route_aggregation_prefix: None,
+        }
+    }
+
+    fn make_response_with_ttl(ttl: u32) -> Message {
+        let mut msg = Message::new();
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NoError);
+        let mut record = Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            ttl,
+            RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(1, 2, 3, 4))),
+        );
+        record.set_record_type(RecordType::A);
+        msg.add_answer(record);
+        msg
+    }
+
+    fn make_nxdomain() -> Message {
+        let mut msg = Message::new();
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NXDomain);
+        msg
+    }
+
+    #[test]
+    fn authoritative_ttl_is_not_extended_by_min_ttl() {
+        // Regression: previously, a record TTL of 10s was clamped UP to the
+        // 60s min_ttl floor, causing leshy to serve stale records well past
+        // the authoritative expiry. The fix honors authoritative TTL as-is.
+        let cfg = make_server_config(60, 3600, 30);
+        let response = make_response_with_ttl(10);
+
+        let ttl = resolve_cache_ttl(None, None, &cfg, &response);
+        assert_eq!(ttl, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn authoritative_ttl_is_capped_by_max_ttl() {
+        let cfg = make_server_config(0, 300, 30);
+        let response = make_response_with_ttl(3600);
+
+        let ttl = resolve_cache_ttl(None, None, &cfg, &response);
+        assert_eq!(ttl, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn record_ttl_zero_falls_back_to_min_ttl() {
+        // Upstream TTL=0 means "do not cache". `min_ttl` is the operator's
+        // override knob to keep some short cache anyway.
+        let cfg = make_server_config(45, 3600, 30);
+        let response = make_response_with_ttl(0);
+
+        let ttl = resolve_cache_ttl(None, None, &cfg, &response);
+        assert_eq!(ttl, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn record_ttl_zero_with_min_ttl_zero_does_not_cache_long() {
+        let cfg = make_server_config(0, 3600, 30);
+        let response = make_response_with_ttl(0);
+
+        let ttl = resolve_cache_ttl(None, None, &cfg, &response);
+        assert_eq!(ttl, Duration::from_secs(0));
+    }
+
+    #[test]
+    fn nxdomain_uses_negative_ttl() {
+        let cfg = make_server_config(60, 3600, 15);
+        let response = make_nxdomain();
+
+        let ttl = resolve_cache_ttl(None, None, &cfg, &response);
+        assert_eq!(ttl, Duration::from_secs(15));
     }
 }

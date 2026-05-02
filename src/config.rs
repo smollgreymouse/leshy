@@ -33,7 +33,9 @@ pub struct ServerConfig {
     #[serde(default = "default_cache_size")]
     pub cache_size: usize,
 
-    /// Minimum TTL for cached responses (seconds)
+    /// Cache TTL applied only when the upstream sends TTL=0 (i.e. tells us
+    /// not to cache). For all other responses the authoritative TTL is
+    /// honored as-is, capped by `cache_max_ttl`.
     #[serde(default = "default_cache_min_ttl")]
     pub cache_min_ttl: u64,
 
@@ -67,7 +69,7 @@ fn default_cache_size() -> usize {
     1000
 }
 fn default_cache_min_ttl() -> u64 {
-    60
+    0
 }
 fn default_cache_max_ttl() -> u64 {
     3600
