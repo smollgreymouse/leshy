@@ -1,6 +1,6 @@
 # Leshy
 
-DNS-driven split-tunnel router. Resolves domains, installs kernel routes -- only the traffic that needs a VPN goes through a VPN. Zero manual IP management, no over-routing, no leaks. Rust, Linux + macOS.
+DNS-driven split-tunnel router. Resolves domains, installs kernel routes -- only the traffic that needs a VPN goes through a VPN. Zero manual IP management, no over-routing, no leaks. Rust, Linux + macOS + Windows.
 
 ```mermaid
 flowchart LR
@@ -140,7 +140,7 @@ This ensures private network traffic (home router, local printers, etc.) bypasse
 - **IP exclusion ranges** -- in exclusive zones, `static_routes` skip route installation for resolved IPs in those CIDRs
 - **Upstream failover** -- tries DNS servers in order, falls over on failure
 - **VPN reconnect** -- device file disappears/reappears as VPN disconnects/connects
-- **Linux + macOS** -- rtnetlink on Linux, `/sbin/route` on macOS
+- **Linux + macOS + Windows** -- rtnetlink on Linux, `/sbin/route` on macOS, IP Helper API (`CreateIpForwardEntry2`) on Windows
 
 ## Running as a Service
 
@@ -160,7 +160,7 @@ sudo leshy service uninstall
 sudo leshy service uninstall --name leshy-corp
 ```
 
-On Linux this creates a systemd unit with `CAP_NET_ADMIN` + `CAP_NET_BIND_SERVICE`. On macOS it creates a launchd plist with `KeepAlive` + `RunAtLoad`.
+On Linux this creates a systemd unit with `CAP_NET_ADMIN` + `CAP_NET_BIND_SERVICE`. On macOS it creates a launchd plist with `KeepAlive` + `RunAtLoad`. On Windows it registers a Windows service (auto-start, run as LocalSystem, restart on failure) and requires an elevated prompt.
 
 You can also run leshy directly:
 
@@ -178,8 +178,14 @@ echo "$TUNDEV" > /run/vpn/corporate.dev
 
 Leshy reads this file on each DNS query. When the file disappears (VPN disconnects), route addition fails gracefully and DNS responses are still returned.
 
+On Windows the device file contains the adapter alias as shown by
+`Get-NetAdapter` (for example `AmneziaVPN`), matched case-insensitively; a bare
+interface index written as decimal digits also works. See
+[docs/windows.md](docs/windows.md) for the Windows-specific setup.
+
 ### Guides
 
+- **[Windows Setup](docs/windows.md)** -- run Leshy natively on Windows: IP Helper routing, service installation, device-file naming
 - **[OpenConnect (Cisco AnyConnect) Split Tunnel](docs/openconnect-split-tunnel.md)** -- connect to a Cisco VPN without it taking over your default route; Leshy routes only corporate traffic through the tunnel
 - **[SSH Tunnel + tun2socks](docs/ssh-tun2socks.md)** -- turn an SSH connection into a routable tunnel device; route selected domains through a remote server without a full VPN
 
@@ -223,6 +229,12 @@ src/
     aggregator.rs       CIDR route aggregation (/32 → wider prefixes)
     linux.rs            Linux rtnetlink operations
     macos.rs            macOS /sbin/route operations
+    windows.rs          Windows IP Helper operations
+  service/
+    mod.rs              Service install entry point
+    linux.rs            systemd unit installation
+    macos.rs            launchd plist installation
+    windows.rs          Windows service (SCM) installation
   reload.rs             Hot-reload config watcher
   zones/
     matcher.rs          Domain/pattern matching for zones

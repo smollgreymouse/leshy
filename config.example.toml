@@ -40,6 +40,8 @@ cache_negative_ttl = 30
 name = "corporate"
 route_type = "dev"                               # Route via network device
 route_target = "/run/vpn/corporate.dev"          # File containing device name (e.g., "tun0")
+                                                 # Windows: adapter alias as shown by Get-NetAdapter
+                                                 # (e.g. "C:\\ProgramData\\leshy\\corporate.dev" containing "AmneziaVPN")
 domains = ["internal.company.com", "jira.company.com"]
 patterns = ["corp"]  # Regex: matches any domain containing "corp"
 

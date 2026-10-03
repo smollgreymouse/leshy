@@ -2,12 +2,20 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "windows")]
+const DEFAULT_CONFIG: &str = r"C:\ProgramData\leshy\config.toml";
+#[cfg(not(target_os = "windows"))]
 const DEFAULT_CONFIG: &str = "/etc/leshy/config.toml";
 const DEFAULT_NAME: &str = "leshy";
+#[cfg(target_os = "windows")]
+const FALLBACK_BINARY: &str = r"C:\Program Files\leshy\leshy.exe";
+#[cfg(not(target_os = "windows"))]
 const FALLBACK_BINARY: &str = "/usr/local/bin/leshy";
 
 fn detect_binary() -> PathBuf {
@@ -42,7 +50,10 @@ pub fn install(name: Option<&str>, config: Option<&Path>) -> Result<()> {
     #[cfg(target_os = "macos")]
     macos::install(name, &binary, config)?;
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    windows::install(name, &binary, config)?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     anyhow::bail!("service install is not supported on this platform");
 
     Ok(())
@@ -59,7 +70,10 @@ pub fn uninstall(name: Option<&str>) -> Result<()> {
     #[cfg(target_os = "macos")]
     macos::uninstall(name)?;
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    windows::uninstall(name)?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     anyhow::bail!("service uninstall is not supported on this platform");
 
     Ok(())

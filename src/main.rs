@@ -75,18 +75,27 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+/// Default config search paths, used when no --config argument is given.
+/// The last entry is the fallback path reported when nothing exists.
+fn default_config_candidates() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = vec![
+            PathBuf::from("leshy.toml"),  // Current directory
+            PathBuf::from("config.toml"), // Current directory
+            PathBuf::from(r"C:\ProgramData\leshy\config.toml"),
+        ];
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            candidates.push(PathBuf::from(appdata).join(r"leshy\config.toml"));
+        }
+        candidates
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\leshy\config.toml"))
+    }
 
-    let config_path = if let Some(path) = config_arg {
-        path
-    } else {
-        // Try common locations
+    #[cfg(not(target_os = "windows"))]
+    {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let candidates = vec![
             PathBuf::from("leshy.toml"),  // Current directory
@@ -99,6 +108,21 @@ async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
             .into_iter()
             .find(|p| p.exists())
             .unwrap_or_else(|| PathBuf::from("/etc/leshy/config.toml"))
+    }
+}
+
+async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let config_path = if let Some(path) = config_arg {
+        path
+    } else {
+        default_config_candidates()
     };
 
     tracing::info!(config_path = ?config_path, "Loading configuration");
