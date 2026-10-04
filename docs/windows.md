@@ -30,6 +30,32 @@ leshy service install        # register the Windows service (elevated prompt)
 leshy service uninstall
 ```
 
+### Ready-made package
+
+`windows/build-package.ps1` produces an installable NSIS setup and a portable
+zip (see [windows/README.md](../windows/README.md)). After installing, the
+machine-wide layout is:
+
+| Path | Purpose |
+|------|---------|
+| `C:\Program Files\leshy\leshy.exe` | binary |
+| `C:\ProgramData\leshy\config.toml` | machine config (seeded from `windows/default-config.toml`) |
+| `C:\ProgramData\leshy\run\*.dev` | device files for `route_type = "dev"` zones |
+| `C:\ProgramData\leshy\logs\leshy.log` | service logs (daily rotation) |
+
+Per-user configs still work via the search order above (`%APPDATA%\leshy`),
+but the service always reads the config path it was registered with.
+
+## Running as a Windows service
+
+A process launched by the Service Control Manager must answer the SCM
+handshake or it is killed with error 1053. Leshy handles this natively:
+the service is registered with `--service <name> <config>` launch arguments,
+and on such a launch the binary attaches to the SCM instead of the console —
+reports StartPending/Running, runs the same server as the CLI, and stops
+cleanly when the SCM asks. Because stdout is invisible under the SCM,
+service-mode logging goes to `<config dir>\logs\leshy.log`.
+
 The service is created with `ServiceStartType::AutoStart`, runs as
 LocalSystem (which holds the right to modify the routing table), and restarts
 5 seconds after a failure via `SERVICE_CONFIG_FAILURE_ACTIONS` — the Windows
@@ -65,8 +91,8 @@ queries and only logs the failed route additions.
 Same contract as Linux/macOS, adapted to Windows naming:
 
 ```text
-C:\ProgramData\leshy\corporate.dev
----------------------------------
+C:\ProgramData\leshy\run\corporate.dev
+--------------------------------------
 AmneziaVPN
 ```
 

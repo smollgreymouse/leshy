@@ -1,0 +1,42 @@
+# Leshy default configuration.
+# Installed to C:\ProgramData\leshy\config.toml (kept on upgrade/uninstall).
+#
+# Machine-wide layout:
+#   C:\ProgramData\leshy\config.toml  -- this file
+#   C:\ProgramData\leshy\run\*.dev    -- device files written by the orchestrator
+#   C:\ProgramData\leshy\logs\        -- service-mode logs (daily rolling)
+
+[server]
+listen_address = "127.0.0.1:53053"
+default_upstream = ["1.1.1.1:53", "8.8.8.8:53"]
+
+# What to do when route installation fails:
+# - "fallback": still return the DNS answer (recommended for manual setups)
+# - "servfail": fail the query, so unresolved+unrouted traffic dies (kill switch)
+route_failure_mode = "fallback"
+
+# ---- Example zone: route corporate domains through a VPN adapter ------------
+# The device file must contain the adapter alias shown by Get-NetAdapter
+# (for example "AmneziaVPN"). Write it when the VPN connects:
+#   Set-Content -Path C:\ProgramData\leshy\run\corporate.dev -Value "AmneziaVPN"
+# and delete it when the VPN disconnects. Leshy re-reads the file on every
+# route installation, so reconnects are picked up without a restart.
+#
+# [[zones]]
+# name = "corporate"
+# mode = "inclusive"
+# dns_servers = []
+# route_type = "dev"
+# route_target = 'C:\ProgramData\leshy\run\corporate.dev'
+# domains = ["internal.company.com", "git.company.com"]
+
+# ---- Example zone: catch-all through a VPN with a static gateway ------------
+# [[zones]]
+# name = "vpn-catchall"
+# mode = "exclusive"
+# dns_servers = []
+# route_type = "via"
+# route_target = "10.8.0.1"
+# domains = []
+# patterns = []
+# static_routes = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]

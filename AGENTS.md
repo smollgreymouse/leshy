@@ -54,6 +54,7 @@ Both must pass before pushing.
 ```
 src/
   config.rs          — Config parsing (TOML, zones, dns_servers)
+  server.rs          — Server startup shared by CLI and service modes
   dns/
     handler.rs       — DNS request handler, upstream forwarding, caching
     cache.rs         — DNS response cache
@@ -67,10 +68,15 @@ src/
   service/
     linux.rs         — systemd unit install/uninstall
     macos.rs         — launchd plist install/uninstall
-    windows.rs       — Windows service install/uninstall (SCM, restart-on-failure)
+    windows.rs       — Windows service install/uninstall + SCM runtime entry
   reload.rs          — Hot-reload config watcher
   zones/
     matcher.rs       — Domain/pattern matching for zones
+windows/
+  build-package.ps1  — Release build + NSIS installer + portable zip
+  leshy.nsi          — NSIS installer script
+  default-config.toml — Machine config seed (C:\ProgramData\leshy\config.toml)
+  install-service.ps1 / uninstall-service.ps1 — Portable service scripts
 
 tests/
   integration_test.rs      — Config validation test (no network/root needed)

@@ -5,6 +5,9 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(target_os = "windows")]
+pub use windows::{dispatch_service, SERVICE_LAUNCH_FLAG};
+
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 

@@ -162,6 +162,9 @@ sudo leshy service uninstall --name leshy-corp
 
 On Linux this creates a systemd unit with `CAP_NET_ADMIN` + `CAP_NET_BIND_SERVICE`. On macOS it creates a launchd plist with `KeepAlive` + `RunAtLoad`. On Windows it registers a Windows service (auto-start, run as LocalSystem, restart on failure) and requires an elevated prompt.
 
+A ready-made Windows installer and portable zip are produced by
+[windows/build-package.ps1](windows/README.md).
+
 You can also run leshy directly:
 
 ```bash
