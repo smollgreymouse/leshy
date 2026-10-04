@@ -3,6 +3,8 @@ mod aggregator;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 use crate::config::{RouteType, ZoneConfig};
 use aggregator::{RouteAction, RouteAggregator};
@@ -17,7 +19,12 @@ use tokio::sync::{Mutex, RwLock};
 use linux::LinuxRouteAdder as PlatformRouteAdder;
 #[cfg(target_os = "macos")]
 use macos::MacosRouteAdder as PlatformRouteAdder;
+#[cfg(target_os = "windows")]
+use windows::WindowsRouteAdder as PlatformRouteAdder;
 
+// async_trait's generated #[must_use] on boxed futures trips this lint on
+// newer clippy versions; the futures are always awaited internally.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub(crate) trait RouteAdder: Send + Sync {
     async fn add_via_route(&self, ip: IpAddr, prefix_len: u8, gateway: &str) -> Result<()>;
