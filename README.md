@@ -19,6 +19,10 @@ flowchart LR
 # Install
 cargo install leshy
 
+# ...or download a prebuilt binary from the Releases page
+# (linux x86_64/aarch64, macOS aarch64/x86_64, Windows installer + portable zip;
+#  checksums in checksums.txt)
+
 # Write your config
 sudo mkdir -p /etc/leshy
 sudo vim /etc/leshy/config.toml   # see Configuration below
