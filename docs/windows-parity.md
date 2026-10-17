@@ -99,6 +99,38 @@ Gaps and risks:
 * **Config parsing is tested only through integration configs** (`tests/*.toml`),
   not by unit tests over `src/config.rs`.
 
+## Windows scenario suite (port of the Linux Docker suite)
+
+`windows/tests/scenarios.ps1` ports the routing-relevant scenarios of
+`tests/docker/test_integration.py` and asserts them through the route table:
+
+| Scenario | Result on the VM |
+|----------|------------------|
+| S1 basic forwarding (`example.com` answered) | PASS |
+| S2 route via device (`chatgpt.com` -> `kk-awg0`) | PASS |
+| S3 route via gateway (`openai.com` -> `192.168.1.1`) | PASS |
+| S4 fallback on route failure (dead device file, answer still returned, no route) | PASS |
+| S5 servfail on route failure (kill switch, no answer) | PASS after the fix below |
+| S6 wildcard `*.openai.com` matches a subdomain | **open** - the subdomain resolves, but no host route lands on `kk-awg0` |
+| S7 vpn reconnect (device file removed -> no route, restored -> route) | PASS |
+| S8 zone `dns_servers` | PASS |
+
+**Defect fixed by this suite: `route_failure_mode` was dead code.**
+`add_routes_from_response` installed routes inside a detached `tokio::spawn`, so a
+routing failure could never influence the answer; the handler only logged
+`Failed to add route` and answered anyway. `servfail`, documented as the kill
+switch, therefore behaved exactly like `fallback` on every platform. The function
+now awaits the route installation, returns whether it succeeded, and both the
+cache-hit and upstream paths answer `SERVFAIL` when the mode says so. Verified on
+the VM: the log shows `Route failure with servfail mode: refusing the answer` and
+the client receives `response:ServFail`.
+
+**Open item S6.** With `domains = ["*.openai.com"]` the subdomain resolves through
+the zone, but no route is installed on the tunnel adapter, so either the wildcard
+does not match in `domains` (while the matcher's unit tests cover wildcards) or
+the route add fails and `fallback` hides it. The next run needs the log window for
+that query to separate the two.
+
 ## Privileged route isolation (Windows)
 
 `windows/tests/route-isolation.ps1` is the first automated test that exercises the

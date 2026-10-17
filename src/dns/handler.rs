@@ -1,4 +1,4 @@
-use crate::config::{Config, DnsProtocol, DnsServerConfig, ServerConfig, ZoneConfig, ZoneMode};
+use crate::config::{Config, DnsProtocol, DnsServerConfig, RouteFailureMode, ServerConfig, ZoneConfig, ZoneMode};
 use crate::dns::cache::DnsCache;
 use crate::routing::RouteManager;
 use crate::zones::{MatchedZone, ZoneMatcher};
@@ -176,10 +176,16 @@ impl DnsHandler {
         })
     }
 
-    async fn add_routes_from_response(&self, message: &Message, qname: &str) {
+    /// Install host routes for the addresses in `message`.
+    ///
+    /// Returns `false` when at least one route could not be installed, so the
+    /// caller can honour `route_failure_mode = "servfail"`. The work is awaited
+    /// deliberately: a fire-and-forget task can never report a failure, which is
+    /// how the documented kill switch had ended up as dead code.
+    async fn add_routes_from_response(&self, message: &Message, qname: &str) -> bool {
         let matched_zone = match self.matcher.find_zone(qname) {
             Some(z) => z,
-            None => return, // No zone match, no routing needed
+            None => return true, // No zone match, no routing needed
         };
 
         // Extract A and AAAA records from answers
@@ -201,36 +207,43 @@ impl DnsHandler {
 
         if ips.is_empty() {
             tracing::debug!(qname = qname, "No A/AAAA records in response");
-            return;
+            return true;
         }
 
-        // Add routes in background (don't block DNS response)
-        let route_manager = Arc::clone(&self.route_manager);
-        let qname = qname.to_string();
-
-        tokio::spawn(async move {
-            let manager = route_manager.read().await;
-            for ip in ips {
-                // Per-zone exclusion check (exclusive zones skip IPs in their CIDR ranges)
-                if matched_zone.is_excluded(ip) {
-                    tracing::debug!(
-                        ip = %ip,
-                        zone = matched_zone.config.name,
-                        "IP is in zone's excluded range, skipping route"
-                    );
-                    continue;
-                }
-                if let Err(e) = manager.add_route(ip, &matched_zone.config).await {
-                    tracing::warn!(
-                        ip = %ip,
-                        zone = matched_zone.config.name,
-                        qname = qname,
-                        error = %e,
-                        "Failed to add route"
-                    );
-                }
+        let manager = self.route_manager.read().await;
+        let mut installed = true;
+        let mut failures = 0usize;
+        for ip in ips {
+            // Per-zone exclusion check (exclusive zones skip IPs in their CIDR ranges)
+            if matched_zone.is_excluded(ip) {
+                tracing::debug!(
+                    ip = %ip,
+                    zone = matched_zone.config.name,
+                    "IP is in zone's excluded range, skipping route"
+                );
+                continue;
             }
-        });
+            if let Err(e) = manager.add_route(ip, &matched_zone.config).await {
+                failures += 1;
+                installed = false;
+                tracing::warn!(
+                    ip = %ip,
+                    zone = matched_zone.config.name,
+                    qname = qname,
+                    error = %e,
+                    "Failed to add route"
+                );
+            }
+        }
+        if !installed {
+            tracing::warn!(
+                qname = qname,
+                zone = matched_zone.config.name,
+                failures = failures,
+                "Route installation incomplete"
+            );
+        }
+        installed
     }
 
     /// Get current config
@@ -356,8 +369,18 @@ impl RequestHandler for DnsHandler {
             if let Some(cached) = self.cache.lookup(&qname, qtype) {
                 tracing::debug!(qname = qname, qtype = ?qtype, "Cache hit");
 
-                // Still add routes from cached response
-                self.add_routes_from_response(&cached, &qname).await;
+                // Still add routes from the cached response; a routing failure
+                // has to be able to turn into SERVFAIL, so wait for the result.
+                let routes_ok = self.add_routes_from_response(&cached, &qname).await;
+                if !routes_ok && self.config.server.route_failure_mode == RouteFailureMode::Servfail {
+                    tracing::warn!(
+                        qname = qname,
+                        "Route failure with servfail mode: refusing the cached answer"
+                    );
+                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let servfail = builder.error_msg(request.header(), ResponseCode::ServFail);
+                    return response_handle.send_response(servfail).await.unwrap();
+                }
 
                 // Use the current request's ID so the client matches the response
                 let mut header = *cached.header();
@@ -460,8 +483,18 @@ impl RequestHandler for DnsHandler {
                     "Got response"
                 );
 
-                // Add routes for resolved IPs (async, don't wait)
-                self.add_routes_from_response(&response, &qname).await;
+                // Install routes for the resolved IPs before answering, so the
+                // configured failure mode can act on a routing failure.
+                let routes_ok = self.add_routes_from_response(&response, &qname).await;
+                if !routes_ok && self.config.server.route_failure_mode == RouteFailureMode::Servfail {
+                    tracing::warn!(
+                        qname = qname,
+                        "Route failure with servfail mode: refusing the answer"
+                    );
+                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let servfail = builder.error_msg(request.header(), ResponseCode::ServFail);
+                    return response_handle.send_response(servfail).await.unwrap();
+                }
 
                 // Cache the response (skip ServFail)
                 if self.cache.is_enabled() && response.response_code() != ResponseCode::ServFail {
