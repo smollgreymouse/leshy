@@ -11,6 +11,10 @@ Builds and installs Leshy on Windows as a native service.
 - `windows/dist/leshy-<version>-windows-x64-portable.zip` — same payload for
   scripted/portable installs via `install-service.ps1`.
 
+Without makensis the script now builds only the portable bundle and prints a
+warning instead of failing, so a machine that cannot install NSIS still produces
+an installable artifact.
+
 ## Build
 
 ```powershell

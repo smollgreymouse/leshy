@@ -47,27 +47,30 @@ foreach ($item in $payload) {
     Copy-Item (Join-Path $repoRoot $item) $stage
 }
 
-# 4. Installer via NSIS.
-$makensis = @()
-if ($MakensisPath) { $makensis += $MakensisPath }
+# 4. Installer via NSIS. Optional: without makensis only the portable bundle is
+# built, which is the documented fallback for machines that cannot install NSIS.
+$candidates = @()
+if ($MakensisPath) { $candidates += $MakensisPath }
 $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
-if ($cmd) { $makensis += $cmd.Source }
-$makensis += @(
-    (Join-Path $env:ProgramFiles "NSIS\makensis.exe"),
-    (Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"),
-    (Join-Path $env:LOCALAPPDATA "Programs\NSIS\makensis.exe")
-)
-$makensis = $makensis | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-if (-not $makensis) {
-    throw "makensis.exe not found. Install NSIS or pass -MakensisPath."
+if ($cmd) { $candidates += $cmd.Source }
+$bases = @($env:ProgramFiles, ${env:ProgramFiles(x86)})
+if ($env:LOCALAPPDATA) { $bases += (Join-Path $env:LOCALAPPDATA "Programs") }
+foreach ($base in $bases) {
+    if ($base) { $candidates += (Join-Path $base "NSIS\makensis.exe") }
 }
-
-Push-Location $windowsDir
-try {
-    & $makensis /DVERSION=$version ".\leshy.nsi"
-    if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
-} finally {
-    Pop-Location
+$makensis = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if ($makensis) {
+    Push-Location $windowsDir
+    try {
+        & $makensis /DVERSION=$version ".\leshy.nsi"
+        if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+    } finally {
+        Pop-Location
+    }
+} elseif ($MakensisPath) {
+    throw "makensis.exe not found at the given -MakensisPath"
+} else {
+    Write-Warning "makensis.exe not found: skipping the installer, building the portable bundle only."
 }
 
 # 5. Portable zip (same payload, service scripts instead of an installer).
