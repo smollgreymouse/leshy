@@ -266,6 +266,26 @@ impl RouteAggregator {
 
     /// Register a static route's IPs so aggregates don't overlap with them.
     /// Does NOT return actions (static routes are installed directly).
+    /// Prefix the aggregator already installed for this address, if any.
+    ///
+    /// Used by the manager to re-verify the kernel row before trusting the
+    /// dedupe: the aggregator's map is bookkeeping, not the routing table.
+    pub fn installed_prefix(&self, ip: Ipv4Addr) -> Option<u8> {
+        let bits = u32::from(ip);
+        self.installed
+            .keys()
+            .filter(|(network, prefix)| {
+                let mask = if *prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - *prefix as u32)
+                };
+                *network == (bits & mask)
+            })
+            .map(|(_, prefix)| *prefix)
+            .max()
+    }
+
     pub fn register_static_ip(&mut self, ip: Ipv4Addr, zone_name: &str) {
         self.known_ips.insert(ip, zone_name.to_string());
     }

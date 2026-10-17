@@ -1,6 +1,6 @@
 [package]
 name = "leshy"
-version = "0.4.0"
+version = "0.5.1"
 edition = "2021"
 description = "DNS-driven split-tunnel router. Resolves domains, installs kernel routes — only the traffic that needs a VPN goes through a VPN."
 license = "MIT"
@@ -60,6 +60,20 @@ notify = "6"
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+] }
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Services",
+] }
+tracing-appender = "0.2"
 
 [dev-dependencies]
 hickory-client = "0.24"

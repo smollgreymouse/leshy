@@ -4,7 +4,7 @@
 
 Leshy is a DNS server for VPN and network routing. It intercepts DNS queries, forwards them to zone-specific or default upstream servers, and adds IP routes for resolved addresses through VPN tunnels or gateways.
 
-**Stack:** Rust (2021 edition), Hickory DNS, Tokio, rtnetlink (Linux), TOML config.
+**Stack:** Rust (2021 edition), Hickory DNS, Tokio, rtnetlink (Linux), IP Helper (Windows), TOML config.
 
 ## Local Workflow (Before Deploying)
 
@@ -54,6 +54,7 @@ Both must pass before pushing.
 ```
 src/
   config.rs          — Config parsing (TOML, zones, dns_servers)
+  server.rs          — Server startup shared by CLI and service modes
   dns/
     handler.rs       — DNS request handler, upstream forwarding, caching
     cache.rs         — DNS response cache
@@ -63,9 +64,19 @@ src/
     aggregator.rs    — CIDR route aggregation (compress /32s into wider prefixes)
     linux.rs         — Linux rtnetlink route operations
     macos.rs         — macOS /sbin/route operations
+    windows.rs       — Windows IP Helper route operations (CreateIpForwardEntry2)
+  service/
+    linux.rs         — systemd unit install/uninstall
+    macos.rs         — launchd plist install/uninstall
+    windows.rs       — Windows service install/uninstall + SCM runtime entry
   reload.rs          — Hot-reload config watcher
   zones/
     matcher.rs       — Domain/pattern matching for zones
+windows/
+  build-package.ps1  — Release build + NSIS installer + portable zip
+  leshy.nsi          — NSIS installer script
+  default-config.toml — Machine config seed (C:\ProgramData\leshy\config.toml)
+  install-service.ps1 / uninstall-service.ps1 — Portable service scripts
 
 tests/
   integration_test.rs      — Config validation test (no network/root needed)
