@@ -75,8 +75,12 @@ impl ZoneMatcher {
         let mut built = Vec::with_capacity(zones.len());
 
         for zone_cfg in zones {
-            let domain_set: HashSet<String> =
-                zone_cfg.domains.iter().map(|d| d.to_lowercase()).collect();
+            let domain_set: HashSet<String> = zone_cfg
+                .domains
+                .iter()
+                .map(|d| normalize_domain_entry(d))
+                .filter(|d| !d.is_empty())
+                .collect();
 
             let pattern_set = RegexSet::new(&zone_cfg.patterns).map_err(|e| {
                 anyhow::anyhow!("Zone '{}': invalid regex pattern: {}", zone_cfg.name, e)
@@ -171,6 +175,18 @@ impl ZoneMatcher {
     }
 }
 
+/// Normalise one `domains` entry.
+///
+/// Matching walks the suffixes of the queried name, so `example.com` already
+/// covers every subdomain. A `*.` prefix is a wildcard marker rather than part
+/// of a name: keeping it verbatim made the entry match nothing at all, and the
+/// shipped lists carried the bare name next to it, which hid the defect.
+fn normalize_domain_entry(entry: &str) -> String {
+    let lowered = entry.trim().to_lowercase();
+    let without_wildcard = lowered.strip_prefix("*.").unwrap_or(&lowered);
+    without_wildcard.trim_end_matches('.').to_string()
+}
+
 /// Check whether a domain matches any entry in the domain set or pattern set.
 fn matches_entries(
     domain_set: &HashSet<String>,
@@ -240,6 +256,32 @@ fn parse_cidr_range(cidr: &str) -> anyhow::Result<CidrRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildcard_entry_matches_subdomains() {
+        // Regression: "*.example.com" used to match nothing because the suffix
+        // walk compares real suffixes against the literal entry.
+        let matcher = ZoneMatcher::new(vec![test_zone("wild", vec!["*.example.com"], vec![])]).unwrap();
+        assert!(matcher.find_zone("api.example.com").is_some());
+        assert!(matcher.find_zone("deep.api.example.com").is_some());
+        assert!(matcher.find_zone("example.com").is_some());
+        assert!(matcher.find_zone("example.org").is_none());
+    }
+
+    #[test]
+    fn domain_entries_ignore_case_and_trailing_dot() {
+        let matcher = ZoneMatcher::new(vec![test_zone("mixed", vec!["Example.COM."], vec![])]).unwrap();
+        assert!(matcher.find_zone("api.example.com").is_some());
+        assert!(matcher.find_zone("example.com.").is_some());
+        assert!(matcher.find_zone("api.example.org").is_none());
+    }
+
+    #[test]
+    fn bare_wildcard_entry_is_ignored() {
+        let matcher = ZoneMatcher::new(vec![test_zone("odd", vec!["*.", "*.ok.example"], vec![])]).unwrap();
+        assert!(matcher.find_zone("ok.example").is_some());
+        assert!(matcher.find_zone("anything.test").is_none());
+    }
 
     fn test_zone(name: &str, domains: Vec<&str>, patterns: Vec<&str>) -> ZoneConfig {
         ZoneConfig {

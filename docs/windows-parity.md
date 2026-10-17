@@ -111,7 +111,7 @@ Gaps and risks:
 | S3 route via gateway (`openai.com` -> `192.168.1.1`) | PASS |
 | S4 fallback on route failure (dead device file, answer still returned, no route) | PASS |
 | S5 servfail on route failure (kill switch, no answer) | PASS after the fix below |
-| S6 wildcard `*.openai.com` matches a subdomain | **open** - the subdomain resolves, but no host route lands on `kk-awg0` |
+| S6 wildcard `*.openai.com` matches a subdomain | PASS after the matcher fix below |
 | S7 vpn reconnect (device file removed -> no route, restored -> route) | PASS |
 | S8 zone `dns_servers` | PASS |
 
@@ -125,11 +125,14 @@ cache-hit and upstream paths answer `SERVFAIL` when the mode says so. Verified o
 the VM: the log shows `Route failure with servfail mode: refusing the answer` and
 the client receives `response:ServFail`.
 
-**Open item S6.** With `domains = ["*.openai.com"]` the subdomain resolves through
-the zone, but no route is installed on the tunnel adapter, so either the wildcard
-does not match in `domains` (while the matcher's unit tests cover wildcards) or
-the route add fails and `fallback` hides it. The next run needs the log window for
-that query to separate the two.
+**Defect fixed by this suite: `*.` entries in `domains` matched nothing.**
+`matches_entries` walks the suffixes of the queried name and looks each suffix up
+in a set of literal entries, so `*.openai.com` never equalled a real suffix and the
+entry was dead. The shipped lists also carry the bare name, which hid the problem -
+and made S6 fail once the test relied on the wildcard alone. `domain_set` is now
+built through `normalize_domain_entry`, which strips the wildcard marker, lowercases
+and drops a trailing dot; three unit tests cover the wildcard, the case/trailing-dot
+forms and the degenerate `*.` entry.
 
 ## Privileged route isolation (Windows)
 

@@ -32,13 +32,19 @@ function Assert-True([bool]$condition, [string]$label) {
 }
 
 function Get-Answers([string]$name) {
-    try {
-        @(Resolve-DnsName $name -Server 127.0.0.1 -Type A -ErrorAction Stop |
-            Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
-    } catch {
-        Write-Host "    (query $name failed: $($_.Exception.Message.Trim()))"
-        @()
+    # Upstreams ride the tunnel and can need a moment after a service restart,
+    # so a single timeout must not fail a scenario.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $answers = @(Resolve-DnsName $name -Server 127.0.0.1 -Type A -ErrorAction Stop |
+                Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
+            if ($answers.Count -gt 0) { return $answers }
+        } catch {
+            Write-Host "    (query $name attempt ${attempt} failed: $($_.Exception.Message.Trim()))"
+        }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
     }
+    @()
 }
 
 function Set-Scenario([string]$zoneToml) {
@@ -110,9 +116,18 @@ try {
     Write-Host "`nS5 servfail on route failure (kill switch)"
     $FailureMode = 'servfail'
     Set-Scenario "[[zones]]`r`nname = ""dead""`r`nmode = ""inclusive""`r`ndns_servers = []`r`nroute_type = ""dev""`r`nroute_target = 'C:\ProgramData\Kikimora\leshy\vpn\does-not-exist.dev'`r`ndomains = [""example.com""]`r`nstatic_routes = [""1.1.1.1/32"", ""8.8.8.8/32""]"
-    $ips = Get-Answers 'example.com'
-    Assert-True ($ips.Count -eq 0) 'query fails instead of leaking to the direct path'
-    [void]$results.Add("S5 servfail: $(if ($ips.Count -eq 0) { 'no answer (kill switch honoured)' } else { 'ANSWER LEAKED' })")
+    $null = Get-Answers 'openai.com'   # warm the upstream, so a failure cannot come from a cold tunnel
+    $refused = $false
+    try {
+        $single = @(Resolve-DnsName 'example.com' -Server 127.0.0.1 -Type A -ErrorAction Stop |
+            Where-Object { $_.IPAddress })
+        if ($single.Count -eq 0) { $refused = $true } else { Write-Host "    (answer leaked: $($single | Out-String))" }
+    } catch {
+        $refused = $true
+        Write-Host "    (refused as expected: $($_.Exception.Message.Trim()))"
+    }
+    Assert-True $refused 'query fails instead of leaking to the direct path'
+    [void]$results.Add("S5 servfail: $(if ($refused) { 'no answer (kill switch honoured)' } else { 'ANSWER LEAKED' })")
 
     Write-Host "`nS6 pattern matching"
     $FailureMode = 'fallback'
