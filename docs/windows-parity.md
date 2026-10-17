@@ -93,12 +93,33 @@ Gaps and risks:
 * **`dns/handler.rs` is the largest untested surface** (587 lines, 5 tests): zone
   selection, upstream choice, `route_failure_mode`, and now the Windows route
   installation all funnel through it.
-* **Windows system calls stay manual.** `CreateIpForwardEntry2` / `DeleteIpForwardEntry2`
-  need elevation, so the only automated Windows evidence is the pure helpers
-  (`SOCKADDR` conversions, alias resolution); route behaviour is validated by
-  smoke runs like the one that found defect 1.
+* **Windows route syscalls are covered by one privileged test since 2026-10-17:**
+  `windows/tests/route-isolation.ps1` (see below). Everything else about the
+  Windows route path is still manual, because elevation cannot be assumed in CI.
 * **Config parsing is tested only through integration configs** (`tests/*.toml`),
   not by unit tests over `src/config.rs`.
+
+## Privileged route isolation (Windows)
+
+`windows/tests/route-isolation.ps1` is the first automated test that exercises the
+Windows route system calls. Run it elevated on a host whose tunnels are up:
+
+```powershell
+.\windows\tests\route-isolation.ps1 -DeviceDir C:\ProgramData\Kikimora\leshy\vpn
+```
+
+It backs up the service config, swaps in one zone per tunnel (`awg`, `oc`, `xray`
+aimed at the device files the orchestrator publishes), restarts the service and
+asserts, for every resolved address of `chatgpt.com`, `gitlab.sca.ad-tech.ru` and
+`telegram.org`, that the host route lands on that zone's own adapter, that
+`Find-NetRoute` selects it, and that no address carries a route on either of the
+other two tunnels. It then removes the `xray` device file, flushes the route and
+the cache, and asserts the traffic does not fall back to another tunnel. The
+previous config is restored and the service restarted in a `finally` block.
+
+Last run on the Windows 10 VM (three tunnels up): **20 assertions, all PASS,
+exit 0**, with `104.18.32.47`/`172.64.155.209` on `kk-awg0`,
+`172.25.41.169` on `kk-oc0` and `149.154.167.99` on `kk-xray-win0`.
 
 ## Suggested next steps
 
