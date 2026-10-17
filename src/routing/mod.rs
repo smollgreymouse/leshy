@@ -30,6 +30,13 @@ pub(crate) trait RouteAdder: Send + Sync {
     async fn add_via_route(&self, ip: IpAddr, prefix_len: u8, gateway: &str) -> Result<()>;
     async fn add_dev_route(&self, ip: IpAddr, prefix_len: u8, device: &str) -> Result<()>;
     async fn remove_route(&self, ip: IpAddr, prefix_len: u8) -> Result<()>;
+
+    /// Report whether the kernel already routes `ip/prefix_len` towards the
+    /// zone's target. Platforms that cannot inspect their table return `true`
+    /// and keep the historical "trust the bookkeeping" behaviour.
+    async fn route_matches(&self, _ip: IpAddr, _prefix_len: u8, _zone: &ZoneConfig) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 pub struct RouteManager {
@@ -60,12 +67,36 @@ impl RouteManager {
     }
 
     async fn add_route_v4(&self, ip: Ipv4Addr, zone: &ZoneConfig) -> Result<()> {
-        let actions = {
+        let (actions, known_prefix) = {
             let mut agg = self.aggregator.lock().await;
-            agg.process_ip(ip, &zone.name, zone.route_type, &zone.route_target)
+            let actions = agg.process_ip(ip, &zone.name, zone.route_type, &zone.route_target);
+            (actions, agg.installed_prefix(ip).unwrap_or(32))
         };
 
         if actions.is_empty() {
+            // The aggregator remembers this prefix, but the kernel is the source
+            // of truth: a row deleted or replaced outside Leshy has to be
+            // restored, otherwise the zone silently loses its path.
+            let matches = self
+                .adder
+                .route_matches(IpAddr::V4(ip), known_prefix, zone)
+                .await
+                .unwrap_or(true);
+            if !matches {
+                tracing::info!(
+                    ip = %ip,
+                    prefix_len = known_prefix,
+                    zone = zone.name,
+                    "Route missing or pointing elsewhere in the kernel, restoring"
+                );
+                let action = RouteAction::Add {
+                    network: ip,
+                    prefix_len: known_prefix,
+                    route_type: zone.route_type,
+                    route_target: zone.route_target.clone(),
+                };
+                self.execute_action(&action).await?;
+            }
             return Ok(());
         }
 

@@ -1,4 +1,5 @@
 use super::RouteAdder;
+use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -325,9 +326,46 @@ fn delete_routes(family: ADDRESS_FAMILY, ip: IpAddr, prefix_len: u8) -> Result<(
 fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result<()> {
     // SAFETY: row is a fully initialized MIB_IPFORWARD_ROW2.
     let err = unsafe { CreateIpForwardEntry2(row) };
-    if err.is_ok() || err == ERROR_OBJECT_ALREADY_EXISTS {
+    if err.is_ok() {
         tracing::debug!(ip = %ip, kind = label, "Route added successfully");
         return Ok(());
+    }
+    if err == ERROR_OBJECT_ALREADY_EXISTS {
+        // A row for this prefix exists, but Windows keys rows by prefix,
+        // interface and next hop, so it may point somewhere else entirely - the
+        // physical default installed before the tunnel came up is the common
+        // case. Keeping it would silently route traffic around the tunnel, so
+        // replace it the way the Kikimora Go route owner does.
+        let family = if ip.is_ipv6() { AF_INET6 } else { AF_INET };
+        let desired = *row;
+        let prefix_len = desired.DestinationPrefix.PrefixLength;
+        let mut replaced = false;
+        for existing in find_route_rows(family, ip, prefix_len)? {
+            if existing.InterfaceIndex == desired.InterfaceIndex
+                && existing.Metric == desired.Metric
+                && sockaddr_to_ip(&existing.NextHop) == sockaddr_to_ip(&desired.NextHop)
+            {
+                tracing::debug!(ip = %ip, kind = label, "Route already present with the requested parameters");
+                return Ok(());
+            }
+            // SAFETY: DeleteIpForwardEntry2 only reads the row.
+            let removed = unsafe { DeleteIpForwardEntry2(&existing) };
+            if !(removed.is_ok() || removed == ERROR_NOT_FOUND) {
+                tracing::warn!(ip = %ip, kind = label, error = ?removed, "Failed to remove the stale route");
+                anyhow::bail!("DeleteIpForwardEntry2 failed while replacing: {removed:?}");
+            }
+            replaced = true;
+        }
+        if replaced {
+            // SAFETY: desired is a fully initialized MIB_IPFORWARD_ROW2.
+            let retry = unsafe { CreateIpForwardEntry2(&desired) };
+            if retry.is_ok() || retry == ERROR_OBJECT_ALREADY_EXISTS {
+                tracing::info!(ip = %ip, kind = label, "Stale route replaced");
+                return Ok(());
+            }
+            tracing::error!(ip = %ip, kind = label, error = ?retry, "Failed to add the replacement route");
+            anyhow::bail!("CreateIpForwardEntry2 failed after replacing: {retry:?}");
+        }
     }
     tracing::error!(ip = %ip, kind = label, error = ?err, "Failed to add route");
     anyhow::bail!("CreateIpForwardEntry2 failed: {err:?}")
@@ -348,6 +386,29 @@ impl RouteAdder for WindowsRouteAdder {
         let interface_index = resolve_interface_index(device)?;
         let mut row = build_route_row(ip, prefix_len, interface_index, None);
         create_route(&mut row, ip, "dev")
+    }
+
+    async fn route_matches(&self, ip: IpAddr, prefix_len: u8, zone: &ZoneConfig) -> Result<bool> {
+        let family = if ip.is_ipv6() { AF_INET6 } else { AF_INET };
+        let rows = find_route_rows(family, ip, prefix_len)?;
+        match zone.route_type {
+            RouteType::Dev => {
+                let device = std::fs::read_to_string(&zone.route_target)
+                    .with_context(|| format!("read device file {}", zone.route_target))?;
+                let interface = resolve_interface_index(device.trim())?;
+                Ok(rows.iter().any(|row| row.InterfaceIndex == interface))
+            }
+            RouteType::Via => {
+                let gateway: IpAddr = zone
+                    .route_target
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("parse gateway {}", zone.route_target))?;
+                Ok(rows
+                    .iter()
+                    .any(|row| sockaddr_to_ip(&row.NextHop) == Some(gateway)))
+            }
+        }
     }
 
     async fn remove_route(&self, ip: IpAddr, prefix_len: u8) -> Result<()> {
