@@ -226,7 +226,10 @@ fn build_route_row(
         InterfaceLuid: NET_LUID_LH::default(),
         InterfaceIndex: interface_index,
         DestinationPrefix: IP_ADDRESS_PREFIX {
-            Prefix: prefix_sockaddr(ip),
+            // The destination prefix must carry the address bits; the zeroed
+            // form is only correct for an on-link next hop, and using it here
+            // created rows for 0.0.0.0/32 while the API still reported success.
+            Prefix: address_sockaddr(ip),
             PrefixLength: prefix_len,
         },
         NextHop: match next_hop {
@@ -359,6 +362,29 @@ impl RouteAdder for WindowsRouteAdder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destination_prefix_carries_the_address() {
+        // Regression: the destination prefix used to be built with the zeroed
+        // helper, so every route was created for 0.0.0.0/32 and silently
+        // vanished from the table.
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let row = build_route_row(ip, 32, 11, None);
+        assert_eq!(sockaddr_to_ip(&row.DestinationPrefix.Prefix), Some(ip));
+        assert_eq!(row.DestinationPrefix.PrefixLength, 32);
+        // The on-link next hop must stay zeroed: that is what "on-link" means.
+        assert_eq!(
+            sockaddr_to_ip(&row.NextHop),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+    }
+
+    #[test]
+    fn destination_prefix_carries_the_address_v6() {
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0x6812, 0x202f));
+        let row = build_route_row(ip, 128, 11, None);
+        assert_eq!(sockaddr_to_ip(&row.DestinationPrefix.Prefix), Some(ip));
+    }
 
     #[test]
     fn ipv4_s_addr_roundtrip() {
