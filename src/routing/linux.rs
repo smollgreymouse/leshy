@@ -201,7 +201,9 @@ impl RouteAdder for LinuxRouteAdder {
         }
 
         let mut routes = req.execute();
+        let mut found = 0usize;
         while let Some(msg) = routes.try_next().await? {
+            found += 1;
             if msg.header.destination_prefix_length != prefix_len {
                 continue;
             }
@@ -221,11 +223,18 @@ impl RouteAdder for LinuxRouteAdder {
                 }
             }
             match (target_index, target_gateway) {
-                (Some(index), _) if oif == Some(index) => return Ok(true),
-                (_, Some(gw)) if gateway == Some(gw) => return Ok(true),
+                (Some(index), _) if oif == Some(index) => {
+                    tracing::debug!(ip = %ip, prefix = prefix_len, "Route matches zone target");
+                    return Ok(true);
+                }
+                (_, Some(gw)) if gateway == Some(gw) => {
+                    tracing::debug!(ip = %ip, prefix = prefix_len, "Route matches zone gateway");
+                    return Ok(true);
+                }
                 _ => {}
             }
         }
+        tracing::info!(ip = %ip, prefix = prefix_len, zone = zone.name, routes = found, "Kernel route check: destination is not routed via the zone target");
         Ok(false)
     }
 
