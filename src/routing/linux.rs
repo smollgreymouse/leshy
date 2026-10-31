@@ -1,9 +1,10 @@
 use super::RouteAdder;
+use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use netlink_packet_route::route::{RouteAddress, RouteProtocol, RouteScope};
-use rtnetlink::{new_connection, Handle};
+use rtnetlink::{new_connection, Handle, IpVersion};
 use std::net::IpAddr;
 
 pub struct LinuxRouteAdder {
@@ -147,12 +148,92 @@ impl RouteAdder for LinuxRouteAdder {
         }
     }
 
+    /// Report whether the kernel still routes `ip/prefix_len` through the
+    /// zone's target. The in-memory bookkeeping cannot be trusted alone: the
+    /// Go core withdraws routes during fail-closed recovery and external
+    /// daemons may drop them, so a stale "installed" set must not mask the
+    /// loss. Mirrors the Windows implementation.
+    async fn route_matches(&self, ip: IpAddr, prefix_len: u8, zone: &ZoneConfig) -> Result<bool> {
+        let version = match ip {
+            IpAddr::V4(_) => IpVersion::V4,
+            IpAddr::V6(_) => IpVersion::V6,
+        };
+        let (target_index, target_gateway): (Option<u32>, Option<IpAddr>) = match zone.route_type {
+            RouteType::Dev => {
+                let device = tokio::fs::read_to_string(&zone.route_target)
+                    .await
+                    .with_context(|| format!("read device file {}", zone.route_target))?;
+                let device = device.trim().to_string();
+                let mut links = self.handle.link().get().match_name(device.clone()).execute();
+                let link = links
+                    .try_next()
+                    .await?
+                    .with_context(|| format!("Device '{device}' not found"))?;
+                (Some(link.header.index), None)
+            }
+            RouteType::Via => {
+                let gw: IpAddr = zone
+                    .route_target
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("parse gateway {}", zone.route_target))?;
+                (None, Some(gw))
+            }
+        };
+
+        let mut req = self.handle.route().get(version);
+        req.message_mut().header.destination_prefix_length = prefix_len;
+        match ip {
+            IpAddr::V4(addr) => {
+                req.message_mut()
+                    .attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Destination(
+                        RouteAddress::Inet(addr),
+                    ));
+            }
+            IpAddr::V6(addr) => {
+                req.message_mut()
+                    .attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Destination(
+                        RouteAddress::Inet6(addr),
+                    ));
+            }
+        }
+
+        let mut routes = req.execute();
+        while let Some(msg) = routes.try_next().await? {
+            if msg.header.destination_prefix_length != prefix_len {
+                continue;
+            }
+            let mut oif: Option<u32> = None;
+            let mut gateway: Option<IpAddr> = None;
+            for attr in msg.attributes.iter() {
+                match attr {
+                    netlink_packet_route::route::RouteAttribute::Oif(index) => {
+                        oif = Some(*index);
+                    }
+                    netlink_packet_route::route::RouteAttribute::Gateway(gw) => match gw {
+                        RouteAddress::Inet(v4) => gateway = Some(IpAddr::V4(*v4)),
+                        RouteAddress::Inet6(v6) => gateway = Some(IpAddr::V6(*v6)),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            match (target_index, target_gateway) {
+                (Some(index), _) if oif == Some(index) => return Ok(true),
+                (_, Some(gw)) if gateway == Some(gw) => return Ok(true),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     async fn remove_route(&self, ip: IpAddr, prefix_len: u8) -> Result<()> {
         tracing::info!(ip = %ip, prefix_len = prefix_len, "Removing route");
 
         let result = match ip {
-            IpAddr::V4(addr) => {
-                let mut msg = netlink_packet_route::route::RouteMessage::default();
+            IpAddr::V4(addr) => {                let mut msg = netlink_packet_route::route::RouteMessage::default();
                 msg.header.destination_prefix_length = prefix_len;
                 msg.header.protocol = RouteProtocol::Boot;
                 msg.attributes
