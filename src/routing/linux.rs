@@ -181,32 +181,33 @@ impl RouteAdder for LinuxRouteAdder {
             }
         };
 
+        // rtnetlink's route GET is implemented as a dump, and the kernel
+        // ignores the destination/table fields of a dump request (verified on
+        // 6.x: every route from every table comes back). Filter in userspace:
+        // only the exact destination/prefix inside the main table counts.
         let mut req = self.handle.route().get(version);
-        req.message_mut().header.destination_prefix_length = prefix_len;
-        match ip {
-            IpAddr::V4(addr) => {
-                req.message_mut()
-                    .attributes
-                    .push(netlink_packet_route::route::RouteAttribute::Destination(
-                        RouteAddress::Inet(addr),
-                    ));
-            }
-            IpAddr::V6(addr) => {
-                req.message_mut()
-                    .attributes
-                    .push(netlink_packet_route::route::RouteAttribute::Destination(
-                        RouteAddress::Inet6(addr),
-                    ));
-            }
-        }
 
         let mut routes = req.execute();
-        let mut found = 0usize;
+        let mut considered = 0usize;
         while let Some(msg) = routes.try_next().await? {
-            found += 1;
-            if msg.header.destination_prefix_length != prefix_len {
+            if msg.header.table != netlink_packet_route::route::RouteHeader::RT_TABLE_MAIN
+                || msg.header.destination_prefix_length != prefix_len
+            {
                 continue;
             }
+            let dst_matches = msg.attributes.iter().any(|attr| match (ip, attr) {
+                (IpAddr::V4(addr), netlink_packet_route::route::RouteAttribute::Destination(
+                    RouteAddress::Inet(found),
+                )) => *found == addr,
+                (IpAddr::V6(addr), netlink_packet_route::route::RouteAttribute::Destination(
+                    RouteAddress::Inet6(found),
+                )) => *found == addr,
+                _ => false,
+            });
+            if !dst_matches {
+                continue;
+            }
+            considered += 1;
             let mut oif: Option<u32> = None;
             let mut gateway: Option<IpAddr> = None;
             for attr in msg.attributes.iter() {
@@ -234,7 +235,7 @@ impl RouteAdder for LinuxRouteAdder {
                 _ => {}
             }
         }
-        tracing::info!(ip = %ip, prefix = prefix_len, zone = zone.name, routes = found, "Kernel route check: destination is not routed via the zone target");
+        tracing::info!(ip = %ip, prefix = prefix_len, zone = zone.name, considered = considered, "Kernel route check: destination is not routed via the zone target");
         Ok(false)
     }
 
