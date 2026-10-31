@@ -128,6 +128,24 @@ pub struct ZoneConfig {
     /// Per-zone negative TTL override (seconds)
     #[serde(default)]
     pub cache_negative_ttl: Option<u64>,
+
+    /// Advertise and route IPv6 for this zone.
+    ///
+    /// Device zones (`route_type = "dev"`) default to IPv4-only: the
+    /// managed interface that carries the zone has no global IPv6 address,
+    /// so an AAAA answer sends the client around the tunnel over the
+    /// physical link (or into a black hole). Enable this only when the
+    /// target device really carries working IPv6.
+    #[serde(default)]
+    pub ipv6: bool,
+}
+
+impl ZoneConfig {
+    /// Whether AAAA answers may be handed to clients and routed through
+    /// this zone. A `dev` zone is IPv4-only unless it opts in explicitly.
+    pub fn advertises_ipv6(&self) -> bool {
+        self.ipv6 || self.route_type != RouteType::Dev
+    }
 }
 
 /// Per-server DNS configuration with optional cache TTL overrides.

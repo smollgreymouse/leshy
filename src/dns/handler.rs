@@ -309,6 +309,19 @@ impl DnsHandler {
     }
 }
 
+/// Remove AAAA answers from a response before it reaches a client of an
+/// IPv4-only zone. The remaining A records keep their TTLs, so the cache and
+/// the client treat the answer as an authoritative “no IPv6 here”.
+fn without_aaaa(mut message: Message) -> Message {
+    let answers: Vec<_> = message
+        .take_answers()
+        .into_iter()
+        .filter(|record| record.record_type() != RecordType::AAAA)
+        .collect();
+    message.insert_answers(answers);
+    message
+}
+
 /// `min_ttl` only applies when the upstream sends TTL=0; otherwise the
 /// authoritative TTL is honored and capped by `max_ttl`.
 fn resolve_cache_ttl(
@@ -477,6 +490,21 @@ impl RequestHandler for DnsHandler {
 
         match result {
             Some((response, server_cfg)) => {
+                // A zone pinned to a managed device that carries only IPv4
+                // must not hand out AAAA answers: the client would send
+                // that traffic around the tunnel over the physical link
+                // (or into a black hole) while the A path stays protected.
+                let response = match &zone {
+                    Some(z) if !z.config.advertises_ipv6() => {
+                        tracing::debug!(
+                            qname = qname,
+                            zone = z.config.name,
+                            "IPv4-only zone: dropping AAAA answers"
+                        );
+                        without_aaaa(response)
+                    }
+                    _ => response,
+                };
                 tracing::debug!(
                     qname = qname,
                     answers = response.answers().len(),
@@ -598,6 +626,86 @@ mod tests {
 
         let ttl = resolve_cache_ttl(None, None, &cfg, &response);
         assert_eq!(ttl, Duration::from_secs(45));
+    }
+
+    fn make_response_with_a_and_aaaa() -> Message {
+        let mut msg = Message::new();
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NoError);
+        let mut a = Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            60,
+            RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(1, 2, 3, 4))),
+        );
+        a.set_record_type(RecordType::A);
+        msg.add_answer(a);
+        let mut aaaa = Record::from_rdata(
+            Name::from_str("example.com.").unwrap(),
+            60,
+            RData::AAAA(hickory_proto::rr::rdata::AAAA(std::net::Ipv6Addr::new(
+                0x2a06, 0x98c1, 0x3122, 0x8000, 0, 0, 0, 0,
+            ))),
+        );
+        aaaa.set_record_type(RecordType::AAAA);
+        msg.add_answer(aaaa);
+        msg
+    }
+
+    #[test]
+    fn ipv4_only_zone_drops_aaaa_answers() {
+        let filtered = without_aaaa(make_response_with_a_and_aaaa());
+        let types: Vec<_> = filtered.answers().iter().map(|r| r.record_type()).collect();
+        assert_eq!(types, vec![RecordType::A]);
+        assert_eq!(filtered.response_code(), ResponseCode::NoError);
+    }
+
+    #[test]
+    fn device_zones_are_ipv4_only_unless_they_opt_in() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+
+[[zones]]
+name = "vpn"
+route_type = "dev"
+route_target = "/run/vpn.dev"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.zones[0].advertises_ipv6());
+
+        let cfg6: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+
+[[zones]]
+name = "vpn"
+route_type = "dev"
+route_target = "/run/vpn.dev"
+ipv6 = true
+"#,
+        )
+        .unwrap();
+        assert!(cfg6.zones[0].advertises_ipv6());
+
+        let cfg_via: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+"#,
+        )
+        .unwrap();
+        assert!(cfg_via.zones[0].advertises_ipv6());
     }
 
     #[test]

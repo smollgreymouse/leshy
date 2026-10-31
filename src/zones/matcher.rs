@@ -297,6 +297,7 @@ mod tests {
             cache_min_ttl: None,
             cache_max_ttl: None,
             cache_negative_ttl: None,
+            ipv6: false,
         }
     }
 
