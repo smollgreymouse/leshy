@@ -1,15 +1,29 @@
-use super::RouteAdder;
+//! Windows route backend: IP Helper API writer plus forwarding-table read-back.
+//!
+//! Windows keys forwarding rows by destination prefix, interface and next hop,
+//! so a row for the same prefix may point somewhere else entirely — the
+//! physical default installed before the tunnel came up is the common case.
+//! `ensure_route` therefore compares the full row identity before reporting a
+//! match, and replaces a stale row the way the Kikimora Go route owner does.
+
+use super::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
+use super::model::{
+    family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget,
+};
 use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use tokio::sync::mpsc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
-    DeleteIpForwardEntry2, FreeMibTable, GetAdaptersAddresses, GetBestInterface,
-    GetBestInterfaceEx, GetIpForwardTable2, GAA_FLAG_INCLUDE_ALL_INTERFACES,
-    IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    ConvertInterfaceAliasToLuid, ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias,
+    ConvertInterfaceLuidToIndex, CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable,
+    GetAdaptersAddresses, GetBestInterface, GetBestInterfaceEx, GetIpForwardTable2,
+    GAA_FLAG_INCLUDE_ALL_INTERFACES, IP_ADAPTER_ADDRESSES_LH, IP_ADDRESS_PREFIX,
+    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
 };
 use windows::Win32::NetworkManagement::Ndis::{IF_MAX_STRING_SIZE, NET_LUID_LH};
 use windows::Win32::Networking::WinSock::{
@@ -17,14 +31,18 @@ use windows::Win32::Networking::WinSock::{
     MIB_IPPROTO_NETMGMT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_INET,
 };
 
-/// Route adder backed by the Windows IP Helper API (iphlpapi.dll).
+/// The main routing table. Windows has no table selector in the IP Helper API;
+/// every row lives in the system forwarding table.
+const MAIN_TABLE: u32 = 254;
+
+/// Route backend backed by the Windows IP Helper API (iphlpapi.dll).
 ///
 /// Routes are created as static `MIB_IPPROTO_NETMGMT` entries with infinite
 /// lifetime, the programmatic equivalent of `route add -p`.
 #[derive(Default)]
-pub struct WindowsRouteAdder;
+pub struct WindowsRouteBackend;
 
-impl WindowsRouteAdder {
+impl WindowsRouteBackend {
     pub fn new() -> Result<Self> {
         Ok(Self)
     }
@@ -146,6 +164,23 @@ fn resolve_interface_index(device: &str) -> Result<u32> {
 
     find_interface_index_case_insensitive(trimmed)
         .with_context(|| format!("Interface '{trimmed}' not found"))
+}
+
+/// Resolve an interface index back to its adapter alias.
+fn interface_alias(index: u32) -> Option<String> {
+    let mut luid = NET_LUID_LH::default();
+    // SAFETY: out-pointer contract of ConvertInterfaceIndexToLuid.
+    if unsafe { ConvertInterfaceIndexToLuid(index, &mut luid) }.is_err() {
+        return None;
+    }
+    let mut buffer = [0u16; IF_MAX_STRING_SIZE as usize + 1];
+    // SAFETY: buffer is sized for IF_MAX_STRING_SIZE characters plus the
+    // terminator, as the API requires.
+    if unsafe { ConvertInterfaceLuidToAlias(&luid, &mut buffer) }.is_err() {
+        return None;
+    }
+    let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..len]))
 }
 
 fn to_wide_null_terminated(value: &str) -> Vec<u16> {
@@ -306,6 +341,59 @@ fn find_route_rows(
     Ok(matches)
 }
 
+/// Enumerate every forwarding row of `family` as an [`ObservedRoute`].
+fn dump_family(family: ADDRESS_FAMILY) -> Result<Vec<ObservedRoute>> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    // SAFETY: out-pointer contract of GetIpForwardTable2.
+    let err = unsafe { GetIpForwardTable2(family, &mut table) };
+    check_win32(err, "GetIpForwardTable2")?;
+
+    let mut out = Vec::new();
+    let mut aliases: HashMap<u32, String> = HashMap::new();
+    // SAFETY: table is a valid heap table returned by the API.
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        let rows = (*table).Table.as_ptr();
+        for i in 0..count {
+            let row = &*rows.add(i);
+            let Some(network) = sockaddr_to_ip(&row.DestinationPrefix.Prefix) else {
+                continue;
+            };
+            let Ok(prefix) = RoutePrefix::new(network, row.DestinationPrefix.PrefixLength) else {
+                continue;
+            };
+            let next_hop = sockaddr_to_ip(&row.NextHop);
+            let target = match next_hop {
+                // An all-zero next hop means the destination is on-link.
+                Some(hop) if !hop.is_unspecified() => RouteTarget::Gateway(hop),
+                _ => {
+                    let index = row.InterfaceIndex;
+                    let name = aliases
+                        .entry(index)
+                        .or_insert_with(|| interface_alias(index).unwrap_or_default())
+                        .clone();
+                    RouteTarget::Device {
+                        name,
+                        ifindex: Some(index),
+                    }
+                }
+            };
+            out.push(ObservedRoute {
+                key: RouteKey {
+                    prefix,
+                    table: MAIN_TABLE,
+                },
+                target,
+                protocol: row.Protocol.0 as u8,
+                metric: row.Metric,
+            });
+        }
+    }
+    // SAFETY: table was allocated by the IP Helper API.
+    unsafe { FreeMibTable(table as _) };
+    Ok(out)
+}
+
 fn delete_routes(family: ADDRESS_FAMILY, ip: IpAddr, prefix_len: u8) -> Result<()> {
     let rows = find_route_rows(family, ip, prefix_len)?;
     if rows.is_empty() {
@@ -371,32 +459,77 @@ fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result
     anyhow::bail!("CreateIpForwardEntry2 failed: {err:?}")
 }
 
+/// Build the forwarding row an intent describes.
+fn row_for_intent(intent: &RouteIntent) -> Result<MIB_IPFORWARD_ROW2> {
+    let prefix = &intent.key.prefix;
+    match &intent.target {
+        RouteTarget::Gateway(gateway) => {
+            if family_of(*gateway) != prefix.family() {
+                anyhow::bail!(
+                    "route {} cannot use gateway {gateway} of another family",
+                    prefix.network
+                );
+            }
+            let index = interface_for_gateway(*gateway)?;
+            Ok(build_route_row(
+                prefix.network,
+                prefix.prefix_len,
+                index,
+                Some(*gateway),
+            ))
+        }
+        RouteTarget::Device {
+            ifindex: Some(index),
+            ..
+        } => Ok(build_route_row(
+            prefix.network,
+            prefix.prefix_len,
+            *index,
+            None,
+        )),
+        RouteTarget::Device {
+            name,
+            ifindex: None,
+        } => {
+            let index = resolve_interface_index(name)?;
+            Ok(build_route_row(
+                prefix.network,
+                prefix.prefix_len,
+                index,
+                None,
+            ))
+        }
+        RouteTarget::Unreachable => anyhow::bail!(
+            "route {} cannot be installed as unreachable on Windows",
+            prefix.network
+        ),
+    }
+}
+
 #[async_trait]
-impl RouteAdder for WindowsRouteAdder {
-    async fn add_via_route(&self, ip: IpAddr, prefix_len: u8, gateway: &str) -> Result<()> {
-        tracing::info!(ip = %ip, prefix_len = prefix_len, gateway = gateway, "Adding route via gateway");
-        let gateway_ip: IpAddr = gateway.parse().context("Failed to parse gateway IP")?;
-        let interface_index = interface_for_gateway(gateway_ip)?;
-        let mut row = build_route_row(ip, prefix_len, interface_index, Some(gateway_ip));
-        create_route(&mut row, ip, "via")
-    }
-
-    async fn add_dev_route(&self, ip: IpAddr, prefix_len: u8, device: &str) -> Result<()> {
-        tracing::info!(ip = %ip, prefix_len = prefix_len, device = device, "Adding route via device");
-        let interface_index = resolve_interface_index(device)?;
-        let mut row = build_route_row(ip, prefix_len, interface_index, None);
-        create_route(&mut row, ip, "dev")
-    }
-
-    async fn route_matches(&self, ip: IpAddr, prefix_len: u8, zone: &ZoneConfig) -> Result<bool> {
-        let family = if ip.is_ipv6() { AF_INET6 } else { AF_INET };
-        let rows = find_route_rows(family, ip, prefix_len)?;
+impl RouteBackend for WindowsRouteBackend {
+    async fn resolve_target(
+        &self,
+        zone: &ZoneConfig,
+        family: AddressFamily,
+    ) -> Result<RouteTarget> {
         match zone.route_type {
             RouteType::Dev => {
-                let device = std::fs::read_to_string(&zone.route_target)
-                    .with_context(|| format!("read device file {}", zone.route_target))?;
-                let interface = resolve_interface_index(device.trim())?;
-                Ok(rows.iter().any(|row| row.InterfaceIndex == interface))
+                let device = std::fs::read_to_string(&zone.route_target).with_context(|| {
+                    format!(
+                        "Device file '{}' not found (VPN not connected?)",
+                        zone.route_target
+                    )
+                })?;
+                let device = device.trim().to_string();
+                if device.is_empty() {
+                    anyhow::bail!("Device file '{}' is empty", zone.route_target);
+                }
+                let ifindex = resolve_interface_index(&device)?;
+                Ok(RouteTarget::Device {
+                    name: device,
+                    ifindex: Some(ifindex),
+                })
             }
             RouteType::Via => {
                 let gateway: IpAddr = zone
@@ -404,19 +537,63 @@ impl RouteAdder for WindowsRouteAdder {
                     .trim()
                     .parse()
                     .with_context(|| format!("parse gateway {}", zone.route_target))?;
-                Ok(rows
-                    .iter()
-                    .any(|row| sockaddr_to_ip(&row.NextHop) == Some(gateway)))
+                if family_of(gateway) != family {
+                    anyhow::bail!(
+                        "zone '{}': gateway {gateway} does not match the {family:?} route family",
+                        zone.name
+                    );
+                }
+                Ok(RouteTarget::Gateway(gateway))
             }
         }
     }
 
-    async fn remove_route(&self, ip: IpAddr, prefix_len: u8) -> Result<()> {
-        tracing::info!(ip = %ip, prefix_len = prefix_len, "Removing route");
-        match ip {
-            IpAddr::V4(_) => delete_routes(AF_INET, ip, prefix_len),
-            IpAddr::V6(_) => delete_routes(AF_INET6, ip, prefix_len),
+    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
+        let prefix = &intent.key.prefix;
+        let family = if prefix.family() == AddressFamily::V6 {
+            AF_INET6
+        } else {
+            AF_INET
+        };
+
+        let mut row = row_for_intent(intent)?;
+
+        // An exact row already present is a no-op; anything else is replaced by
+        // `create_route`, which keeps the historical Windows behaviour.
+        let existing = find_route_rows(family, prefix.network, prefix.prefix_len)?;
+        let already_matching = existing.iter().any(|candidate| {
+            candidate.InterfaceIndex == row.InterfaceIndex
+                && candidate.Metric == row.Metric
+                && sockaddr_to_ip(&candidate.NextHop) == sockaddr_to_ip(&row.NextHop)
+        });
+        if already_matching {
+            return Ok(EnsureOutcome::AlreadyMatching);
         }
+
+        create_route(&mut row, prefix.network, "leshy")?;
+        Ok(EnsureOutcome::Added)
+    }
+
+    async fn remove_route(&self, intent: &RouteIntent) -> Result<()> {
+        let prefix = &intent.key.prefix;
+        let family = if prefix.family() == AddressFamily::V6 {
+            AF_INET6
+        } else {
+            AF_INET
+        };
+        delete_routes(family, prefix.network, prefix.prefix_len)
+    }
+
+    async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
+        let mut out = dump_family(AF_INET)?;
+        out.extend(dump_family(AF_INET6)?);
+        Ok(out)
+    }
+
+    fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
+        // Windows route-change notifications land in a later step; until then
+        // the registry relies on explicit reconciliation only.
+        None
     }
 }
 
@@ -504,5 +681,26 @@ mod tests {
     #[test]
     fn missing_interface_is_reported() {
         assert!(resolve_interface_index("no-such-leshy-interface").is_err());
+    }
+
+    #[test]
+    fn interface_alias_roundtrip() {
+        let index = resolve_interface_index("Loopback Pseudo-Interface 1").unwrap();
+        let alias = interface_alias(index).unwrap();
+        assert!(alias.to_lowercase().contains("loopback"));
+    }
+
+    #[test]
+    fn gateway_of_another_family_is_rejected() {
+        let intent = RouteIntent {
+            key: RouteKey {
+                prefix: RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                table: MAIN_TABLE,
+            },
+            zone: "corp".to_string(),
+            target: RouteTarget::Gateway(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            source: super::super::model::RouteSource::Dns,
+        };
+        assert!(row_for_intent(&intent).is_err());
     }
 }

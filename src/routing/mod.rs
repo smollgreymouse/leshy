@@ -1,6 +1,14 @@
+//! Route orchestration: turns DNS answers and static config into route intents
+//! and drives them through the unified registry.
+//!
+//! The manager owns no kernel state of its own. Every mutation goes through
+//! [`RouteRegistry`], which dedupes concurrent intents for the same prefix and
+//! only reports success once the platform backend has verified the row.
+
 mod aggregator;
 pub(crate) mod backend;
 mod model;
+pub(crate) mod registry;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -10,124 +18,151 @@ mod macos;
 mod windows;
 
 pub use model::{
-    family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteSource,
-    RouteState, RouteTarget,
+    family_of, AddressFamily, RouteIntent, RouteKey, RoutePrefix, RouteSource, RouteTarget,
 };
+// The DNS handler starts classifying these in the typed-safety step; the
+// kernel monitor drives `reconcile_all`/`dynamic_route_count` in the Linux
+// snapshot step.
+#[allow(unused_imports)]
+pub use registry::{ReconcileReport, RouteError};
 
 use crate::config::{RouteType, ZoneConfig};
 use aggregator::{RouteAction, RouteAggregator};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use backend::{EnsureOutcome, RouteBackend};
+use registry::RouteRegistry;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 #[cfg(target_os = "linux")]
-use linux::LinuxRouteAdder as PlatformRouteAdder;
+use linux::LinuxRouteBackend as PlatformBackend;
 #[cfg(target_os = "macos")]
-use macos::MacosRouteAdder as PlatformRouteAdder;
+use macos::MacosRouteBackend as PlatformBackend;
 #[cfg(target_os = "windows")]
-use windows::WindowsRouteAdder as PlatformRouteAdder;
+use windows::WindowsRouteBackend as PlatformBackend;
 
-// async_trait's generated #[must_use] on boxed futures trips this lint on
-// newer clippy versions; the futures are always awaited internally.
-#[allow(clippy::double_must_use)]
-#[async_trait]
-pub(crate) trait RouteAdder: Send + Sync {
-    async fn add_via_route(&self, ip: IpAddr, prefix_len: u8, gateway: &str) -> Result<()>;
-    async fn add_dev_route(&self, ip: IpAddr, prefix_len: u8, device: &str) -> Result<()>;
-    async fn remove_route(&self, ip: IpAddr, prefix_len: u8) -> Result<()>;
+/// The main routing table every Leshy route lives in.
+const MAIN_TABLE: u32 = 254;
 
-    /// Report whether the kernel already routes `ip/prefix_len` towards the
-    /// zone's target. Platforms that cannot inspect their table return `true`
-    /// and keep the historical "trust the bookkeeping" behaviour.
-    async fn route_matches(
-        &self,
-        _ip: IpAddr,
-        _prefix_len: u8,
-        _zone: &ZoneConfig,
-    ) -> Result<bool> {
-        Ok(true)
-    }
-}
+/// Default cap on dynamic (DNS-sourced) route intents.
+pub const DEFAULT_MAX_DYNAMIC_ROUTES: usize = 16384;
 
 pub struct RouteManager {
-    adder: PlatformRouteAdder,
-    zone_routes: Arc<RwLock<HashMap<String, HashSet<IpAddr>>>>,
+    backend: Arc<dyn RouteBackend>,
+    registry: Arc<RouteRegistry>,
     aggregator: Mutex<RouteAggregator>,
+    kernel_epoch: AtomicU64,
 }
 
 impl RouteManager {
     pub fn new(aggregation_prefix: Option<u8>) -> Result<Self> {
-        let adder = PlatformRouteAdder::new()?;
+        Self::with_capacity(aggregation_prefix, DEFAULT_MAX_DYNAMIC_ROUTES)
+    }
 
+    pub fn with_capacity(
+        aggregation_prefix: Option<u8>,
+        max_dynamic_routes: usize,
+    ) -> Result<Self> {
+        let backend = Arc::new(PlatformBackend::new()?);
         Ok(Self {
-            adder,
-            zone_routes: Arc::new(RwLock::new(HashMap::new())),
+            backend,
+            registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
             aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
+            kernel_epoch: AtomicU64::new(0),
         })
     }
 
-    /// Add a route for the given IP based on zone configuration.
-    /// For IPv4 with aggregation enabled, installs a wider CIDR prefix.
-    /// For IPv6, always uses /128 (no aggregation).
-    pub async fn add_route(&self, ip: IpAddr, zone: &ZoneConfig) -> Result<()> {
-        match ip {
-            IpAddr::V4(v4) => self.add_route_v4(v4, zone).await,
-            IpAddr::V6(_) => self.add_route_simple(ip, 128, zone).await,
+    /// Construct a manager around an arbitrary backend. Used by tests to drive
+    /// reconciliation against a fake kernel.
+    #[cfg(test)]
+    pub(crate) fn with_backend<B>(
+        backend: Arc<B>,
+        aggregation_prefix: Option<u8>,
+        max_dynamic_routes: usize,
+    ) -> Self
+    where
+        B: RouteBackend + 'static,
+    {
+        Self {
+            backend,
+            registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
+            aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
+            kernel_epoch: AtomicU64::new(0),
         }
     }
 
-    async fn add_route_v4(&self, ip: Ipv4Addr, zone: &ZoneConfig) -> Result<()> {
-        let (actions, known_prefix) = {
+    /// Current kernel epoch. Bumped whenever the kernel state is invalidated.
+    pub fn kernel_epoch(&self) -> u64 {
+        self.kernel_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Add a route for the given IP based on zone configuration.
+    ///
+    /// Both families take the same path: resolve the target, build a canonical
+    /// intent, and let the registry dedupe it. IPv4 additionally passes through
+    /// the aggregation planner, which may widen the prefix.
+    pub async fn add_route(&self, ip: IpAddr, zone: &ZoneConfig) -> Result<()> {
+        let family = family_of(ip);
+        let target = self.backend.resolve_target(zone, family).await?;
+
+        match ip {
+            IpAddr::V4(v4) => self.add_route_v4(v4, zone, target).await,
+            IpAddr::V6(_) => {
+                let intent = RouteIntent {
+                    key: RouteKey {
+                        prefix: RoutePrefix::host(ip),
+                        table: MAIN_TABLE,
+                    },
+                    zone: zone.name.clone(),
+                    target,
+                    source: RouteSource::Dns,
+                };
+                self.ensure_intent(intent).await.map(|_| ())
+            }
+        }
+    }
+
+    async fn add_route_v4(
+        &self,
+        ip: Ipv4Addr,
+        zone: &ZoneConfig,
+        target: RouteTarget,
+    ) -> Result<()> {
+        let actions = {
             let mut agg = self.aggregator.lock().await;
-            let actions = agg.process_ip(ip, &zone.name, zone.route_type, &zone.route_target);
-            (actions, agg.installed_prefix(ip).unwrap_or(32))
+            agg.process_ip(ip, &zone.name, zone.route_type, &zone.route_target)
         };
 
         if actions.is_empty() {
-            // The aggregator remembers this prefix, but the kernel is the source
-            // of truth: a row deleted or replaced outside Leshy has to be
-            // restored, otherwise the zone silently loses its path.
-            let matches = self
-                .adder
-                .route_matches(IpAddr::V4(ip), known_prefix, zone)
-                .await
-                .unwrap_or(true);
-            if !matches {
-                tracing::info!(
-                    ip = %ip,
-                    prefix_len = known_prefix,
-                    zone = zone.name,
-                    "Route missing or pointing elsewhere in the kernel, restoring"
-                );
-                let action = RouteAction::Add {
-                    network: ip,
-                    prefix_len: known_prefix,
-                    route_type: zone.route_type,
-                    route_target: zone.route_target.clone(),
-                };
-                self.execute_action(&action).await?;
-            }
-            return Ok(());
+            // The aggregator already covers this address. The registry still
+            // has to confirm the covering prefix is verified, otherwise a row
+            // dropped outside Leshy would stay missing.
+            let prefix_len = {
+                let agg = self.aggregator.lock().await;
+                agg.installed_prefix(ip).unwrap_or(32)
+            };
+            let intent = RouteIntent {
+                key: RouteKey {
+                    prefix: RoutePrefix::new(IpAddr::V4(ip), prefix_len)?,
+                    table: MAIN_TABLE,
+                },
+                zone: zone.name.clone(),
+                target,
+                source: RouteSource::Dns,
+            };
+            return self.ensure_intent(intent).await.map(|_| ());
         }
 
         for action in &actions {
-            self.execute_action(action).await?;
+            self.execute_action(action, zone).await?;
         }
-
-        let mut routes = self.zone_routes.write().await;
-        routes
-            .entry(zone.name.clone())
-            .or_default()
-            .insert(IpAddr::V4(ip));
-
         Ok(())
     }
 
-    /// Execute a single RouteAction against the kernel.
-    async fn execute_action(&self, action: &RouteAction) -> Result<()> {
+    /// Execute one aggregator action against the registry.
+    async fn execute_action(&self, action: &RouteAction, zone: &ZoneConfig) -> Result<()> {
         match action {
             RouteAction::Add {
                 network,
@@ -135,184 +170,354 @@ impl RouteManager {
                 route_type,
                 route_target,
             } => {
-                let ip = IpAddr::V4(*network);
-                match route_type {
-                    RouteType::Via => {
-                        self.adder
-                            .add_via_route(ip, *prefix_len, route_target)
-                            .await
-                    }
-                    RouteType::Dev => {
-                        let device = self.read_device_file(route_target).await?;
-                        self.adder.add_dev_route(ip, *prefix_len, &device).await
-                    }
-                }
+                let family = AddressFamily::V4;
+                let target = match route_type {
+                    RouteType::Via => RouteTarget::Gateway(
+                        route_target
+                            .trim()
+                            .parse()
+                            .with_context(|| format!("parse gateway {route_target}"))?,
+                    ),
+                    RouteType::Dev => self.backend.resolve_target(zone, family).await?,
+                };
+                let intent = RouteIntent {
+                    key: RouteKey {
+                        prefix: RoutePrefix::new(IpAddr::V4(*network), *prefix_len)?,
+                        table: MAIN_TABLE,
+                    },
+                    zone: zone.name.clone(),
+                    target,
+                    source: RouteSource::Dns,
+                };
+                self.ensure_intent(intent).await.map(|_| ())
             }
             RouteAction::Remove {
                 network,
                 prefix_len,
             } => {
-                self.adder
-                    .remove_route(IpAddr::V4(*network), *prefix_len)
-                    .await
+                let intent = RouteIntent {
+                    key: RouteKey {
+                        prefix: RoutePrefix::new(IpAddr::V4(*network), *prefix_len)?,
+                        table: MAIN_TABLE,
+                    },
+                    zone: zone.name.clone(),
+                    target: RouteTarget::Unreachable,
+                    source: RouteSource::Dns,
+                };
+                self.backend.remove_route(&intent).await
             }
         }
     }
 
-    /// Simple route add without aggregation (used for IPv6).
-    async fn add_route_simple(&self, ip: IpAddr, prefix_len: u8, zone: &ZoneConfig) -> Result<()> {
-        let result = match zone.route_type {
-            RouteType::Via => {
-                self.adder
-                    .add_via_route(ip, prefix_len, &zone.route_target)
-                    .await
-            }
-            RouteType::Dev => {
-                let device = self.read_device_file(&zone.route_target).await?;
-                self.adder.add_dev_route(ip, prefix_len, &device).await
-            }
-        };
-
-        if result.is_ok() {
-            let mut routes = self.zone_routes.write().await;
-            routes.entry(zone.name.clone()).or_default().insert(ip);
-        }
-
-        result
+    /// Push one intent through the registry.
+    async fn ensure_intent(&self, intent: RouteIntent) -> Result<EnsureOutcome> {
+        let epoch = self.kernel_epoch();
+        self.registry
+            .ensure(intent, self.backend.as_ref(), epoch)
+            .await
     }
 
     /// Add a static route from a CIDR string (e.g. "149.154.160.0/20" or "1.2.3.4").
-    /// Static routes bypass aggregation but register their IPs so aggregates don't overlap.
+    ///
+    /// Static routes bypass aggregation but register their IPs so aggregates
+    /// don't overlap, and they do not consume the dynamic quota.
     pub async fn add_static_route(&self, cidr: &str, zone: &ZoneConfig) -> Result<()> {
-        let (ip, prefix_len) = parse_cidr(cidr)?;
+        let prefix = parse_prefix(cidr)?;
+        let family = prefix.family();
 
         tracing::info!(cidr = cidr, zone = zone.name, "Adding static route");
 
-        // Register individual IPs in the aggregator so future aggregates
-        // don't accidentally cover them
-        if let IpAddr::V4(v4) = ip {
+        if let IpAddr::V4(v4) = prefix.network {
             let mut agg = self.aggregator.lock().await;
             agg.register_static_ip(v4, &zone.name);
         }
 
-        let result = match zone.route_type {
-            RouteType::Via => {
-                self.adder
-                    .add_via_route(ip, prefix_len, &zone.route_target)
-                    .await
-            }
-            RouteType::Dev => {
-                let device = self.read_device_file(&zone.route_target).await?;
-                self.adder.add_dev_route(ip, prefix_len, &device).await
-            }
+        let target = self.backend.resolve_target(zone, family).await?;
+        let intent = RouteIntent {
+            key: RouteKey {
+                prefix,
+                table: MAIN_TABLE,
+            },
+            zone: zone.name.clone(),
+            target,
+            source: RouteSource::Static,
         };
-
-        if result.is_ok() {
-            let mut routes = self.zone_routes.write().await;
-            routes.entry(zone.name.clone()).or_default().insert(ip);
-        }
-
-        result
+        self.ensure_intent(intent).await.map(|_| ())
     }
 
-    async fn read_device_file(&self, path: &str) -> Result<String> {
-        match tokio::fs::read_to_string(path).await {
-            Ok(content) => {
-                let device = content.trim().to_string();
-                if device.is_empty() {
-                    anyhow::bail!("Device file '{path}' is empty");
-                }
-                Ok(device)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                anyhow::bail!("Device file '{path}' not found (VPN not connected?)");
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Clean up routes for a specific zone
+    /// Clean up routes for a specific zone.
     ///
-    /// Removes the zone from tracking but does NOT delete routes from the
-    /// kernel routing table. Routes will naturally expire or be replaced.
+    /// This is explicit operator intent: the zone is gone, so its owned rows
+    /// are removed from the kernel. A row on the same prefix that Leshy does
+    /// not own is left alone by the backend.
     pub async fn cleanup_zone(&self, zone_name: &str) -> Result<()> {
-        let mut routes = self.zone_routes.write().await;
+        let report = self
+            .registry
+            .remove_zone(zone_name, self.backend.as_ref())
+            .await;
 
-        if let Some(ips) = routes.remove(zone_name) {
-            tracing::info!(
-                zone = zone_name,
-                route_count = ips.len(),
-                "Removed zone from tracking (routes remain in kernel table)"
-            );
-            tracing::debug!(
-                zone = zone_name,
-                ips = ?ips,
-                "Routes that were tracked for this zone"
-            );
-        } else {
-            tracing::debug!(zone = zone_name, "Zone has no tracked routes");
-        }
-
-        // Also clean up aggregator state
         let mut agg = self.aggregator.lock().await;
         agg.cleanup_zone(zone_name);
 
+        tracing::info!(
+            zone = zone_name,
+            removed = report.removed,
+            errors = report.errors,
+            "Zone routes retired"
+        );
         Ok(())
     }
 
-    /// Get count of tracked routes for a zone
+    /// Count of dynamic (DNS-sourced) intents currently registered.
     #[allow(dead_code)]
-    pub async fn get_zone_route_count(&self, zone_name: &str) -> usize {
-        let routes = self.zone_routes.read().await;
-        routes.get(zone_name).map(|set| set.len()).unwrap_or(0)
+    pub async fn dynamic_route_count(&self) -> u64 {
+        self.registry.count_dynamic().await
+    }
+
+    /// Mark every entry dirty and reconcile against a fresh snapshot.
+    ///
+    /// Called by the kernel monitor when it cannot map a change to individual
+    /// keys, and by the periodic safety audit.
+    #[allow(dead_code)]
+    pub async fn reconcile_all(&self) -> Result<ReconcileReport> {
+        let epoch = self.kernel_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.registry
+            .mark_dirty(backend::RouteInvalidation::Full, epoch)
+            .await;
+        let snapshot = self.backend.snapshot().await?;
+        Ok(self
+            .registry
+            .reconcile_dirty(self.backend.as_ref(), &snapshot, epoch)
+            .await)
     }
 }
 
-/// Parse a CIDR string like "149.154.160.0/20" or plain IP "1.2.3.4"
-fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8)> {
+/// Parse a CIDR string like "149.154.160.0/20" or plain IP "1.2.3.4".
+fn parse_prefix(cidr: &str) -> Result<RoutePrefix> {
     if let Some((ip_str, prefix_str)) = cidr.split_once('/') {
         let ip: IpAddr = ip_str.parse().context("Failed to parse IP in CIDR")?;
         let prefix_len: u8 = prefix_str
             .parse()
             .context("Failed to parse prefix length")?;
-        let max = match ip {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        if prefix_len > max {
-            anyhow::bail!("Prefix length {prefix_len} exceeds maximum {max} for {ip}");
-        }
-        Ok((ip, prefix_len))
+        RoutePrefix::new(ip, prefix_len)
     } else {
         let ip: IpAddr = cidr.parse().context("Failed to parse IP")?;
-        let prefix_len = match ip {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        Ok((ip, prefix_len))
+        Ok(RoutePrefix::host(ip))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DnsProtocol, ZoneMode};
+    use crate::routing::backend::fake::FakeBackend;
+    use crate::routing::model::ObservedRoute;
+    use std::net::Ipv6Addr;
+
+    fn via_zone(name: &str, gateway: &str) -> ZoneConfig {
+        ZoneConfig {
+            name: name.to_string(),
+            mode: ZoneMode::Inclusive,
+            dns_servers: vec![],
+            route_type: RouteType::Via,
+            route_target: gateway.to_string(),
+            domains: vec![],
+            patterns: vec![],
+            static_routes: vec![],
+            dns_protocol: DnsProtocol::Udp,
+            cache_min_ttl: None,
+            cache_max_ttl: None,
+            cache_negative_ttl: None,
+            ipv6: false,
+        }
+    }
+
+    fn manager(backend: Arc<FakeBackend>, aggregation: Option<u8>) -> RouteManager {
+        RouteManager::with_backend(backend, aggregation, DEFAULT_MAX_DYNAMIC_ROUTES)
+    }
 
     #[test]
     fn parse_cidr_v4_with_prefix() {
-        let (ip, prefix) = parse_cidr("10.0.0.0/8").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
-        assert_eq!(prefix, 8);
+        let prefix = parse_prefix("10.0.0.0/8").unwrap();
+        assert_eq!(prefix.network, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert_eq!(prefix.prefix_len, 8);
     }
 
     #[test]
     fn parse_cidr_v4_host() {
-        let (ip, prefix) = parse_cidr("1.2.3.4").unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-        assert_eq!(prefix, 32);
+        let prefix = parse_prefix("1.2.3.4").unwrap();
+        assert_eq!(prefix.network, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(prefix.prefix_len, 32);
+    }
+
+    #[test]
+    fn parse_cidr_v6_host() {
+        let prefix = parse_prefix("2001:db8::1").unwrap();
+        assert_eq!(prefix.prefix_len, 128);
+        assert_eq!(prefix.family(), AddressFamily::V6);
     }
 
     #[test]
     fn parse_cidr_invalid_prefix() {
-        assert!(parse_cidr("10.0.0.0/33").is_err());
+        assert!(parse_prefix("10.0.0.0/33").is_err());
+    }
+
+    #[test]
+    fn parse_cidr_canonicalizes() {
+        let prefix = parse_prefix("10.0.0.255/24").unwrap();
+        assert_eq!(prefix.network, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+    }
+
+    #[tokio::test]
+    async fn duplicate_v4_route_is_one_mutation() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone = via_zone("corp", "192.168.1.1");
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        for _ in 0..1000 {
+            mgr.add_route(ip, &zone).await.unwrap();
+        }
+        assert_eq!(backend.ensure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_v6_route_is_one_mutation() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone = via_zone("corp", "2001:db8::1");
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+
+        for _ in 0..1000 {
+            mgr.add_route(ip, &zone).await.unwrap();
+        }
+        assert_eq!(backend.ensure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn v4_and_v6_share_the_registry() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
+            .await
+            .unwrap();
+        assert_eq!(mgr.dynamic_route_count().await, 1);
+
+        // A v6 intent needs a v6 gateway; the fake rejects the mismatch, which
+        // is exactly the family guard the plan requires.
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(mgr.add_route(v6, &zone).await.is_err());
+        assert_eq!(mgr.dynamic_route_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn static_route_does_not_consume_quota() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = RouteManager::with_backend(Arc::clone(&backend), None, 1);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        mgr.add_static_route("10.0.0.0/8", &zone).await.unwrap();
+        assert_eq!(mgr.dynamic_route_count().await, 0);
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
+            .await
+            .unwrap();
+        assert_eq!(mgr.dynamic_route_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_zone_removes_owned_rows() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
+            .await
+            .unwrap();
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), &zone)
+            .await
+            .unwrap();
+
+        mgr.cleanup_zone("corp").await.unwrap();
+        assert_eq!(backend.remove_count(), 2);
+        assert_eq!(mgr.dynamic_route_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn aggregation_installs_a_wider_prefix() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), Some(24));
+        let zone = via_zone("corp", "192.168.1.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), &zone)
+            .await
+            .unwrap();
+
+        let ensured = backend.ensured();
+        assert_eq!(ensured.len(), 1);
+        assert_eq!(ensured[0].key.prefix.prefix_len, 24);
+        assert_eq!(
+            ensured[0].key.prefix.network,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn same_zone_covered_ip_is_a_noop() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), Some(24));
+        let zone = via_zone("corp", "192.168.1.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), &zone)
+            .await
+            .unwrap();
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100)), &zone)
+            .await
+            .unwrap();
+
+        // The second address is covered by the /24, so the registry sees the
+        // same intent and performs no extra mutation.
+        assert_eq!(backend.ensure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_restores_a_dropped_route() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
+            .await
+            .unwrap();
+        assert_eq!(backend.ensure_count(), 1);
+
+        // The fake snapshot is empty, so the audit must re-add the row.
+        let report = mgr.reconcile_all().await.unwrap();
+        assert_eq!(report.adds, 1);
+        assert_eq!(backend.ensure_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_is_idempotent_when_the_row_survives() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone = via_zone("corp", "192.168.1.1");
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        mgr.add_route(ip, &zone).await.unwrap();
+        let ensured = backend.ensured();
+        backend.push_observed(ObservedRoute {
+            key: ensured[0].key.clone(),
+            target: ensured[0].target.clone(),
+            protocol: 3,
+            metric: 0,
+        });
+
+        let report = mgr.reconcile_all().await.unwrap();
+        assert_eq!(report.noops, 1);
+        assert_eq!(report.adds, 0);
+        assert_eq!(backend.ensure_count(), 1);
     }
 }

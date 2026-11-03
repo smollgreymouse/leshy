@@ -1,94 +1,50 @@
-use super::RouteAdder;
+//! Linux route backend: rtnetlink writer plus kernel read-back.
+//!
+//! `ensure_route` never treats EEXIST as unconditional success: a row for the
+//! same destination that points at another interface or gateway is a conflict,
+//! not a match. The kernel is the source of truth, so every mutation is
+//! followed by a read-back of the affected prefix.
+
+use super::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
+use super::model::{
+    family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget,
+};
 use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use netlink_packet_route::route::{RouteAddress, RouteProtocol, RouteScope};
 use rtnetlink::{new_connection, Handle, IpVersion};
+use std::collections::HashMap;
 use std::net::IpAddr;
+use tokio::sync::mpsc;
 
-pub struct LinuxRouteAdder {
+/// Protocol stamped on every row Leshy creates.
+///
+/// `Boot` is what `ip route add` uses by default, so rows installed by earlier
+/// Leshy versions are adopted without a migration step.
+const LESHY_PROTOCOL: RouteProtocol = RouteProtocol::Boot;
+
+/// The main routing table.
+const MAIN_TABLE: u32 = 254;
+
+/// `RouteHeader::table` is a single byte, so the main table is compared in
+/// that width.
+const MAIN_TABLE_U8: u8 = MAIN_TABLE as u8;
+
+pub struct LinuxRouteBackend {
     handle: Handle,
 }
 
-impl LinuxRouteAdder {
+impl LinuxRouteBackend {
     pub fn new() -> Result<Self> {
         let (connection, handle, _) = new_connection()?;
         tokio::spawn(connection);
         Ok(Self { handle })
     }
-}
 
-#[async_trait]
-impl RouteAdder for LinuxRouteAdder {
-    async fn add_via_route(&self, ip: IpAddr, prefix_len: u8, gateway: &str) -> Result<()> {
-        let gateway_ip: IpAddr = gateway.parse().context("Failed to parse gateway IP")?;
-
-        tracing::info!(ip = %ip, prefix_len = prefix_len, gateway = %gateway, "Adding route via gateway");
-
-        let route = match ip {
-            IpAddr::V4(addr) => {
-                let mut route = self.handle.route().add().v4();
-                route.message_mut().header.destination_prefix_length = prefix_len;
-                route.message_mut().attributes.push(
-                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet(
-                        addr,
-                    )),
-                );
-
-                if let IpAddr::V4(gw) = gateway_ip {
-                    route.message_mut().attributes.push(
-                        netlink_packet_route::route::RouteAttribute::Gateway(RouteAddress::Inet(
-                            gw,
-                        )),
-                    );
-                }
-
-                route.message_mut().header.scope = RouteScope::Universe;
-                route.execute().await
-            }
-            IpAddr::V6(addr) => {
-                let mut route = self.handle.route().add().v6();
-                route.message_mut().header.destination_prefix_length = prefix_len;
-                route.message_mut().attributes.push(
-                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet6(
-                        addr,
-                    )),
-                );
-
-                if let IpAddr::V6(gw) = gateway_ip {
-                    route.message_mut().attributes.push(
-                        netlink_packet_route::route::RouteAttribute::Gateway(RouteAddress::Inet6(
-                            gw,
-                        )),
-                    );
-                }
-
-                route.message_mut().header.scope = RouteScope::Universe;
-                route.execute().await
-            }
-        };
-
-        match route {
-            Ok(_) => {
-                tracing::debug!(ip = %ip, gateway = %gateway, "Route added successfully");
-                Ok(())
-            }
-            Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -17) =>
-            {
-                tracing::debug!(ip = %ip, "Route already exists");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(ip = %ip, error = %e, "Failed to add route");
-                Err(e.into())
-            }
-        }
-    }
-
-    async fn add_dev_route(&self, ip: IpAddr, prefix_len: u8, device: &str) -> Result<()> {
-        tracing::info!(ip = %ip, prefix_len = prefix_len, device = device, "Adding route via device");
-
+    /// Resolve an interface name to its current index.
+    async fn ifindex_of(&self, device: &str) -> Result<u32> {
         let mut links = self
             .handle
             .link()
@@ -98,200 +54,427 @@ impl RouteAdder for LinuxRouteAdder {
         let link = links
             .try_next()
             .await?
-            .context(format!("Device '{device}' not found"))?;
+            .with_context(|| format!("Device '{device}' not found"))?;
+        Ok(link.header.index)
+    }
 
-        let route = match ip {
+    /// Map every interface index to its name, so a snapshot can report device
+    /// targets with the same identity the intents carry.
+    async fn link_names(&self) -> Result<HashMap<u32, String>> {
+        let mut links = self.handle.link().get().execute();
+        let mut names = HashMap::new();
+        while let Some(link) = links.try_next().await? {
+            let name = link
+                .attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    netlink_packet_route::link::LinkAttribute::IfName(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            names.insert(link.header.index, name);
+        }
+        Ok(names)
+    }
+
+    /// Read the main table for one address family.
+    async fn dump_family(
+        &self,
+        version: IpVersion,
+        names: &HashMap<u32, String>,
+    ) -> Result<Vec<ObservedRoute>> {
+        let mut routes = self.handle.route().get(version).execute();
+        let mut out = Vec::new();
+        while let Some(msg) = routes.try_next().await? {
+            if msg.header.table != MAIN_TABLE_U8 {
+                continue;
+            }
+            let Some(network) = destination_of(&msg) else {
+                continue;
+            };
+            let Ok(prefix) = RoutePrefix::new(network, msg.header.destination_prefix_length) else {
+                continue;
+            };
+            let Some(target) = target_of(&msg, names) else {
+                continue;
+            };
+            out.push(ObservedRoute {
+                key: RouteKey {
+                    prefix,
+                    table: MAIN_TABLE,
+                },
+                target,
+                protocol: msg.header.protocol.into(),
+                metric: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Find the row that currently occupies `intent.key`, if any.
+    async fn find_row(&self, intent: &RouteIntent) -> Result<Option<ObservedRoute>> {
+        let version = match intent.key.prefix.family() {
+            AddressFamily::V4 => IpVersion::V4,
+            AddressFamily::V6 => IpVersion::V6,
+        };
+        let names = self.link_names().await?;
+        let rows = self.dump_family(version, &names).await?;
+        Ok(rows.into_iter().find(|row| row.key == intent.key))
+    }
+
+    /// Build the netlink add request for an intent.
+    async fn add_row(&self, intent: &RouteIntent) -> Result<()> {
+        let prefix = &intent.key.prefix;
+        let result = match prefix.network {
             IpAddr::V4(addr) => {
                 let mut route = self.handle.route().add().v4();
-                route.message_mut().header.destination_prefix_length = prefix_len;
+                route.message_mut().header.destination_prefix_length = prefix.prefix_len;
+                route.message_mut().header.protocol = LESHY_PROTOCOL;
                 route.message_mut().attributes.push(
                     netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet(
                         addr,
                     )),
                 );
-                route.message_mut().attributes.push(
-                    netlink_packet_route::route::RouteAttribute::Oif(link.header.index),
-                );
-                route.message_mut().header.scope = RouteScope::Link;
+                match &intent.target {
+                    RouteTarget::Gateway(IpAddr::V4(gw)) => {
+                        route.message_mut().attributes.push(
+                            netlink_packet_route::route::RouteAttribute::Gateway(
+                                RouteAddress::Inet(*gw),
+                            ),
+                        );
+                        route.message_mut().header.scope = RouteScope::Universe;
+                    }
+                    RouteTarget::Device {
+                        ifindex: Some(index),
+                        ..
+                    } => {
+                        route
+                            .message_mut()
+                            .attributes
+                            .push(netlink_packet_route::route::RouteAttribute::Oif(*index));
+                        route.message_mut().header.scope = RouteScope::Link;
+                    }
+                    other => anyhow::bail!(
+                        "route {} cannot be installed with target {other:?}",
+                        intent.key.prefix.network
+                    ),
+                }
                 route.execute().await
             }
             IpAddr::V6(addr) => {
                 let mut route = self.handle.route().add().v6();
-                route.message_mut().header.destination_prefix_length = prefix_len;
+                route.message_mut().header.destination_prefix_length = prefix.prefix_len;
+                route.message_mut().header.protocol = LESHY_PROTOCOL;
                 route.message_mut().attributes.push(
                     netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet6(
                         addr,
                     )),
                 );
-                route.message_mut().attributes.push(
-                    netlink_packet_route::route::RouteAttribute::Oif(link.header.index),
-                );
-                route.message_mut().header.scope = RouteScope::Link;
+                match &intent.target {
+                    RouteTarget::Gateway(IpAddr::V6(gw)) => {
+                        route.message_mut().attributes.push(
+                            netlink_packet_route::route::RouteAttribute::Gateway(
+                                RouteAddress::Inet6(*gw),
+                            ),
+                        );
+                        route.message_mut().header.scope = RouteScope::Universe;
+                    }
+                    RouteTarget::Device {
+                        ifindex: Some(index),
+                        ..
+                    } => {
+                        route
+                            .message_mut()
+                            .attributes
+                            .push(netlink_packet_route::route::RouteAttribute::Oif(*index));
+                        route.message_mut().header.scope = RouteScope::Link;
+                    }
+                    other => anyhow::bail!(
+                        "route {} cannot be installed with target {other:?}",
+                        intent.key.prefix.network
+                    ),
+                }
                 route.execute().await
             }
         };
 
-        match route {
-            Ok(_) => {
-                tracing::debug!(ip = %ip, device = device, "Route added successfully");
-                Ok(())
-            }
+        match result {
+            Ok(()) => Ok(()),
             Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -17) =>
             {
-                tracing::debug!(ip = %ip, "Route already exists");
+                // EEXIST: the caller decides whether the existing row matches.
                 Ok(())
             }
-            Err(e) => {
-                tracing::error!(ip = %ip, error = %e, "Failed to add route");
-                Err(e.into())
-            }
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// Report whether the kernel still routes `ip/prefix_len` through the
-    /// zone's target. The in-memory bookkeeping cannot be trusted alone: the
-    /// Go core withdraws routes during fail-closed recovery and external
-    /// daemons may drop them, so a stale "installed" set must not mask the
-    /// loss. Mirrors the Windows implementation.
-    async fn route_matches(&self, ip: IpAddr, prefix_len: u8, zone: &ZoneConfig) -> Result<bool> {
-        let version = match ip {
-            IpAddr::V4(_) => IpVersion::V4,
-            IpAddr::V6(_) => IpVersion::V6,
-        };
-        let (target_index, target_gateway): (Option<u32>, Option<IpAddr>) = match zone.route_type {
-            RouteType::Dev => {
-                let device = tokio::fs::read_to_string(&zone.route_target)
-                    .await
-                    .with_context(|| format!("read device file {}", zone.route_target))?;
-                let device = device.trim().to_string();
-                let mut links = self
-                    .handle
-                    .link()
-                    .get()
-                    .match_name(device.clone())
-                    .execute();
-                let link = links
-                    .try_next()
-                    .await?
-                    .with_context(|| format!("Device '{device}' not found"))?;
-                (Some(link.header.index), None)
-            }
-            RouteType::Via => {
-                let gw: IpAddr = zone
-                    .route_target
-                    .trim()
-                    .parse()
-                    .with_context(|| format!("parse gateway {}", zone.route_target))?;
-                (None, Some(gw))
-            }
-        };
-
-        // rtnetlink's route GET is implemented as a dump, and the kernel
-        // ignores the destination/table fields of a dump request (verified on
-        // 6.x: every route from every table comes back). Filter in userspace:
-        // only the exact destination/prefix inside the main table counts.
-        let mut req = self.handle.route().get(version);
-
-        let mut routes = req.execute();
-        let mut considered = 0usize;
-        while let Some(msg) = routes.try_next().await? {
-            if msg.header.table != netlink_packet_route::route::RouteHeader::RT_TABLE_MAIN
-                || msg.header.destination_prefix_length != prefix_len
-            {
-                continue;
-            }
-            let dst_matches = msg.attributes.iter().any(|attr| match (ip, attr) {
-                (
-                    IpAddr::V4(addr),
-                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet(
-                        found,
-                    )),
-                ) => *found == addr,
-                (
-                    IpAddr::V6(addr),
-                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet6(
-                        found,
-                    )),
-                ) => *found == addr,
-                _ => false,
-            });
-            if !dst_matches {
-                continue;
-            }
-            considered += 1;
-            let mut oif: Option<u32> = None;
-            let mut gateway: Option<IpAddr> = None;
-            for attr in msg.attributes.iter() {
-                match attr {
-                    netlink_packet_route::route::RouteAttribute::Oif(index) => {
-                        oif = Some(*index);
-                    }
-                    netlink_packet_route::route::RouteAttribute::Gateway(gw) => match gw {
-                        RouteAddress::Inet(v4) => gateway = Some(IpAddr::V4(*v4)),
-                        RouteAddress::Inet6(v6) => gateway = Some(IpAddr::V6(*v6)),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
-            match (target_index, target_gateway) {
-                (Some(index), _) if oif == Some(index) => {
-                    tracing::debug!(ip = %ip, prefix = prefix_len, "Route matches zone target");
-                    return Ok(true);
-                }
-                (_, Some(gw)) if gateway == Some(gw) => {
-                    tracing::debug!(ip = %ip, prefix = prefix_len, "Route matches zone gateway");
-                    return Ok(true);
-                }
-                _ => {}
-            }
-        }
-        tracing::info!(ip = %ip, prefix = prefix_len, zone = zone.name, considered = considered, "Kernel route check: destination is not routed via the zone target");
-        Ok(false)
-    }
-
-    async fn remove_route(&self, ip: IpAddr, prefix_len: u8) -> Result<()> {
-        tracing::info!(ip = %ip, prefix_len = prefix_len, "Removing route");
-
-        let result = match ip {
+    /// Delete the row occupying `intent.key`.
+    async fn delete_row(&self, intent: &RouteIntent) -> Result<()> {
+        let prefix = &intent.key.prefix;
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.header.destination_prefix_length = prefix.prefix_len;
+        msg.header.protocol = LESHY_PROTOCOL;
+        msg.header.table = MAIN_TABLE_U8;
+        match prefix.network {
             IpAddr::V4(addr) => {
-                let mut msg = netlink_packet_route::route::RouteMessage::default();
-                msg.header.destination_prefix_length = prefix_len;
-                msg.header.protocol = RouteProtocol::Boot;
                 msg.attributes
                     .push(netlink_packet_route::route::RouteAttribute::Destination(
                         RouteAddress::Inet(addr),
                     ));
-                self.handle.route().del(msg).execute().await
             }
             IpAddr::V6(addr) => {
-                let mut msg = netlink_packet_route::route::RouteMessage::default();
-                msg.header.destination_prefix_length = prefix_len;
-                msg.header.protocol = RouteProtocol::Boot;
                 msg.header.address_family = netlink_packet_route::AddressFamily::Inet6;
                 msg.attributes
                     .push(netlink_packet_route::route::RouteAttribute::Destination(
                         RouteAddress::Inet6(addr),
                     ));
-                self.handle.route().del(msg).execute().await
-            }
-        };
-
-        match result {
-            Ok(_) => {
-                tracing::debug!(ip = %ip, prefix_len = prefix_len, "Route removed successfully");
-                Ok(())
-            }
-            Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -3) =>
-            {
-                // ESRCH = no such route, not an error
-                tracing::debug!(ip = %ip, "Route does not exist, nothing to remove");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(ip = %ip, error = %e, "Failed to remove route");
-                Err(e.into())
             }
         }
+
+        match self.handle.route().del(msg).execute().await {
+            Ok(()) => Ok(()),
+            // ESRCH: nothing to delete.
+            Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -3) => {
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Extract the destination address from a route message.
+fn destination_of(msg: &netlink_packet_route::route::RouteMessage) -> Option<IpAddr> {
+    msg.attributes.iter().find_map(|attr| match attr {
+        netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet(addr)) => {
+            Some(IpAddr::V4(*addr))
+        }
+        netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet6(addr)) => {
+            Some(IpAddr::V6(*addr))
+        }
+        _ => None,
+    })
+}
+
+/// Extract the forwarding target from a route message.
+fn target_of(
+    msg: &netlink_packet_route::route::RouteMessage,
+    names: &HashMap<u32, String>,
+) -> Option<RouteTarget> {
+    let mut oif = None;
+    let mut gateway = None;
+    for attr in msg.attributes.iter() {
+        match attr {
+            netlink_packet_route::route::RouteAttribute::Oif(index) => oif = Some(*index),
+            netlink_packet_route::route::RouteAttribute::Gateway(gw) => match gw {
+                RouteAddress::Inet(v4) => gateway = Some(IpAddr::V4(*v4)),
+                RouteAddress::Inet6(v6) => gateway = Some(IpAddr::V6(*v6)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if let Some(gw) = gateway {
+        return Some(RouteTarget::Gateway(gw));
+    }
+    oif.map(|index| RouteTarget::Device {
+        name: names.get(&index).cloned().unwrap_or_default(),
+        ifindex: Some(index),
+    })
+}
+
+#[async_trait]
+impl RouteBackend for LinuxRouteBackend {
+    async fn resolve_target(
+        &self,
+        zone: &ZoneConfig,
+        family: AddressFamily,
+    ) -> Result<RouteTarget> {
+        match zone.route_type {
+            RouteType::Dev => {
+                let device = tokio::fs::read_to_string(&zone.route_target)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Device file '{}' not found (VPN not connected?)",
+                            zone.route_target
+                        )
+                    })?;
+                let device = device.trim().to_string();
+                if device.is_empty() {
+                    anyhow::bail!("Device file '{}' is empty", zone.route_target);
+                }
+                let ifindex = self.ifindex_of(&device).await?;
+                Ok(RouteTarget::Device {
+                    name: device,
+                    ifindex: Some(ifindex),
+                })
+            }
+            RouteType::Via => {
+                let gateway: IpAddr = zone
+                    .route_target
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("parse gateway {}", zone.route_target))?;
+                if family_of(gateway) != family {
+                    anyhow::bail!(
+                        "zone '{}': gateway {gateway} does not match the {family:?} route family",
+                        zone.name
+                    );
+                }
+                Ok(RouteTarget::Gateway(gateway))
+            }
+        }
+    }
+
+    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
+        // A row already occupying this prefix decides the outcome: an exact
+        // match is a no-op, anything else is a conflict we must not clobber.
+        if let Some(existing) = self.find_row(intent).await? {
+            if existing.target == intent.target {
+                return Ok(EnsureOutcome::AlreadyMatching);
+            }
+            anyhow::bail!(
+                "route {} is already owned by {:?}, refusing to replace it with {:?}",
+                intent.key.prefix.network,
+                existing.target,
+                intent.target
+            );
+        }
+
+        self.add_row(intent).await?;
+
+        // Read back: the kernel is the only proof the route exists.
+        match self.find_row(intent).await? {
+            Some(row) if row.target == intent.target => Ok(EnsureOutcome::Added),
+            Some(row) => anyhow::bail!(
+                "route {} landed on {:?} instead of {:?}",
+                intent.key.prefix.network,
+                row.target,
+                intent.target
+            ),
+            None => anyhow::bail!(
+                "route {} is missing right after it was added",
+                intent.key.prefix.network
+            ),
+        }
+    }
+
+    async fn remove_route(&self, intent: &RouteIntent) -> Result<()> {
+        match self.find_row(intent).await? {
+            // Only delete a row Leshy owns; a foreign row on the same prefix
+            // belongs to someone else.
+            Some(row) if row.target == intent.target => self.delete_row(intent).await,
+            Some(row) => {
+                tracing::debug!(
+                    prefix = %intent.key.prefix.network,
+                    prefix_len = intent.key.prefix.prefix_len,
+                    owner = ?row.target,
+                    "Leaving a foreign route in place"
+                );
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
+        let names = self.link_names().await?;
+        let mut out = self.dump_family(IpVersion::V4, &names).await?;
+        out.extend(self.dump_family(IpVersion::V6, &names).await?);
+        Ok(out)
+    }
+
+    fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
+        // The netlink monitor lands in a later step; until then the registry
+        // relies on explicit reconciliation only.
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn leshy_protocol_is_boot() {
+        // Rows installed by earlier versions used the kernel default, which is
+        // `boot`; keeping it avoids an adoption migration.
+        assert_eq!(u8::from(LESHY_PROTOCOL), 3);
+    }
+
+    #[test]
+    fn main_table_is_254() {
+        assert_eq!(MAIN_TABLE, 254);
+    }
+
+    #[test]
+    fn destination_extraction_v4() {
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Destination(
+                RouteAddress::Inet(Ipv4Addr::new(10, 1, 2, 3)),
+            ));
+        assert_eq!(
+            destination_of(&msg),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)))
+        );
+    }
+
+    #[test]
+    fn destination_extraction_v6() {
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Destination(
+                RouteAddress::Inet6(Ipv6Addr::LOCALHOST),
+            ));
+        assert_eq!(destination_of(&msg), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn destination_missing_is_none() {
+        let msg = netlink_packet_route::route::RouteMessage::default();
+        assert_eq!(destination_of(&msg), None);
+    }
+
+    #[test]
+    fn gateway_wins_over_oif() {
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Oif(7));
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Gateway(
+                RouteAddress::Inet(Ipv4Addr::new(192, 168, 1, 1)),
+            ));
+        let names = HashMap::new();
+        assert_eq!(
+            target_of(&msg, &names),
+            Some(RouteTarget::Gateway(IpAddr::V4(Ipv4Addr::new(
+                192, 168, 1, 1
+            ))))
+        );
+    }
+
+    #[test]
+    fn oif_becomes_device_target_with_name() {
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Oif(7));
+        let mut names = HashMap::new();
+        names.insert(7u32, "tun0".to_string());
+        assert_eq!(
+            target_of(&msg, &names),
+            Some(RouteTarget::Device {
+                name: "tun0".to_string(),
+                ifindex: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn no_target_attributes_is_none() {
+        let msg = netlink_packet_route::route::RouteMessage::default();
+        assert_eq!(target_of(&msg, &HashMap::new()), None);
     }
 }
