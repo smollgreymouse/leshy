@@ -95,6 +95,17 @@ domains = ["netns.test"]
     (manager, config)
 }
 
+/// Install a tracing subscriber so monitor/reconcile decisions are visible
+/// with RUST_LOG when the acceptance runs.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("leshy=debug,warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_test_writer()
+        .try_init();
+}
+
 /// The whole acceptance walk in one test so the namespace state stays
 /// sequential and deterministic (the script passes --test-threads=1 anyway).
 #[tokio::test(flavor = "multi_thread")]
@@ -105,6 +116,7 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         return;
     };
     assert!(running_as_root(), "the netns harness runs as root");
+    init_tracing();
 
     let (manager, config) = manager_with_dev_zone().await;
     let zone = config.zones[0].clone();
