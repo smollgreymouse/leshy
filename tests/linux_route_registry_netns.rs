@@ -15,6 +15,7 @@ use leshy::config::Config;
 use leshy::routing::RouteManager;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
+use std::time::Duration;
 
 /// The dummy interface the script created inside the namespace.
 fn netns_dev() -> Option<String> {
@@ -49,6 +50,20 @@ fn kernel_table() -> String {
         ip(&["route", "show", "table", "main"]),
         ip(&["-6", "route", "show", "table", "main"])
     )
+}
+
+/// Poll a kernel-truth condition; monitor-driven changes are asynchronous
+/// (event debounce plus reconcile), so the acceptance waits for them.
+async fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool, what: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = std::fmt::format(format_args!("{what}"));
+    cond()
 }
 
 /// Build the production manager against a dev zone in the current namespace.
@@ -122,7 +137,7 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         "a converged table must not change under repeated DNS classifications"
     );
 
-    // --- external deletion is restored once -------------------------------
+    // --- external deletion is restored by the monitor, exactly once -------
     Command::new("ip")
         .args(["route", "del", &V4_HOST.to_string(), "table", "main"])
         .output()
@@ -131,14 +146,23 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         !kernel_table().contains(&format!("{V4_HOST} dev")),
         "the row must be gone after the external delete"
     );
+    // A DNS classification for a still-Verified entry is the zero-IO fast
+    // path: the monitor owns the restoration, not the request path.
     manager
         .add_route(IpAddr::V4(V4_HOST), &zone)
         .await
-        .expect("the missing row is restored");
+        .expect("fast-path classification stays ok");
     assert!(
-        kernel_table().contains(&format!("{V4_HOST} dev")),
-        "the /32 row must be back after reconciliation"
+        !kernel_table().contains(&format!("{V4_HOST} dev")),
+        "the request path must not restore the row: kernel drift is the monitor's job"
     );
+    let restored = wait_for(
+        Duration::from_secs(10),
+        || kernel_table().contains(&format!("{V4_HOST} dev")),
+        "the monitor must restore the externally deleted row",
+    )
+    .await;
+    assert!(restored, "the /32 row must be back after reconciliation");
     let after_restore = kernel_table();
 
     // Repeated classifications after the restore stay flat.
@@ -179,24 +203,31 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         "the foreign row must survive the refused ensure"
     );
 
-    // Explicit zone cleanup must not delete it either.
+    // Explicit zone cleanup must not delete it either. Owned rows go away;
+    // the foreign row and everything else stay byte-identical.
     manager.cleanup_zone(&zone.name).await.unwrap();
+    let _ = wait_for(
+        Duration::from_secs(5),
+        || !kernel_table().contains(&format!("{V4_HOST} dev")),
+        "owned rows are cleaned up",
+    )
+    .await;
     let foreign_after = kernel_table();
     assert!(
         foreign_after.contains(FOREIGN),
-        "the foreign row must survive the zone cleanup"
+        "the foreign row must survive the zone cleanup:\n{foreign_after}"
     );
     assert!(
         !foreign_after.contains(&format!("{V4_HOST} dev")),
-        "owned rows are cleaned up"
+        "owned rows are cleaned up:\n{foreign_after}"
     );
     assert!(
         !foreign_after.contains(&format!("{V6_HOST} dev")),
-        "owned v6 rows are cleaned up"
+        "owned v6 rows are cleaned up:\n{foreign_after}"
     );
     assert_eq!(
         foreign_after, foreign_before,
-        "cleanup must remove only owned rows, leaving the table otherwise identical"
+        "cleanup must remove only owned rows, leaving the table otherwise identical:\nbefore:\n{foreign_before}\nafter:\n{foreign_after}"
     );
 
     // Cleanup is idempotent: a second pass touches nothing.
@@ -242,7 +273,21 @@ async fn real_kernel_dual_stack_through_one_device() {
     assert_eq!(manager.dynamic_route_count().await, 2);
 
     manager.cleanup_zone(&zone.name).await.unwrap();
+    let _ = wait_for(
+        Duration::from_secs(5),
+        || !kernel_table().contains("10.55.8.1 dev"),
+        "owned v4 row must be cleaned up",
+    )
+    .await;
     let table = kernel_table();
-    assert!(!table.contains("10.55.8.1 dev"));
-    assert!(!table.contains("fd00:55::8 dev"));
+    assert!(
+        !table.contains("10.55.8.1 dev"),
+        "owned v4 row must be cleaned up:
+{table}"
+    );
+    assert!(
+        !table.contains("fd00:55::8 dev"),
+        "owned v6 row must be cleaned up:
+{table}"
+    );
 }
