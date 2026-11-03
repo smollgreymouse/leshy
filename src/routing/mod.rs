@@ -1,10 +1,18 @@
 mod aggregator;
+pub(crate) mod backend;
+mod model;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+pub use model::{
+    family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteSource,
+    RouteState, RouteTarget,
+};
 
 use crate::config::{RouteType, ZoneConfig};
 use aggregator::{RouteAction, RouteAggregator};
@@ -34,7 +42,12 @@ pub(crate) trait RouteAdder: Send + Sync {
     /// Report whether the kernel already routes `ip/prefix_len` towards the
     /// zone's target. Platforms that cannot inspect their table return `true`
     /// and keep the historical "trust the bookkeeping" behaviour.
-    async fn route_matches(&self, _ip: IpAddr, _prefix_len: u8, _zone: &ZoneConfig) -> Result<bool> {
+    async fn route_matches(
+        &self,
+        _ip: IpAddr,
+        _prefix_len: u8,
+        _zone: &ZoneConfig,
+    ) -> Result<bool> {
         Ok(true)
     }
 }
