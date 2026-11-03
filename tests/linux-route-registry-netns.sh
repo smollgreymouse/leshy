@@ -4,6 +4,9 @@
 # creates its own namespace and interfaces and cleans them with a trap.
 #
 # Usage: sudo ./tests/linux-route-registry-netns.sh
+#
+# The build runs as the invoking user; only the already-built test binary is
+# executed inside the namespace as root (no cargo, no registry under root).
 set -euo pipefail
 
 NS="leshy-route-registry-$$"
@@ -15,6 +18,10 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 if ! command -v ip >/dev/null 2>&1; then
     echo "iproute2 is required" >&2
+    exit 1
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "rust cargo is required" >&2
     exit 1
 fi
 
@@ -32,7 +39,15 @@ ip -n "$NS" link set "$DEV" up
 echo "namespace $NS ready (device $DEV)"
 
 cd "$(dirname "$0")/.."
-LESHY_NETNS_DEV="$DEV" CARGO_NET_OFFLINE=true \
-    ip netns exec "$NS" cargo test \
-        --test linux_route_registry_netns \
-        -- --ignored --test-threads=1 --nocapture
+echo "building the acceptance test binary..."
+CARGO_NET_OFFLINE=true cargo test --test linux_route_registry_netns --no-run
+
+BIN=$(ls -t target/debug/deps/linux_route_registry_netns-* 2>/dev/null \
+    | grep -v '\.d$' | head -1 || true)
+if [[ -z "$BIN" ]]; then
+    echo "could not locate the test binary under target/debug/deps" >&2
+    exit 1
+fi
+
+LESHY_NETNS_DEV="$DEV" ip netns exec "$NS" "$BIN" \
+    --ignored --test-threads=1 --nocapture
