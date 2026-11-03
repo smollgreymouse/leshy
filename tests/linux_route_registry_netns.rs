@@ -69,6 +69,7 @@ name = "netns"
 route_type = "dev"
 route_target = "{}"
 ipv6 = true
+domains = ["netns.test"]
 "#,
         device_file.display()
     ))
