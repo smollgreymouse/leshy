@@ -217,8 +217,15 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
 
     // --- a foreign row is never replaced nor deleted ----------------------
     const FOREIGN: &str = "10.55.9.9/32";
+    // `ip route show` prints host routes without the /32 suffix.
+    const FOREIGN_ROW: &str = "10.55.9.9 dev lo";
     ip(&["route", "add", FOREIGN, "dev", "lo", "table", "main"]);
     let foreign_before = kernel_table();
+    assert!(
+        foreign_before.contains(FOREIGN_ROW),
+        "the foreign fixture row must exist:
+{foreign_before}"
+    );
 
     let result = manager
         .add_route(IpAddr::V4(Ipv4Addr::new(10, 55, 9, 9)), &zone)
@@ -228,8 +235,10 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         "a foreign row on the same prefix must be refused, not replaced"
     );
     assert!(
-        kernel_table().contains(FOREIGN),
-        "the foreign row must survive the refused ensure"
+        kernel_table().contains(FOREIGN_ROW),
+        "the foreign row must survive the refused ensure:
+{}",
+        kernel_table()
     );
 
     // Explicit zone cleanup must not delete it either. Owned rows go away;
