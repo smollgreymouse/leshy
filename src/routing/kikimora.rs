@@ -74,6 +74,10 @@ pub(crate) struct LeshyRouteResultWire {
     pub generation: u64,
     /// applied | already-applied | denied | conflict
     pub state: String,
+    /// Denial marker: "family N is not ready for this role" lets the DNS
+    /// layer suppress that family with NODATA instead of SERVFAIL.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -309,10 +313,14 @@ impl KikimoraRouteBackend {
             "applied" => Ok(EnsureOutcome::Added),
             "already-applied" => Ok(EnsureOutcome::AlreadyMatching),
             "denied" => Err(anyhow::anyhow!(ControllerDenied {
-                reason: format!(
-                    "role '{}' generation {} refused {}",
-                    result.role, result.generation, result.prefix
-                ),
+                // The controller's own marker wins: a family-not-ready
+                // denial is the family-suppression contract.
+                reason: result.reason.clone().unwrap_or_else(|| {
+                    format!(
+                        "role '{}' generation {} refused {}",
+                        result.role, result.generation, result.prefix
+                    )
+                }),
             })),
             "conflict" => Err(anyhow::anyhow!(RouteConflict {
                 prefix: result.prefix.clone(),
@@ -504,6 +512,9 @@ pub(crate) mod fake {
     pub(crate) struct FakeTransport {
         requests: Mutex<Vec<ControlRequest>>,
         response: Mutex<Option<ControlResponse>>,
+        /// Per-family overrides: a real controller denies one family while
+        /// applying the other.
+        by_family: Mutex<std::collections::HashMap<u8, ControlResponse>>,
     }
 
     impl FakeTransport {
@@ -511,7 +522,20 @@ pub(crate) mod fake {
             Self {
                 requests: Mutex::new(Vec::new()),
                 response: Mutex::new(None),
+                by_family: Mutex::new(std::collections::HashMap::new()),
             }
+        }
+
+        /// Script the verdict for one address family only.
+        pub(crate) fn set_result_for_family(&self, family: u8, result: LeshyRouteResultWire) {
+            let response = ControlResponse {
+                ok: true,
+                error: String::new(),
+                capabilities: vec![MANAGED_CAPABILITY.to_string()],
+                leshy_route: Some(result),
+                snapshot: None,
+            };
+            self.by_family.lock().unwrap().insert(family, response);
         }
 
         pub(crate) fn set_result(&self, result: LeshyRouteResultWire) {
@@ -562,6 +586,19 @@ pub(crate) mod fake {
                 method: method.to_string(),
                 leshy_route: intent.cloned(),
             });
+            // Family-scoped scripts win: a real controller answers per family.
+            if let Some(intent) = intent {
+                let family = if intent.prefix.contains(':') { 6 } else { 4 };
+                if let Some(response) = self.by_family.lock().unwrap().get(&family) {
+                    if response.ok {
+                        return Ok((response.capabilities.clone(), response.leshy_route.clone()));
+                    }
+                    return Err(anyhow::anyhow!(
+                        "kikimora {method} failed: {}",
+                        response.error
+                    ));
+                }
+            }
             match self.response.lock().unwrap().clone() {
                 Some(response) if response.ok => Ok((response.capabilities, response.leshy_route)),
                 Some(response) => bail!("kikimora {method} failed: {}", response.error),
@@ -592,6 +629,7 @@ pub(crate) mod fake {
             family,
             generation: 7,
             state: "applied".to_string(),
+            reason: None,
         }
     }
 }
@@ -801,7 +839,10 @@ mod tests {
             .add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
             .await
             .unwrap_err();
-        assert_eq!(err.to_string(), "route authority denied by the controller");
+        assert_eq!(
+            err.to_string(),
+            "route authority denied by the controller: role 'primary' generation 7 refused 10.0.0.1/32"
+        );
     }
 
     #[test]
@@ -813,6 +854,7 @@ mod tests {
             family: 6,
             generation: 7,
             state: "applied".to_string(),
+            reason: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"role\":\"primary\""));

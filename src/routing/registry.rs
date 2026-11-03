@@ -138,8 +138,10 @@ impl RouteRegistry {
                 if e.downcast_ref::<RouteConflict>().is_some() {
                     bail!(RouteError::Conflict);
                 }
-                if e.downcast_ref::<ControllerDenied>().is_some() {
-                    bail!(RouteError::AuthorityDenied);
+                if let Some(denied) = e.downcast_ref::<ControllerDenied>() {
+                    bail!(RouteError::AuthorityDenied {
+                        reason: denied.reason.clone(),
+                    });
                 }
                 bail!(RouteError::Apply(e));
             }
@@ -408,9 +410,13 @@ pub enum RouteError {
     Apply(anyhow::Error),
     CapacityExceeded,
     Conflict,
-    /// Reserved for the Kikimora managed backend: the controller refused the
-    /// intent, which is a safety denial like any other.
-    AuthorityDenied,
+    /// The Kikimora managed backend refused the intent, which is a safety
+    /// denial like any other. A "family N is not ready" reason is the
+    /// controller's family-suppression contract: the resolver answers that
+    /// family with NODATA instead of SERVFAIL.
+    AuthorityDenied {
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for RouteError {
@@ -419,7 +425,9 @@ impl std::fmt::Display for RouteError {
             RouteError::Apply(e) => write!(f, "route apply: {e}"),
             RouteError::CapacityExceeded => write!(f, "route capacity exceeded"),
             RouteError::Conflict => write!(f, "route conflict with a foreign kernel route"),
-            RouteError::AuthorityDenied => write!(f, "route authority denied by the controller"),
+            RouteError::AuthorityDenied { reason } => {
+                write!(f, "route authority denied by the controller: {reason}")
+            }
         }
     }
 }

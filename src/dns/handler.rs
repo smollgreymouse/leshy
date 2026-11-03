@@ -224,7 +224,7 @@ impl DnsHandler {
     /// says. Only `Apply` honours the legacy compatibility fallback.
     async fn add_routes_from_response(
         &self,
-        message: &Message,
+        message: &mut Message,
         qname: &str,
     ) -> Result<RouteResponse, RouteError> {
         let matched_zone = match self.matcher.find_zone(qname) {
@@ -289,6 +289,21 @@ impl DnsHandler {
                     Ok(error) => error,
                     Err(e) => RouteError::Apply(e),
                 };
+                // A controller "family N is not ready" denial is the family
+                // suppression contract (08D §12 suppressed/denied): answer
+                // without that family (NODATA) instead of failing the whole
+                // response.
+                if let RouteError::AuthorityDenied { reason } = &classified {
+                    if reason.contains("is not ready for this role")
+                        && crate::routing::family_of(ip) == crate::routing::AddressFamily::V6
+                    {
+                        suppressed = true;
+                        message
+                            .answers_mut()
+                            .retain(|record| record.record_type() != RecordType::AAAA);
+                        continue;
+                    }
+                }
                 tracing::warn!(
                     ip = %ip,
                     zone = matched_zone.config.name,
@@ -326,9 +341,9 @@ impl DnsHandler {
     /// whatever the legacy fallback says. `Apply` honours `route_failure_mode`.
     fn must_fail_closed(&self, error: &RouteError) -> bool {
         match error {
-            RouteError::CapacityExceeded | RouteError::Conflict | RouteError::AuthorityDenied => {
-                true
-            }
+            RouteError::CapacityExceeded
+            | RouteError::Conflict
+            | RouteError::AuthorityDenied { .. } => true,
             RouteError::Apply(_) => {
                 self.config.server.route_failure_mode == RouteFailureMode::Servfail
             }
@@ -456,7 +471,9 @@ impl DnsHandler {
 fn denial_rank(error: &RouteError) -> u8 {
     match error {
         RouteError::Apply(_) => 0,
-        RouteError::CapacityExceeded | RouteError::Conflict | RouteError::AuthorityDenied => 1,
+        RouteError::CapacityExceeded
+        | RouteError::Conflict
+        | RouteError::AuthorityDenied { .. } => 1,
     }
 }
 
@@ -530,12 +547,12 @@ impl RequestHandler for DnsHandler {
 
         // Check cache before forwarding
         if self.cache.is_enabled() {
-            if let Some(cached) = self.cache.lookup(&qname, qtype) {
+            if let Some(mut cached) = self.cache.lookup(&qname, qtype) {
                 tracing::debug!(qname = qname, qtype = ?qtype, "Cache hit");
 
                 // Still add routes from the cached response; a routing failure
                 // has to be able to turn into SERVFAIL, so wait for the result.
-                let route_result = self.add_routes_from_response(&cached, &qname).await;
+                let route_result = self.add_routes_from_response(&mut cached, &qname).await;
                 if let Err(error) = &route_result {
                     if self.must_fail_closed(error) {
                         tracing::warn!(
@@ -655,7 +672,7 @@ impl RequestHandler for DnsHandler {
                 // must not hand out AAAA answers: the client would send
                 // that traffic around the tunnel over the physical link
                 // (or into a black hole) while the A path stays protected.
-                let response = match &zone {
+                let mut response = match &zone {
                     Some(z) if !z.config.advertises_ipv6() => {
                         tracing::debug!(
                             qname = qname,
@@ -674,7 +691,7 @@ impl RequestHandler for DnsHandler {
 
                 // Install routes for the resolved IPs before answering, so the
                 // configured failure mode can act on a routing failure.
-                let route_result = self.add_routes_from_response(&response, &qname).await;
+                let route_result = self.add_routes_from_response(&mut response, &qname).await;
                 if let Err(error) = &route_result {
                     if self.must_fail_closed(error) {
                         tracing::warn!(
@@ -1290,5 +1307,96 @@ route_target = "192.0.2.1"
         // The refusal reached the controller exactly once; no local writer
         // was ever involved.
         assert_eq!(transport.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn controller_family_not_ready_denial_suppresses_aaaa_with_nodata() {
+        use crate::routing::kikimora::{fake::FakeTransport, KikimoraRouteBackend};
+
+        // The controller denies the AAAA intent with the family-not-ready
+        // marker: the answer proceeds without AAAA (NODATA) instead of
+        // SERVFAIL — the suppressed shape of 08D §12.
+        let transport = Arc::new(FakeTransport::new());
+        let mut v6denial = crate::routing::kikimora::fake::applied_result("2001:db8::10/128", 6);
+        v6denial.state = "denied".to_string();
+        v6denial.reason = Some("family 6 is not ready for this role".to_string());
+        transport.set_result_for_family(6, v6denial);
+        transport.set_result(crate::routing::kikimora::fake::applied_result(
+            "1.2.3.4/32",
+            4,
+        ));
+
+        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+        let mut config = e2e_config(
+            RouteFailureMode::Servfail,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+        );
+        config.zones[0].ipv6 = true;
+        config.zones[0].route_target_ipv6 = Some("2001:db8::1".to_string());
+        let matcher = ZoneMatcher::new(config.zones.clone()).unwrap();
+        let manager = RouteManager::with_backend(
+            Arc::new(backend),
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        );
+        let handler = DnsHandler::with_route_manager(config, matcher, manager);
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        let v6 = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        handler.cache.insert(
+            "example.com.",
+            RecordType::A,
+            cached_response("example.com.", &[v4, v6]),
+            Duration::from_secs(60),
+        );
+
+        let answer = run_query(&handler, "example.com", RecordType::A).await;
+        assert_eq!(answer.response_code(), ResponseCode::NoError);
+        let types: Vec<_> = answer.answers().iter().map(|r| r.record_type()).collect();
+        assert_eq!(types, vec![RecordType::A], "AAAA must be suppressed");
+        // The A route was still installed; only the AAAA intent was denied.
+        assert_eq!(transport.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn controller_capacity_denial_still_servfails_aaaa() {
+        use crate::routing::kikimora::{fake::FakeTransport, KikimoraRouteBackend};
+
+        // A non-family denial (capacity) stays a fail-closed SERVFAIL: only the
+        // family-not-ready marker suppresses with NODATA.
+        let transport = Arc::new(FakeTransport::new());
+        let mut v6denial = crate::routing::kikimora::fake::applied_result("2001:db8::10/128", 6);
+        v6denial.state = "denied".to_string();
+        v6denial.reason = Some("selected-route capacity 16384 reached for this role".to_string());
+        transport.set_result_for_family(6, v6denial);
+        transport.set_result(crate::routing::kikimora::fake::applied_result(
+            "1.2.3.4/32",
+            4,
+        ));
+
+        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+        let mut config = e2e_config(
+            RouteFailureMode::Fallback,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+        );
+        config.zones[0].ipv6 = true;
+        config.zones[0].route_target_ipv6 = Some("2001:db8::1".to_string());
+        let matcher = ZoneMatcher::new(config.zones.clone()).unwrap();
+        let manager = RouteManager::with_backend(
+            Arc::new(backend),
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        );
+        let handler = DnsHandler::with_route_manager(config, matcher, manager);
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        let v6 = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        handler.cache.insert(
+            "example.com.",
+            RecordType::A,
+            cached_response("example.com.", &[v4, v6]),
+            Duration::from_secs(60),
+        );
+
+        let answer = run_query(&handler, "example.com", RecordType::A).await;
+        assert_eq!(answer.response_code(), ResponseCode::ServFail);
     }
 }
