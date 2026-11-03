@@ -40,7 +40,16 @@ echo "namespace $NS ready (device $DEV)"
 
 cd "$(dirname "$0")/.."
 echo "building the acceptance test binary..."
-CARGO_NET_OFFLINE=true cargo test --test linux_route_registry_netns --no-run
+# The build must run as the registry owner (its CARGO_HOME/registry cache);
+# only the already-built test binary is executed inside the namespace as root.
+if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" env \
+        HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)" \
+        CARGO_NET_OFFLINE=true \
+        cargo test --test linux_route_registry_netns --no-run
+else
+    CARGO_NET_OFFLINE=true cargo test --test linux_route_registry_netns --no-run
+fi
 
 BIN=$(ls -t target/debug/deps/linux_route_registry_netns-* 2>/dev/null \
     | grep -v '\.d$' | head -1 || true)
