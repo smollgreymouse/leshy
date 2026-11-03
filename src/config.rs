@@ -1,5 +1,6 @@
+use crate::routing::{family_of, AddressFamily};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +52,14 @@ pub struct ServerConfig {
     /// to reduce the number of kernel routes. Unset or 32 = disabled.
     #[serde(default)]
     pub route_aggregation_prefix: Option<u8>,
+
+    /// Hard cap on dynamic (DNS-sourced) route intents.
+    ///
+    /// A long-lived zone can accumulate CDN destinations indefinitely. When
+    /// the cap is reached a new unique address is denied fail-closed instead
+    /// of silently growing the routing table. Static routes do not count.
+    #[serde(default = "default_max_dynamic_routes")]
+    pub max_dynamic_routes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -76,6 +85,9 @@ fn default_cache_max_ttl() -> u64 {
 fn default_cache_negative_ttl() -> u64 {
     30
 }
+fn default_max_dynamic_routes() -> usize {
+    crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ZoneConfig {
@@ -96,9 +108,17 @@ pub struct ZoneConfig {
     /// How to route resolved IPs
     pub route_type: RouteType,
 
-    /// For "via": gateway IP address
-    /// For "dev": path to device file
+    /// For "via": the IPv4 gateway address.
+    /// For "dev": path to the device file (used for both families).
     pub route_target: String,
+
+    /// IPv6 gateway for `route_type = "via"` zones with `ipv6 = true`.
+    ///
+    /// A `via` zone needs a separate IPv6 next hop because an IPv4 gateway
+    /// cannot carry IPv6 traffic. Must be absent for `dev` zones, where the
+    /// single device file serves both families.
+    #[serde(default)]
+    pub route_target_ipv6: Option<String>,
 
     /// Exact domain matches (domain + all subdomains)
     #[serde(default)]
@@ -131,20 +151,59 @@ pub struct ZoneConfig {
 
     /// Advertise and route IPv6 for this zone.
     ///
-    /// Device zones (`route_type = "dev"`) default to IPv4-only: the
-    /// managed interface that carries the zone has no global IPv6 address,
-    /// so an AAAA answer sends the client around the tunnel over the
-    /// physical link (or into a black hole). Enable this only when the
-    /// target device really carries working IPv6.
+    /// IPv4 is always enabled. IPv6 is enabled only when this is `true`, for
+    /// both `dev` and `via` zones: the managed interface that carries a `dev`
+    /// zone usually has no global IPv6 address, so an AAAA answer would send
+    /// the client around the tunnel over the physical link (or into a black
+    /// hole). A `via` zone needs `route_target_ipv6` as well.
     #[serde(default)]
     pub ipv6: bool,
 }
 
 impl ZoneConfig {
-    /// Whether AAAA answers may be handed to clients and routed through
-    /// this zone. A `dev` zone is IPv4-only unless it opts in explicitly.
+    /// Whether AAAA answers may be handed to clients and routed through this
+    /// zone. This is exactly the configured policy: the address family of a
+    /// route always comes from the address itself, never from this flag.
     pub fn advertises_ipv6(&self) -> bool {
-        self.ipv6 || self.route_type != RouteType::Dev
+        self.ipv6
+    }
+
+    /// Whether routes of `family` may be installed for this zone.
+    pub fn family_enabled(&self, family: AddressFamily) -> bool {
+        match family {
+            AddressFamily::V4 => true,
+            AddressFamily::V6 => self.ipv6,
+        }
+    }
+
+    /// The configured gateway for `family`, if this zone routes via a gateway.
+    ///
+    /// Returns `Ok(None)` for `dev` zones, which have no gateway at all.
+    pub fn gateway_for(&self, family: AddressFamily) -> anyhow::Result<Option<IpAddr>> {
+        if self.route_type == RouteType::Dev {
+            return Ok(None);
+        }
+        let raw = match family {
+            AddressFamily::V4 => Some(&self.route_target),
+            AddressFamily::V6 => self.route_target_ipv6.as_ref(),
+        };
+        let Some(raw) = raw else {
+            anyhow::bail!(
+                "zone '{}': route_target_ipv6 is required for an IPv6 via zone",
+                self.name
+            );
+        };
+        let gateway: IpAddr = raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("zone '{}': invalid gateway '{raw}'", self.name))?;
+        if family_of(gateway) != family {
+            anyhow::bail!(
+                "zone '{}': gateway {gateway} does not match the {family:?} route family",
+                self.name
+            );
+        }
+        Ok(Some(gateway))
     }
 }
 
@@ -340,6 +399,77 @@ impl Config {
                     );
                 }
             }
+
+            // Validate the route target against the zone's family policy.
+            match zone.route_type {
+                RouteType::Dev => {
+                    if zone.route_target_ipv6.is_some() {
+                        anyhow::bail!(
+                            "Zone '{}': route_target_ipv6 is not allowed for a dev zone; \
+                             the device file serves both families",
+                            zone.name
+                        );
+                    }
+                }
+                RouteType::Via => {
+                    let v4: IpAddr = zone.route_target.trim().parse().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Zone '{}': route_target '{}' is not a valid IPv4 gateway",
+                            zone.name,
+                            zone.route_target
+                        )
+                    })?;
+                    if family_of(v4) != AddressFamily::V4 {
+                        anyhow::bail!(
+                            "Zone '{}': route_target '{}' must be an IPv4 gateway",
+                            zone.name,
+                            zone.route_target
+                        );
+                    }
+                    if zone.ipv6 {
+                        let raw = zone.route_target_ipv6.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Zone '{}': route_target_ipv6 is required when ipv6 = true",
+                                zone.name
+                            )
+                        })?;
+                        let v6: IpAddr = raw.trim().parse().map_err(|_| {
+                            anyhow::anyhow!(
+                                "Zone '{}': route_target_ipv6 '{}' is not a valid IPv6 gateway",
+                                zone.name,
+                                raw
+                            )
+                        })?;
+                        if family_of(v6) != AddressFamily::V6 {
+                            anyhow::bail!(
+                                "Zone '{}': route_target_ipv6 '{}' must be an IPv6 gateway",
+                                zone.name,
+                                raw
+                            );
+                        }
+                    }
+                }
+            }
+
+            // An IPv6 static route is meaningless when the zone is IPv4-only.
+            if !zone.ipv6 {
+                for cidr in &zone.static_routes {
+                    if let Ok(ip) = cidr
+                        .split_once('/')
+                        .map(|(ip, _)| ip)
+                        .unwrap_or(cidr)
+                        .parse::<IpAddr>()
+                    {
+                        if family_of(ip) == AddressFamily::V6 {
+                            anyhow::bail!(
+                                "Zone '{}': static route '{}' is IPv6 but ipv6 = false",
+                                zone.name,
+                                cidr
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Validate route_aggregation_prefix
@@ -358,5 +488,241 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml_src: &str) -> anyhow::Result<Config> {
+        let config: Config = toml::from_str(toml_src)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    const SERVER: &str = r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+"#;
+
+    #[test]
+    fn ipv6_defaults_to_false_for_dev_zones() {
+        let cfg = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "corp"
+route_type = "dev"
+route_target = "/run/vpn/corp.dev"
+domains = ["corp.example.com"]
+"#
+        ))
+        .unwrap();
+        assert!(!cfg.zones[0].ipv6);
+        assert!(!cfg.zones[0].advertises_ipv6());
+        assert!(!cfg.zones[0].family_enabled(AddressFamily::V6));
+        assert!(cfg.zones[0].family_enabled(AddressFamily::V4));
+    }
+
+    #[test]
+    fn ipv6_defaults_to_false_for_via_zones() {
+        let cfg = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#
+        ))
+        .unwrap();
+        // The old implicit dual-stack behaviour for `via` zones is gone.
+        assert!(!cfg.zones[0].advertises_ipv6());
+    }
+
+    #[test]
+    fn dev_zone_can_opt_into_ipv6() {
+        let cfg = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "corp"
+route_type = "dev"
+route_target = "/run/vpn/corp.dev"
+domains = ["corp.example.com"]
+ipv6 = true
+"#
+        ))
+        .unwrap();
+        assert!(cfg.zones[0].advertises_ipv6());
+        assert!(cfg.zones[0].family_enabled(AddressFamily::V6));
+        // A dev zone has no gateway at all.
+        assert_eq!(cfg.zones[0].gateway_for(AddressFamily::V4).unwrap(), None);
+        assert_eq!(cfg.zones[0].gateway_for(AddressFamily::V6).unwrap(), None);
+    }
+
+    #[test]
+    fn dev_zone_rejects_route_target_ipv6() {
+        let result = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "corp"
+route_type = "dev"
+route_target = "/run/vpn/corp.dev"
+route_target_ipv6 = "2001:db8::1"
+domains = ["corp.example.com"]
+ipv6 = true
+"#
+        ));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("route_target_ipv6"));
+    }
+
+    #[test]
+    fn via_zone_with_ipv6_needs_a_v6_gateway() {
+        let result = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+ipv6 = true
+"#
+        ));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("route_target_ipv6"));
+    }
+
+    #[test]
+    fn via_zone_with_separate_gateways() {
+        let cfg = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+route_target_ipv6 = "2001:db8::1"
+domains = ["example.com"]
+ipv6 = true
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.zones[0].gateway_for(AddressFamily::V4).unwrap(),
+            Some("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(
+            cfg.zones[0].gateway_for(AddressFamily::V6).unwrap(),
+            Some("2001:db8::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn via_zone_rejects_a_v6_route_target() {
+        let result = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "2001:db8::1"
+domains = ["example.com"]
+"#
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn via_zone_rejects_a_v4_route_target_ipv6() {
+        let result = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+route_target_ipv6 = "192.0.2.2"
+domains = ["example.com"]
+ipv6 = true
+"#
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ipv6_static_route_requires_ipv6_enabled() {
+        let result = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+static_routes = ["2001:db8::/32"]
+domains = ["example.com"]
+"#
+        ));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ipv6 = false"));
+    }
+
+    #[test]
+    fn ipv6_static_route_is_allowed_when_enabled() {
+        let cfg = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+route_target_ipv6 = "2001:db8::1"
+static_routes = ["2001:db8:1::/48"]
+domains = ["example.com"]
+ipv6 = true
+"#
+        ))
+        .unwrap();
+        assert_eq!(cfg.zones[0].static_routes.len(), 1);
+    }
+
+    #[test]
+    fn max_dynamic_routes_defaults_to_the_registry_cap() {
+        let cfg = parse(&format!(
+            r#"{SERVER}
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.server.max_dynamic_routes,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES
+        );
+    }
+
+    #[test]
+    fn max_dynamic_routes_is_configurable() {
+        let cfg = parse(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+max_dynamic_routes = 512
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.max_dynamic_routes, 512);
     }
 }

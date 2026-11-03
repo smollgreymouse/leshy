@@ -152,6 +152,7 @@ mod tests {
             dns_servers: vec![],
             route_type,
             route_target: route_target.to_string(),
+            route_target_ipv6: None,
             domains: vec![],
             patterns: vec![],
             static_routes: vec![],

@@ -133,6 +133,26 @@ With this config:
 
 This ensures private network traffic (home router, local printers, etc.) bypasses the VPN even when domains aren't explicitly excluded.
 
+Exclusion ranges are dual-stack: a plain IPv6 address is a /128 exclusion and `fd00::/8`-style CIDRs exclude IPv6 ranges the same way.
+
+### IPv6 (Dual-Stack) Zones
+
+IPv4 is always enabled. IPv6 is **opt-in per zone** with `ipv6 = true`: the address family of a route always comes from the resolved address itself, and the `ipv6` flag is an enable policy only.
+
+A `via` zone needs a separate IPv6 gateway, because an IPv4 next hop cannot carry IPv6 traffic. A `dev` zone uses its single device file for both families.
+
+```toml
+[[zones]]
+name = "dual-stack"
+route_type = "via"
+route_target = "10.8.0.1"          # IPv4 gateway
+route_target_ipv6 = "fd00:8::1"    # IPv6 gateway (required when ipv6 = true)
+ipv6 = true
+domains = ["dual.example.com"]
+```
+
+With `ipv6 = false` (the default for every zone type), AAAA answers are suppressed (`without_aaaa`) and no IPv6 routes are installed.
+
 ## Features
 
 - **Zone-based routing** -- different DNS servers and route targets per zone

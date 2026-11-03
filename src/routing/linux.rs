@@ -326,17 +326,9 @@ impl RouteBackend for LinuxRouteBackend {
                 })
             }
             RouteType::Via => {
-                let gateway: IpAddr = zone
-                    .route_target
-                    .trim()
-                    .parse()
-                    .with_context(|| format!("parse gateway {}", zone.route_target))?;
-                if family_of(gateway) != family {
-                    anyhow::bail!(
-                        "zone '{}': gateway {gateway} does not match the {family:?} route family",
-                        zone.name
-                    );
-                }
+                let gateway = zone.gateway_for(family)?.ok_or_else(|| {
+                    anyhow::anyhow!("zone '{}': no gateway configured for {family:?}", zone.name)
+                })?;
                 Ok(RouteTarget::Gateway(gateway))
             }
         }

@@ -23,7 +23,10 @@ pub struct DnsHandler {
 
 impl DnsHandler {
     pub fn new(config: Config, matcher: ZoneMatcher) -> anyhow::Result<Self> {
-        let route_manager = RouteManager::new(config.server.route_aggregation_prefix)?;
+        let route_manager = RouteManager::with_capacity(
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        )?;
         let cache = Arc::new(DnsCache::new(config.server.cache_size));
 
         Ok(Self {
@@ -581,6 +584,7 @@ mod tests {
             cache_max_ttl: max_ttl,
             cache_negative_ttl: negative_ttl,
             route_aggregation_prefix: None,
+            max_dynamic_routes: crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
         }
     }
 
@@ -709,7 +713,9 @@ route_target = "192.0.2.1"
 "#,
         )
         .unwrap();
-        assert!(cfg_via.zones[0].advertises_ipv6());
+        // A `via` zone is no longer implicitly dual-stack: IPv6 is an explicit
+        // opt-in for every zone type.
+        assert!(!cfg_via.zones[0].advertises_ipv6());
     }
 
     #[test]

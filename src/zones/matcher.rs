@@ -1,23 +1,43 @@
 use crate::config::{ZoneConfig, ZoneMode};
+use crate::routing::{family_of, RoutePrefix};
 use regex::RegexSet;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 
-/// An IPv4 CIDR range used for per-zone IP exclusion checks.
+/// A CIDR range used for per-zone IP exclusion checks.
+///
+/// Wraps the canonical [`RoutePrefix`] so IPv4 and IPv6 exclusions share one
+/// representation and one containment rule.
 #[derive(Debug, Clone)]
 struct CidrRange {
-    network: u32,
-    prefix_len: u8,
+    prefix: RoutePrefix,
 }
 
 impl CidrRange {
-    fn contains_v4(&self, ip: Ipv4Addr) -> bool {
-        if self.prefix_len == 0 {
-            return true;
+    fn contains(&self, ip: IpAddr) -> bool {
+        if family_of(ip) != self.prefix.family() {
+            return false;
         }
-        let mask = !((1u32 << (32 - self.prefix_len)) - 1);
-        (u32::from(ip) & mask) == self.network
+        match (ip, self.prefix.network) {
+            (IpAddr::V4(addr), IpAddr::V4(network)) => {
+                let mask = if self.prefix.prefix_len == 0 {
+                    0u32
+                } else {
+                    !0u32 << (32 - self.prefix.prefix_len)
+                };
+                (addr.to_bits() & mask) == network.to_bits()
+            }
+            (IpAddr::V6(addr), IpAddr::V6(network)) => {
+                let mask = if self.prefix.prefix_len == 0 {
+                    0u128
+                } else {
+                    !0u128 << (128 - self.prefix.prefix_len)
+                };
+                (addr.to_bits() & mask) == network.to_bits()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -30,13 +50,12 @@ pub struct MatchedZone {
 
 impl MatchedZone {
     /// Check if an IP falls within this zone's excluded CIDR ranges.
-    /// Always false for inclusive zones (they have no excluded CIDRs).
-    /// For exclusive zones, returns true if IPv4 matches any excluded range.
+    ///
+    /// Always false for inclusive zones (they have no excluded CIDRs). For
+    /// exclusive zones both families are honoured: an IPv6 exclusion such as
+    /// `fd00::/8` keeps that traffic off the tunnel exactly like an IPv4 one.
     pub fn is_excluded(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => self.excluded_cidrs.iter().any(|r| r.contains_v4(v4)),
-            IpAddr::V6(_) => false,
-        }
+        self.excluded_cidrs.iter().any(|r| r.contains(ip))
     }
 }
 
@@ -222,40 +241,45 @@ fn matches_entries(
     false
 }
 
-/// Parse a CIDR string like "10.0.0.0/8" into a CidrRange.
-/// Only supports IPv4. Returns an error for IPv6 or invalid input.
+/// Parse a CIDR string like "10.0.0.0/8" or "fd00::/8" into a CidrRange.
+///
+/// A plain address becomes a host prefix (/32 or /128). IPv4-mapped IPv6
+/// addresses are rejected rather than ambiguously matching an IPv4 range.
 fn parse_cidr_range(cidr: &str) -> anyhow::Result<CidrRange> {
-    let (ip_str, prefix_len) = if let Some((ip, prefix)) = cidr.split_once('/') {
-        let prefix_len: u8 = prefix
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid prefix length: {prefix}"))?;
-        if prefix_len > 32 {
-            anyhow::bail!("prefix length {prefix_len} exceeds 32");
+    let (ip_str, prefix_len) = match cidr.split_once('/') {
+        Some((ip, prefix)) => {
+            let prefix_len: u8 = prefix
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid prefix length: {prefix}"))?;
+            (ip, Some(prefix_len))
         }
-        (ip, prefix_len)
-    } else {
-        (cidr, 32u8)
+        None => (cidr, None),
     };
 
-    let ip: Ipv4Addr = ip_str
+    let ip: IpAddr = ip_str
         .parse()
-        .map_err(|_| anyhow::anyhow!("not a valid IPv4 address: {ip_str}"))?;
+        .map_err(|_| anyhow::anyhow!("not a valid IP address: {ip_str}"))?;
 
-    let mask = if prefix_len == 0 {
-        0u32
-    } else {
-        !((1u32 << (32 - prefix_len)) - 1)
-    };
+    if let IpAddr::V6(v6) = ip {
+        if v6.to_ipv4_mapped().is_some() {
+            anyhow::bail!("IPv4-mapped IPv6 address {v6} is not a valid exclusion range");
+        }
+    }
+
+    let prefix_len = prefix_len.unwrap_or(match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    });
 
     Ok(CidrRange {
-        network: u32::from(ip) & mask,
-        prefix_len,
+        prefix: RoutePrefix::new(ip, prefix_len)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn wildcard_entry_matches_subdomains() {
@@ -293,6 +317,7 @@ mod tests {
             dns_servers: vec![],
             route_type: crate::config::RouteType::Via,
             route_target: "192.168.1.1".to_string(),
+            route_target_ipv6: None,
             domains: domains.into_iter().map(String::from).collect(),
             patterns: patterns.into_iter().map(String::from).collect(),
             static_routes: vec![],
@@ -474,8 +499,76 @@ mod tests {
         assert!(!matched.is_excluded(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!matched.is_excluded(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
 
-        // IPv6 never excluded
+        // No IPv6 exclusion configured, so IPv6 is not excluded.
         assert!(!matched.is_excluded(IpAddr::V6("::1".parse().unwrap())));
+    }
+
+    #[test]
+    fn ipv6_exclusion_range_is_honoured() {
+        let zone = ZoneConfig {
+            static_routes: vec!["fd00::/8".to_string()],
+            ipv6: true,
+            ..exclusive_zone("vpn", vec!["google.com"], vec![])
+        };
+        let matcher = ZoneMatcher::new(vec![zone]).unwrap();
+        let matched = matcher.find_zone("example.com").unwrap();
+
+        assert!(matched.is_excluded("fd00::1".parse().unwrap()));
+        assert!(matched.is_excluded("fdff:ffff::1".parse().unwrap()));
+        assert!(!matched.is_excluded("2001:db8::1".parse().unwrap()));
+        // An IPv4 address never matches an IPv6 range.
+        assert!(!matched.is_excluded(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+    }
+
+    #[test]
+    fn plain_ipv6_exclusion_is_a_host_prefix() {
+        let zone = ZoneConfig {
+            static_routes: vec!["2001:db8::1".to_string()],
+            ipv6: true,
+            ..exclusive_zone("vpn", vec![], vec![])
+        };
+        let matcher = ZoneMatcher::new(vec![zone]).unwrap();
+        let matched = matcher.find_zone("example.com").unwrap();
+
+        assert!(matched.is_excluded("2001:db8::1".parse().unwrap()));
+        assert!(!matched.is_excluded("2001:db8::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_exclusion_cidr_is_canonicalized() {
+        let zone = ZoneConfig {
+            static_routes: vec!["fd00:1234::ffff/64".to_string()],
+            ipv6: true,
+            ..exclusive_zone("vpn", vec![], vec![])
+        };
+        let matcher = ZoneMatcher::new(vec![zone]).unwrap();
+        let matched = matcher.find_zone("example.com").unwrap();
+
+        // The host bits are dropped, so the whole /64 is excluded.
+        assert!(matched.is_excluded("fd00:1234::1".parse().unwrap()));
+        assert!(matched.is_excluded("fd00:1234::abcd".parse().unwrap()));
+        assert!(!matched.is_excluded("fd00:1235::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_exclusion_is_rejected() {
+        assert!(parse_cidr_range("::ffff:10.0.0.0/104").is_err());
+    }
+
+    #[test]
+    fn mixed_family_exclusions_coexist() {
+        let zone = ZoneConfig {
+            static_routes: vec!["10.0.0.0/8".to_string(), "fd00::/8".to_string()],
+            ipv6: true,
+            ..exclusive_zone("vpn", vec![], vec![])
+        };
+        let matcher = ZoneMatcher::new(vec![zone]).unwrap();
+        let matched = matcher.find_zone("example.com").unwrap();
+
+        assert!(matched.is_excluded(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))));
+        assert!(matched.is_excluded("fd00::1".parse().unwrap()));
+        assert!(!matched.is_excluded(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!matched.is_excluded("2001:db8::1".parse().unwrap()));
     }
 
     #[test]

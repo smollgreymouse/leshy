@@ -62,10 +62,8 @@ pub struct RouteManager {
 }
 
 impl RouteManager {
-    pub fn new(aggregation_prefix: Option<u8>) -> Result<Self> {
-        Self::with_capacity(aggregation_prefix, DEFAULT_MAX_DYNAMIC_ROUTES)
-    }
-
+    /// Production constructor: creates the platform backend, the registry and
+    /// the Linux monitor/audit task.
     pub fn with_capacity(
         aggregation_prefix: Option<u8>,
         max_dynamic_routes: usize,
@@ -182,6 +180,12 @@ impl RouteManager {
     /// the aggregation planner, which may widen the prefix.
     pub async fn add_route(&self, ip: IpAddr, zone: &ZoneConfig) -> Result<()> {
         let family = family_of(ip);
+        if !zone.family_enabled(family) {
+            anyhow::bail!(
+                "zone '{}': {family:?} routing is disabled for this zone",
+                zone.name
+            );
+        }
         let target = self.backend.resolve_target(zone, family).await?;
 
         match ip {
@@ -377,6 +381,7 @@ mod tests {
             dns_servers: vec![],
             route_type: RouteType::Via,
             route_target: gateway.to_string(),
+            route_target_ipv6: None,
             domains: vec![],
             patterns: vec![],
             static_routes: vec![],
@@ -441,13 +446,26 @@ mod tests {
     async fn duplicate_v6_route_is_one_mutation() {
         let backend = Arc::new(FakeBackend::new());
         let mgr = manager(Arc::clone(&backend), None);
-        let zone = via_zone("corp", "2001:db8::1");
+        let mut zone = via_zone("corp", "192.168.1.1");
+        zone.ipv6 = true;
+        zone.route_target_ipv6 = Some("2001:db8::1".to_string());
         let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
 
         for _ in 0..1000 {
             mgr.add_route(ip, &zone).await.unwrap();
         }
         assert_eq!(backend.ensure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn ipv6_route_is_rejected_when_the_zone_is_ipv4_only() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        let result = mgr.add_route(IpAddr::V6(Ipv6Addr::LOCALHOST), &zone).await;
+        assert!(result.is_err());
+        assert_eq!(backend.ensure_count(), 0);
     }
 
     #[tokio::test]

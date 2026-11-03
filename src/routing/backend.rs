@@ -69,7 +69,7 @@ pub(crate) trait RouteBackend: Send + Sync {
 pub(crate) mod fake {
     use super::*;
     use crate::config::RouteType;
-    use crate::routing::model::{family_of, AddressFamily, RouteSource};
+    use crate::routing::model::{AddressFamily, RouteSource};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -185,13 +185,9 @@ pub(crate) mod fake {
             }
             match zone.route_type {
                 RouteType::Via => {
-                    let gw: IpAddr = zone.route_target.parse()?;
-                    if family_of(gw) != family {
-                        anyhow::bail!(
-                            "zone '{}': gateway {gw} does not match family {family:?}",
-                            zone.name
-                        );
-                    }
+                    let gw = zone.gateway_for(family)?.ok_or_else(|| {
+                        anyhow::anyhow!("zone '{}': no gateway for {family:?}", zone.name)
+                    })?;
                     Ok(RouteTarget::Gateway(gw))
                 }
                 RouteType::Dev => {
@@ -259,6 +255,7 @@ pub(crate) mod fake {
                 dns_servers: vec![],
                 route_type: RouteType::Via,
                 route_target: gateway.to_string(),
+                route_target_ipv6: None,
                 domains: vec![],
                 patterns: vec![],
                 static_routes: vec![],

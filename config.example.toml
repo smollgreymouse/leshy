@@ -34,6 +34,12 @@ cache_negative_ttl = 30
 # Recommended: 22 (1024 IPs per aggregate) or 24 (256 IPs per aggregate).
 # route_aggregation_prefix = 24
 
+# Hard cap on dynamic (DNS-sourced) route intents (default: 16384).
+# A long-lived zone can accumulate CDN destinations indefinitely. When the cap
+# is reached a new unique address is denied fail-closed (SERVFAIL) instead of
+# silently growing the routing table. Static routes do not count.
+# max_dynamic_routes = 16384
+
 # Example Zone 1: Corporate VPN with device-based routing
 # Routes traffic through a VPN tunnel device that may connect/disconnect
 [[zones]]
@@ -93,4 +99,25 @@ route_type = "via"
 route_target = "10.8.0.1"
 # These domains/patterns are EXCLUDED from the VPN (accessed directly):
 domains = ["local.network"]
-patterns = ['\.ru$', '\.local$']
+patterns = ["\\.ru$", "\\.local$"]
+
+# Example Zone 5: Dual-stack zone
+#
+# IPv4 is always enabled. IPv6 is opt-in per zone: `ipv6 = true` is required
+# for AAAA answers to be routed, for both `dev` and `via` zones. The address
+# family of a route always comes from the address itself — `ipv6` is an enable
+# policy, never a family selector.
+#
+# A `via` zone needs a separate IPv6 next hop, because an IPv4 gateway cannot
+# carry IPv6 traffic. A `dev` zone uses its single device file for both
+# families and must not set `route_target_ipv6`.
+[[zones]]
+name = "dual-stack"
+route_type = "via"
+route_target = "10.8.0.1"          # IPv4 gateway
+route_target_ipv6 = "fd00:8::1"    # IPv6 gateway (required when ipv6 = true)
+ipv6 = true
+domains = ["dual.example.com"]
+# In an exclusive zone, static_routes double as IP exclusion ranges and now
+# accept IPv6 as well:
+# static_routes = ["10.0.0.0/8", "fd00::/8"]
