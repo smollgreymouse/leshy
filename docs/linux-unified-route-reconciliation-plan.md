@@ -1,6 +1,6 @@
 # Implementation plan: unified dual-stack route registry and reconciliation (Linux + Windows)
 
-**Status:** COMPLETE — commits 1–9 landed and the acceptance gate is green (fmt, clippy `-D warnings`, full test suite, and the privileged netns harness `tests/linux-route-registry-netns.sh` on a disposable kernel; the managed backend stays unenabled until Kikimora packet 08D).  
+**Status:** Linux scope COMPLETE — commits 1–9 landed and the acceptance gate is green (fmt, clippy `-D warnings`, full test suite, and the privileged netns harness `tests/linux-route-registry-netns.sh` on a disposable kernel; the managed backend stays unenabled until Kikimora packet 08D). The Windows scope (section 7W and the Windows half of commit 4) is still to implement: Windows today keeps compiling and uses the shared registry with the existing IP Helper writer.  
 **Leshy baseline reviewed:** master at `ba53d42ac12f2efefe66f0a1a27f8d47544d2267`; code baseline before this document is v0.5.2 / `277fd6d9699fd6a08e148a37a268e4bdefbedabc`.  
 **Primary targets:** Linux and Windows. Both must receive the same registry, dedupe, exact-observation and event-driven reconciliation semantics in this fix. macOS must continue to compile and preserve current behavior; its equivalent kernel-observation/event implementation may follow separately.  
 **Kikimora integration:** explicitly deferred until the standalone/local route registry is complete; the final integration architecture is fixed in section 12 and in Kikimora's own integration packet.
