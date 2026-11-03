@@ -164,7 +164,12 @@ impl RouteAdder for LinuxRouteAdder {
                     .await
                     .with_context(|| format!("read device file {}", zone.route_target))?;
                 let device = device.trim().to_string();
-                let mut links = self.handle.link().get().match_name(device.clone()).execute();
+                let mut links = self
+                    .handle
+                    .link()
+                    .get()
+                    .match_name(device.clone())
+                    .execute();
                 let link = links
                     .try_next()
                     .await?
@@ -196,12 +201,18 @@ impl RouteAdder for LinuxRouteAdder {
                 continue;
             }
             let dst_matches = msg.attributes.iter().any(|attr| match (ip, attr) {
-                (IpAddr::V4(addr), netlink_packet_route::route::RouteAttribute::Destination(
-                    RouteAddress::Inet(found),
-                )) => *found == addr,
-                (IpAddr::V6(addr), netlink_packet_route::route::RouteAttribute::Destination(
-                    RouteAddress::Inet6(found),
-                )) => *found == addr,
+                (
+                    IpAddr::V4(addr),
+                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet(
+                        found,
+                    )),
+                ) => *found == addr,
+                (
+                    IpAddr::V6(addr),
+                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet6(
+                        found,
+                    )),
+                ) => *found == addr,
                 _ => false,
             });
             if !dst_matches {
@@ -243,7 +254,8 @@ impl RouteAdder for LinuxRouteAdder {
         tracing::info!(ip = %ip, prefix_len = prefix_len, "Removing route");
 
         let result = match ip {
-            IpAddr::V4(addr) => {                let mut msg = netlink_packet_route::route::RouteMessage::default();
+            IpAddr::V4(addr) => {
+                let mut msg = netlink_packet_route::route::RouteMessage::default();
                 msg.header.destination_prefix_length = prefix_len;
                 msg.header.protocol = RouteProtocol::Boot;
                 msg.attributes

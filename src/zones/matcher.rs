@@ -261,7 +261,8 @@ mod tests {
     fn wildcard_entry_matches_subdomains() {
         // Regression: "*.example.com" used to match nothing because the suffix
         // walk compares real suffixes against the literal entry.
-        let matcher = ZoneMatcher::new(vec![test_zone("wild", vec!["*.example.com"], vec![])]).unwrap();
+        let matcher =
+            ZoneMatcher::new(vec![test_zone("wild", vec!["*.example.com"], vec![])]).unwrap();
         assert!(matcher.find_zone("api.example.com").is_some());
         assert!(matcher.find_zone("deep.api.example.com").is_some());
         assert!(matcher.find_zone("example.com").is_some());
@@ -270,7 +271,8 @@ mod tests {
 
     #[test]
     fn domain_entries_ignore_case_and_trailing_dot() {
-        let matcher = ZoneMatcher::new(vec![test_zone("mixed", vec!["Example.COM."], vec![])]).unwrap();
+        let matcher =
+            ZoneMatcher::new(vec![test_zone("mixed", vec!["Example.COM."], vec![])]).unwrap();
         assert!(matcher.find_zone("api.example.com").is_some());
         assert!(matcher.find_zone("example.com.").is_some());
         assert!(matcher.find_zone("api.example.org").is_none());
@@ -278,7 +280,8 @@ mod tests {
 
     #[test]
     fn bare_wildcard_entry_is_ignored() {
-        let matcher = ZoneMatcher::new(vec![test_zone("odd", vec!["*.", "*.ok.example"], vec![])]).unwrap();
+        let matcher =
+            ZoneMatcher::new(vec![test_zone("odd", vec!["*.", "*.ok.example"], vec![])]).unwrap();
         assert!(matcher.find_zone("ok.example").is_some());
         assert!(matcher.find_zone("anything.test").is_none());
     }

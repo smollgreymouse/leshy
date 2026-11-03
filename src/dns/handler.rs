@@ -1,4 +1,6 @@
-use crate::config::{Config, DnsProtocol, DnsServerConfig, RouteFailureMode, ServerConfig, ZoneConfig, ZoneMode};
+use crate::config::{
+    Config, DnsProtocol, DnsServerConfig, RouteFailureMode, ServerConfig, ZoneConfig, ZoneMode,
+};
 use crate::dns::cache::DnsCache;
 use crate::routing::RouteManager;
 use crate::zones::{MatchedZone, ZoneMatcher};
@@ -385,7 +387,8 @@ impl RequestHandler for DnsHandler {
                 // Still add routes from the cached response; a routing failure
                 // has to be able to turn into SERVFAIL, so wait for the result.
                 let routes_ok = self.add_routes_from_response(&cached, &qname).await;
-                if !routes_ok && self.config.server.route_failure_mode == RouteFailureMode::Servfail {
+                if !routes_ok && self.config.server.route_failure_mode == RouteFailureMode::Servfail
+                {
                     tracing::warn!(
                         qname = qname,
                         "Route failure with servfail mode: refusing the cached answer"
@@ -514,7 +517,8 @@ impl RequestHandler for DnsHandler {
                 // Install routes for the resolved IPs before answering, so the
                 // configured failure mode can act on a routing failure.
                 let routes_ok = self.add_routes_from_response(&response, &qname).await;
-                if !routes_ok && self.config.server.route_failure_mode == RouteFailureMode::Servfail {
+                if !routes_ok && self.config.server.route_failure_mode == RouteFailureMode::Servfail
+                {
                     tracing::warn!(
                         qname = qname,
                         "Route failure with servfail mode: refusing the answer"
