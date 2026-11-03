@@ -264,7 +264,7 @@ impl LinuxRouteBackend {
         // assumed Boot/link delete silently misses the row (ESRCH), leaving
         // it in the table. NOWHERE scope and UNSPEC protocol mean "match
         // any"; an absent priority matches any metric.
-        msg.header.scope = RouteScope::Nowhere;
+        msg.header.scope = RouteScope::NoWhere;
         msg.header.protocol = RouteProtocol::Unspec;
         match prefix.network {
             IpAddr::V4(addr) => {
