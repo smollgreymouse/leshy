@@ -389,7 +389,8 @@ impl Config {
         anyhow::bail!("Could not parse zones from file");
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    /// Check the whole configuration for structural and policy errors.
+    pub fn validate(&self) -> anyhow::Result<()> {
         // Validate listen address is not 0.0.0.0:0
         if self.server.listen_address.port() == 0 {
             anyhow::bail!("Server listen port cannot be 0");
