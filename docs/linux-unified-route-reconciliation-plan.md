@@ -1,358 +1,840 @@
-# RFC / next fix: unified IPv4 + IPv6 routing and safe fail-closed reconciliation
+# Implementation plan: unified dual-stack route registry and reconciliation
 
-**Status:** DESIGN PLAN — NOT IMPLEMENTED. Architectural decisions and test gates, not a deployment instruction.  
-**Reviewed Leshy:** smollgreymouse/leshy master at 277fd6d9699fd6a08e148a37a268e4bdefbedabc (v0.5.2), 2026-11-03.  
-**Integration reviewed:** Kikimora Go/Toad route ownership, bridge, parking manager, recovery driver, and dual-stack regression contract.  
-**Scope:** Linux-first route lifecycle; maintain Windows/macOS API behavior and test cross-platform safety. No live-system changes.
+**Status:** implementation-ready plan. No design choices are intentionally left to the executor.  
+**Leshy baseline reviewed:** master at `ba53d42ac12f2efefe66f0a1a27f8d47544d2267`; code baseline before this document is v0.5.2 / `277fd6d9699fd6a08e148a37a268e4bdefbedabc`.  
+**Primary target:** Linux. macOS and Windows must continue to compile and preserve current behavior until their equivalent kernel-observation implementation is added.  
+**Kikimora integration:** explicitly deferred until the standalone/local route registry is complete; the final integration architecture is fixed in section 12 and in Kikimora's own integration packet.
 
-## 0. Goals and decisions
+## 0. Final architecture decisions
 
-A single DNS name and a single logical zone must support **both A/IPv4 and AAAA/IPv6 simultaneously**. The family is determined from the returned RR address type, not from a second zone name or a global IPv6 routing toggle. Maintain **independent per-family readiness, next hop, desired routes, verified kernel routes, and fail-closed policy**.
+These decisions are final for this fix.
 
-Both families use the same lifecycle:
+1. **One logical DNS zone handles both address families.** The DNS record/address type selects the family: A/IPv4 produces IPv4 route intents; AAAA/IPv6 produces IPv6 route intents. There are no duplicate per-family zones.
+2. **IPv4 and IPv6 use one route lifecycle.** Both go through the same registry, dedupe, target resolution, kernel reconciliation and error handling. IPv4 aggregation is an optional planner in front of the registry; IPv6 stays at /128 unless a future explicitly reviewed IPv6 aggregation feature is added.
+3. **DNS cache and route registry remain separate.** A cached DNS response still produces route intents, but a verified registry entry makes that operation a zero-kernel-I/O fast path.
+4. **Desired, observed and authorized are different states.** Never use a HashSet of previously seen addresses as proof that a route still exists.
+5. **No DNS-TTL route deletion.** TTL expiry is not connection expiry. Dynamic routes live until explicit zone/config retirement or process lifecycle cleanup. Growth is bounded by a hard registry capacity; when capacity is reached, a new unique route is denied fail-closed instead of silently growing the FIB or returning an unrouted address.
+6. **Kikimora parking stays in Kikimora.** Leshy does not absorb VPN lifecycle or fail-closed parking.
+7. **Managed Kikimora mode ultimately has one FIB writer: Kikimora.** After integration, Leshy sends route intents to Kikimora and does not mutate managed selected routes itself. The generation/ACK dual-writer protocol proposed in the previous RFC is superseded.
+8. **Standalone Leshy remains a local route writer.** The local registry/backend described below is required even when Kikimora is not installed.
+9. **Existing `ipv6` is an enable policy, never a family selector.** The actual family always comes from the IP address. In v0.6 configuration semantics, IPv6 is disabled unless explicitly enabled for the zone; this removes the current special case where every `via` zone implicitly advertises IPv6.
+10. **A route target must match the address family.** IPv4 and IPv6 gateway addresses are never silently mixed.
 
-~~~text
-DNS query -> DNS cache or upstream -> zone classifier
-  -> per-family address extraction / exclusions / readiness policy
-  -> canonical route intents (v4 /32, v6 /128, plus configured static CIDRs)
-  -> unified registry + concurrent request coalescing
-  -> authority gate (standalone vs Kikimora-managed zone)
-  -> kernel-state cache + event-driven invalidation
-  -> minimal netlink action, iff necessary and authorized
-  -> read-back/verification and registry update
-  -> release or deny DNS answer according to configured failure mode
-~~~
+## 1. Bugs this implementation closes
 
-The **route registry is not the DNS response cache**, and neither is proof of a real kernel route. Likewise, "missing in kernel" is **not permission to restore** if Kikimora intentionally revoked a tunnel.
+The current code has these concrete defects.
 
-Recommendations:
+- `src/routing/mod.rs::RouteManager::add_route`: IPv4 enters `add_route_v4`, but IPv6 bypasses all dedupe through `add_route_simple(ip, 128, zone)`.
+- `src/routing/aggregator.rs::RouteAggregator::process_ip`: the `installed` map is mutated before all corresponding kernel actions succeed. Desired state and observed kernel state are conflated.
+- `src/routing/mod.rs::RouteManager::add_route_v4`: an empty aggregation action list calls `route_matches`; on Linux this becomes a full main-table route dump on every repeated DNS classification.
+- `src/routing/linux.rs::LinuxRouteAdder::route_matches`: a dump is filtered in userspace. It also compares an individual host address with `known_prefix`; when an IPv4 host is covered by a wider aggregate, the requested destination is not canonicalized to the aggregate network.
+- `src/routing/linux.rs::add_via_route`: an IPv6 destination with an IPv4 gateway, or the reverse, silently omits the gateway attribute rather than rejecting the invalid route.
+- `src/routing/linux.rs::add_via_route` and `add_dev_route`: EEXIST is accepted without proving that the existing route points to the intended gateway/device.
+- `src/zones/matcher.rs::CidrRange`: exclusive-zone CIDR exclusions are IPv4-only.
+- `src/reload.rs::get_zones_to_cleanup`: reload notices deleted zone names only; a same-name zone whose route target/family policy/static routes changed is not reconciled as a route-policy change.
+- `src/routing/mod.rs::cleanup_zone`: tracking is forgotten but kernel routes are deliberately left behind.
+- `src/dns/handler.rs::handle_request`: cache hits call `add_routes_from_response` again, which is correct for safety, but the current route layer turns that into repeated kernel work.
+- Linux has no bounded dynamic-route admission policy. An active long-lived zone can accumulate CDN destinations indefinitely.
 
-1. Keep **VPN readiness, fail-closed parking, and tunnel recovery owned by Kikimora**. Leshy owns domain classification, per-family route intents and standalone route reconciliation. Do not relocate parking alone into Leshy.
-2. In the near-term integration, add explicit owned-route reporting and a revocable, generation-fenced authorization contract. Preserve compatibility with the existing device-file bridge until replaced.
-3. Longer term, consider **one route writer in managed mode**: Leshy submits desired selected routes to Kikimora, and Kikimora applies both functional routes and parks. This is a separate architectural milestone, not a prerequisite to unify the route registry.
-4. Preserve permanent IPv6 support. The current v0.5.2 default for device zones (suppress AAAA unless ipv6=true) is a **temporary safety default**, not a reason to remove IPv6 routing support or to make IPv6 permanently disabled.
-5. Avoid eager TTL-based route deletion: DNS TTL expiration does not mean applications have closed connections to that address. Removing a specific VPN route can leak through the physical default. Garbage collection requires an explicit safe-retirement policy.
+The observed legacy 0.4.0 host showed the practical form of the IPv6 defect: 1,225 IPv6 add attempts in one hour for only 127 distinct IPv6 addresses. That field measurement is a regression input, not evidence about v0.5.2 behavior.
 
-## 1. Confirmed implementation gaps
+## 2. Target module layout
 
-- src/dns/handler.rs: cache hits and fresh answers both call add_routes_from_response(). The DNS cache does not suppress route-kernel work.
-- src/routing/mod.rs: IPv4 goes via add_route_v4() and RouteAggregator; IPv6 goes via add_route_simple(.../128) and submits the add again each time.
-- src/routing/aggregator.rs: IPv4 installed/known_ips tracking is in memory. Aggregator inserts bookkeeping **before** all kernel actions succeed, creating false-installed risks on failure and after partial aggregate split. It is IPv4-specific because of CIDR compression, not because IPv6 cannot be deduped.
-- src/routing/linux.rs: route_matches() uses a full route dump + userspace filter, including for unchanged cached IPv4 destinations. The dump is not a cheap per-prefix proof. EEXIST in add_via_route/add_dev_route is treated as success without verifying existing row identity/target.
-- src/routing/mod.rs: zone_routes stores IpAddr for both families but is not the source-of-truth route state machine. cleanup_zone() forgets bookkeeping but does not remove kernel routes. Be careful: automatic deletion without protection creates direct-path leakage.
-- src/reload.rs and src/server.rs: removed zone names trigger cleanup; changes to an existing zone's target, family readiness/policy or routes need proper invalidation and reconciliation.
-- src/zones/matcher.rs: CidrRange/MatchedZone::is_excluded() implement **IPv4-only** CIDR exclusions; IPv6 in an exclusive zone never matches an excluded CIDR.
-- src/routing/linux.rs: with route_type=via and an IPv6 destination but an IPv4 gateway, the code does not attach a gateway to the IPv6 netlink message. Reject mismatched families and define per-family gateways; do not silently add malformed/unintended routes.
-- IPv4 aggregation: the installed_prefix(ip) path can pass a **host IP** with a **wider prefix** to route_matches(), which compares exact Destination addresses. A canonical subnet key is required for correctness.
-- Linux route operations do not have a distinguishable ownership tag separate from generic system/static routes, making safe replacement/removal ambiguous.
-
-Legacy field measurements are relevant only as a regression signature: installed Leshy 0.4.0 produced 1,244 "Adding route" events/hour, with 1,225 IPv6 attempts but only 127 distinct IPv6 addresses (1,098 redundant IPv6 attempts). The measured host was **not** running the reviewed 0.5.2 master.
-
-## 2. Why IPv4 and IPv6 should not have separate cache algorithms
-
-Both can be represented by a canonical RouteKey:
+Keep `src/routing/mod.rs` as the public orchestration layer and add these modules:
 
 ~~~text
-RouteKey = (address_family, table, canonical_network, prefix_length)
-RouteIntent = (RouteKey, zone_id, route_kind, target, protocol, metric,
-               source={DNS,static}, lifetime/reference metadata)
+src/routing/
+  mod.rs             RouteManager orchestration only
+  model.rs           canonical cross-family route types
+  registry.rs        desired/observed route state + per-key serialization
+  aggregator.rs      pure IPv4 desired-prefix planner
+  backend.rs         platform backend trait and common outcomes
+  linux.rs           Linux backend + snapshot/event monitor
+  macos.rs           existing writer adapted to backend trait
+  windows.rs         existing writer adapted to backend trait
 ~~~
 
-Use native address types (Rust IpAddr/IpNet or equivalent); do not normalize IPv6 into a 32-bit key.
+Do not put DNS TTL/cache types in `routing/`.
 
-IPv4 /32 and IPv6 /128 follow the same dedupe, reconciliation, ownership and cleanup logic. IPv4 aggregation into /N is an **optional planner** that converts multiple host intentions into one or more canonical kernel prefix intentions. That planner must preserve non-overrouting/conflict semantics, must not cover other zones, and must be separately tested. Keep IPv6 host /128 routes by default; collapsing arbitrary CDN IPv6 /128 routes into /64 would be unsafe.
+### 2.1 Canonical model — new `src/routing/model.rs`
 
-A single logical domain may return several A and AAAA RRs; each becomes its own key. Shared IPs across domains/zones require explicit ownership conflict resolution and reference counts (not "last DNS response wins").
+Add:
 
-## 3. One name, two families: routing policy, not two zones
+~~~rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum AddressFamily { V4, V6 }
 
-Example, with documentation-only addresses:
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct RoutePrefix {
+    pub network: IpAddr,   // always canonical network address
+    pub prefix_len: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum RouteTarget {
+    Device { name: String, ifindex: Option<u32> },
+    Gateway(IpAddr),
+    Unreachable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct RouteKey {
+    pub prefix: RoutePrefix,
+    pub table: u32,        // 254/main for current Leshy routes
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RouteSource { Dns, Static }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteIntent {
+    pub key: RouteKey,
+    pub zone: String,
+    pub target: RouteTarget,
+    pub source: RouteSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedRoute {
+    pub key: RouteKey,
+    pub target: RouteTarget,
+    pub protocol: u8,
+    pub metric: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteState { Pending, Verified, Dirty, Denied, Error }
+~~~
+
+Required helpers:
+
+~~~rust
+impl RoutePrefix {
+    pub fn new(ip: IpAddr, prefix_len: u8) -> Result<Self>;
+    pub fn host(ip: IpAddr) -> Self; // /32 or /128
+    pub fn family(&self) -> AddressFamily;
+}
+~~~
+
+`RoutePrefix::new` must canonicalize the network bits for both families. The rest of the routing code must never construct a non-canonical prefix directly.
+
+No new CIDR crate is required; use `Ipv4Addr::to_bits/from_bits` and `Ipv6Addr::to_bits/from_bits` in this one module. Unit-test /0, host prefixes and non-canonical /24 and /64 inputs.
+
+## 3. Platform backend contract — new `src/routing/backend.rs`
+
+Replace the current low-level `RouteAdder` contract with one intent-aware backend contract:
+
+~~~rust
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnsureOutcome {
+    Added,
+    AlreadyMatching,
+}
+
+#[async_trait]
+pub(crate) trait RouteBackend: Send + Sync {
+    async fn resolve_target(&self, zone: &ZoneConfig, family: AddressFamily)
+        -> Result<RouteTarget>;
+
+    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome>;
+
+    async fn remove_route(&self, intent: &RouteIntent) -> Result<()>;
+
+    async fn snapshot(&self) -> Result<Vec<ObservedRoute>>;
+
+    fn take_invalidation_receiver(&self)
+        -> Option<tokio::sync::mpsc::UnboundedReceiver<RouteInvalidation>>;
+}
+~~~
+
+`RouteInvalidation` is:
+
+~~~rust
+pub enum RouteInvalidation {
+    Prefix(RouteKey),
+    Interface(u32),
+    Full,
+}
+~~~
+
+macOS/Windows may return `None` for the invalidation receiver in the first implementation. They still use registry dedupe; their periodic full audit may remain disabled until a platform read-back implementation exists. Linux must implement snapshot and invalidation.
+
+### Exact entry points
+
+- Move device-file reading out of `RouteManager::read_device_file` into each platform backend's `resolve_target`.
+- Replace `add_via_route`, `add_dev_route`, `route_matches` and `remove_route` calls in `src/routing/mod.rs` with the backend interface.
+- Add `RouteManager::with_backend(...)` under `#[cfg(test)]` so all reconciliation tests use a fake backend with mutation counters.
+
+## 4. Unified registry — new `src/routing/registry.rs`
+
+### 4.1 Data structure
+
+Use a two-level structure so unrelated addresses are not serialized behind one lock:
+
+~~~rust
+pub struct RouteRegistry {
+    entries: RwLock<HashMap<RouteKey, Arc<Mutex<RouteEntry>>>>,
+    max_dynamic_routes: usize,
+}
+
+pub struct RouteEntry {
+    desired: Option<RouteIntent>,
+    observed: Option<ObservedRoute>,
+    state: RouteState,
+    dirty_epoch: u64,
+    verified_epoch: u64,
+    last_error: Option<String>,
+}
+~~~
+
+The map lock may be held only while finding/inserting an `Arc<Mutex<RouteEntry>>`. The per-entry mutex may span one backend await; this deliberately coalesces concurrent DNS requests for the same route while allowing different prefixes to proceed concurrently.
+
+### 4.2 Required methods
+
+~~~rust
+pub async fn ensure(
+    &self,
+    intent: RouteIntent,
+    backend: &dyn RouteBackend,
+    kernel_epoch: u64,
+) -> Result<EnsureOutcome>;
+
+pub async fn mark_dirty(&self, invalidation: RouteInvalidation, epoch: u64);
+
+pub async fn reconcile_dirty(
+    &self,
+    backend: &dyn RouteBackend,
+    snapshot: &[ObservedRoute],
+    epoch: u64,
+) -> ReconcileReport;
+
+pub async fn remove_zone(
+    &self,
+    zone: &str,
+    backend: &dyn RouteBackend,
+) -> Result<ZoneRemovalReport>;
+
+pub async fn count_dynamic(&self) -> usize;
+~~~
+
+### 4.3 Fast-path invariant
+
+`ensure` returns `AlreadyMatching` **without backend I/O** only when all are true:
+
+- the exact same `RouteIntent` is still desired;
+- state is `Verified`;
+- `verified_epoch == kernel_epoch` or the entry was not affected by later targeted invalidations;
+- target identity has not changed.
+
+A DNS cache hit for an unchanged verified route therefore does no netlink write and no FIB dump.
+
+### 4.4 Capacity invariant
+
+Add to `ServerConfig`:
+
+~~~rust
+#[serde(default = "default_max_dynamic_routes")]
+pub max_dynamic_routes: usize;
+~~~
+
+Default: **16384 logical DNS host intents**.
+
+Rules:
+
+- existing intents are always allowed to refresh/reconcile;
+- static routes do not consume this quota;
+- IPv4 + IPv6 dynamic intents share the quota;
+- aggregation does not hide logical intents from the quota;
+- when a new unique DNS intent would exceed the quota, return a typed `RouteError::CapacityExceeded`;
+- `DnsHandler` always converts `CapacityExceeded`, `AuthorityDenied` and family-policy denial into SERVFAIL/NODATA as specified below, even when legacy `route_failure_mode = "fallback"` is configured. The compatibility fallback applies only to ordinary route-application errors.
+
+This is the bounded-growth fix. Do **not** invent automatic DNS-TTL route deletion in this change.
+
+## 5. Make the IPv4 aggregator a pure desired-state planner
+
+### Entry point: `src/routing/aggregator.rs`
+
+Rename the semantic meaning of `installed`; it must no longer claim kernel truth.
+
+Preferred shape:
+
+~~~rust
+pub struct RouteAggregator {
+    known_ips: HashMap<Ipv4Addr, RouteOwner>,
+    desired: HashMap<(u32, u8), RouteOwner>,
+    prefix_len: u8,
+}
+
+pub struct AggregationPlan {
+    pub next_desired: HashMap<(u32, u8), RouteOwner>,
+    pub adds: Vec<RouteIntent>,
+    pub removes: Vec<RouteIntent>,
+}
+~~~
+
+`plan_ip(...)` computes the next desired prefix set. It may update logical `known_ips`, but **only RouteRegistry/backend verification determines observed/Verified state**.
+
+### Safe mutation ordering
+
+When an existing broad aggregate must be split:
+
+1. add all more-specific replacement routes;
+2. verify those adds;
+3. add the new conflicting-zone /32;
+4. verify it;
+5. remove the superseded broad route last.
+
+Never remove the broad route first. A partial failure must leave a route rather than open a direct/default gap.
+
+If any action fails:
+
+- keep the intended desired plan;
+- mark affected registry entries Dirty/Error;
+- perform one batched snapshot/reconcile;
+- return failure to DNS for the new address until the correct route is Verified.
+
+### Canonical aggregate key
+
+Every aggregate `RouteIntent` uses `RoutePrefix::new(network, prefix)`. Never call the backend with the original host IP and a wider prefix.
+
+## 6. Refactor RouteManager around intents
+
+### Entry point: `src/routing/mod.rs`
+
+Replace fields:
+
+~~~rust
+adder
+zone_routes
+aggregator
+~~~
+
+with:
+
+~~~rust
+backend: Arc<dyn RouteBackend>,
+registry: Arc<RouteRegistry>,
+aggregator: Mutex<RouteAggregator>,
+kernel_epoch: AtomicU64,
+~~~
+
+Keep `RouteManager::new` as the production constructor. It creates the platform backend, registry and Linux monitor/audit task.
+
+### 6.1 `RouteManager::add_route`
+
+New exact behavior:
 
 ~~~text
-example.com -> matched zone "primary"
-      A 203.0.113.10 -> IPv4 readiness -> route 203.0.113.10/32
-   AAAA 2001:db8::10 -> IPv6 readiness -> route 2001:db8::10/128
+ip + zone
+  -> family policy check
+  -> backend.resolve_target(zone, family)
+  -> build host RouteIntent
+  -> IPv4: feed optional aggregator; ensure resulting canonical intents
+  -> IPv6: ensure /128 intent directly
+  -> registry.ensure(...)
 ~~~
 
-The DNS RR type determines family automatically. Define an **independent family policy and runtime state** for the same zone:
+Delete `add_route_simple` completely.
+
+Both IPv4 and IPv6 must reach `RouteRegistry::ensure`.
+
+### 6.2 Static routes
+
+`add_static_route`:
+
+- parse through `RoutePrefix::new`;
+- validate family against zone policy;
+- resolve family-specific target;
+- submit `RouteSource::Static` to the same registry;
+- IPv4 static prefixes are registered with the aggregator conflict planner before DNS aggregation;
+- static routes do not consume dynamic quota.
+
+### 6.3 Zone cleanup
+
+`cleanup_zone` becomes real explicit cleanup:
+
+- obtain all registry entries whose desired intent belongs to the zone;
+- for each **owned exact intent**, call backend `remove_route`;
+- if the backend reports a conflicting/non-owned route, do not delete it;
+- remove registry entries only after successful deletion or confirmed absence;
+- remove zone entries from aggregator desired/known state.
+
+This cleanup is called only for explicit zone removal/replacement, not DNS TTL expiry.
+
+## 7. Linux backend: exact verification and kernel-state cache
+
+### Entry point: `src/routing/linux.rs`
+
+### 7.1 Target resolution
+
+`resolve_target`:
+
+- `dev`: read the device file, resolve current ifindex and return `RouteTarget::Device { name, ifindex: Some(index) }`;
+- `via`: parse the family-specific configured gateway and require gateway family == route family. A mismatch is a validation/runtime error before netlink.
+
+### 7.2 Exact ensure semantics
+
+`ensure_route` must no longer treat EEXIST as unconditional success.
+
+Algorithm under one route operation:
+
+1. perform a targeted lookup in the local kernel snapshot/cache;
+2. if an exact matching row exists (canonical prefix, main table, target, expected protocol/metric), return `AlreadyMatching`;
+3. if the same prefix is occupied by a conflicting route that is not known to be Leshy-owned, return `RouteConflict`; never blindly replace/delete it;
+4. otherwise add/replace the owned route;
+5. read back/refresh the affected prefix and require an exact match;
+6. only then return `Added`.
+
+Set a deterministic route protocol on Linux for Leshy-created rows. Keep the current protocol value if changing it would make upgrade adoption unsafe; if a dedicated protocol value is introduced, implement explicit migration/adoption tests before deleting old rows. The executor must not choose a protocol ad hoc.
+
+### 7.3 Kernel snapshot cache
+
+Delete the request-path use of `route_matches`.
+
+Create a Linux monitor owned by the backend:
+
+- startup: one full IPv4 + IPv6 main-table snapshot;
+- route/link/address notifications: emit targeted `RouteInvalidation` where possible, `Full` when identity cannot be mapped safely;
+- coalesce event bursts (100 ms debounce is sufficient);
+- periodic safety audit: one full snapshot every 30 seconds;
+- an audit/invalidation increments `RouteManager.kernel_epoch` and reconciles Dirty entries in a batch;
+- DNS queries never initiate a full FIB dump.
+
+The implementation may use the rtnetlink multicast API available to the pinned crate or a small netlink-sys listener. This is an implementation-library choice only; the state machine above is fixed.
+
+If the event stream terminates or reports overflow:
+
+1. mark all registry entries Dirty;
+2. take a full snapshot;
+3. reconcile;
+4. restart the monitor with bounded backoff.
+
+No busy retry loop.
+
+### 7.4 Exact observed identity
+
+Linux comparison must include:
+
+- address family;
+- canonical destination/prefix;
+- table 254;
+- output ifindex for device routes OR gateway for via routes;
+- protocol value used by Leshy;
+- route type/scope where materially required.
+
+A route for the same destination through another interface is not success.
+
+## 8. Family policy and dual-stack configuration
+
+### Entry point: `src/config.rs`
+
+This fix is a v0.6 configuration semantic change.
+
+Keep:
+
+~~~toml
+ipv6 = true|false
+~~~
+
+but make semantics uniform:
+
+- IPv4 is always enabled in this release.
+- IPv6 is enabled **only** when `ipv6 = true`, for both `dev` and `via` zones.
+- default `ipv6 = false` for all zones.
+- `ZoneConfig::advertises_ipv6()` becomes exactly `self.ipv6`; remove the `route_type != Dev` implicit enable.
+
+Add:
+
+~~~rust
+#[serde(default)]
+pub route_target_ipv6: Option<String>;
+~~~
+
+Rules:
+
+- `route_type = "dev"`: `route_target` is the one device-file path used for both families; `route_target_ipv6` must be absent.
+- `route_type = "via"`: `route_target` is the IPv4 gateway and must parse as IPv4. When `ipv6 = true`, `route_target_ipv6` is required and must parse as IPv6.
+- an IPv6 static route is invalid when `ipv6 = false`.
+- mapped IPv6 addresses are rejected where family identity matters.
+
+Add helper:
+
+~~~rust
+impl ZoneConfig {
+    pub fn family_enabled(&self, family: AddressFamily) -> bool;
+    pub fn gateway_for(&self, family: AddressFamily) -> Result<Option<IpAddr>>;
+}
+~~~
+
+Update `config.example.toml` and README with an explicit dual-stack example.
+
+## 9. Make exclusive CIDR exclusions dual-stack
+
+### Entry point: `src/zones/matcher.rs`
+
+Replace IPv4-only `CidrRange { network: u32, prefix_len }` with the same canonical `RoutePrefix` type (or a thin wrapper around it).
+
+Required API:
+
+~~~rust
+impl CidrRange {
+    fn contains(&self, ip: IpAddr) -> bool;
+}
+~~~
+
+`MatchedZone::is_excluded(ip)` must work for IPv4 and IPv6.
+
+Parsing rules:
+
+- plain IPv4 -> /32;
+- plain IPv6 -> /128;
+- CIDR canonicalized;
+- prefix length validated per family;
+- IPv4-mapped IPv6 rejected rather than ambiguously matching v4.
+
+Update comments that currently claim IPv4-only behavior.
+
+## 10. DNS handler changes
+
+### Entry points: `src/dns/handler.rs::add_routes_from_response` and `handle_request`
+
+### 10.1 Family handling
+
+Keep one zone match by qname.
+
+For each answer:
+
+- A -> IPv4 intent if IPv4 policy permits;
+- AAAA -> IPv6 intent only if `zone.ipv6 == true`;
+- do not use a global "select IPv4 vs IPv6" switch;
+- a response may legitimately install both families.
+
+`without_aaaa` remains the compatibility suppression helper for IPv6-disabled zones.
+
+### 10.2 Route result classification
+
+Change the routing return from boolean to a typed result:
+
+~~~rust
+pub enum RouteResponse {
+    Ready,
+    NoRouteNeeded,
+    FamilySuppressed,
+}
+
+pub enum RouteError {
+    Apply(anyhow::Error),
+    CapacityExceeded,
+    Conflict,
+    AuthorityDenied, // used by later Kikimora backend
+}
+~~~
+
+Policy:
+
+- `CapacityExceeded`, `Conflict`, `AuthorityDenied`: never return an address that has no safe selected route. Return SERVFAIL for a requested enabled family; an explicitly disabled AAAA family remains NODATA through `without_aaaa`.
+- ordinary `Apply` errors honor legacy `route_failure_mode`;
+- managed Kikimora mode (section 12) treats controller denial as safety denial regardless of legacy fallback.
+
+### 10.3 Cache-hit test
+
+The existing comment "Still add routes from the cached response" remains correct. The test must prove:
 
 ~~~text
-Zone = name, domain/pattern matching, route policy
-ZoneFamily[IPv4] = {configured, ready/denied/unknown, target, generation}
-ZoneFamily[IPv6] = {configured, ready/denied/unknown, target, generation}
+first cached/fresh classification -> one backend mutation
+1000 subsequent cache hits       -> zero additional backend mutations
+one targeted invalidation        -> one reconciliation
+next 1000 hits                   -> zero mutations
 ~~~
 
-Separate these concepts:
+## 11. Hot reload and explicit retirement
 
-- **Configured capability:** operator allows a family. This is not proof of working connectivity.
-- **Published readiness:** orchestrator has verified the transport can carry user traffic for that family, including a usable address/source and route, not just interface UP.
-- **DNS answer policy:** A or AAAA is exposed only when the corresponding family is safely handled. Unavailable family should be suppressed as NODATA where appropriate; a strict fail-closed policy may return SERVFAIL. Suppression is not itself sufficient to block already-known IPs or direct-IP clients.
-- **Route target:** device-based zones can share one device name but family readiness may differ. For via mode IPv4 and IPv6 gateways are usually different addresses; validate against family instead of silently omitting a mismatching next hop.
+### Entry points: `src/reload.rs`, `src/server.rs`, `DnsHandler::update_config`
 
-Configuration compatibility proposal (exact TOML syntax subject to implementation review):
+Replace `get_zones_to_cleanup/get_new_zones` with:
 
-- Keep existing ipv6 boolean behavior on old config.
-- Introduce explicit per-family enable policy in a new opt-in config format, and per-family gateways when needed.
-- For managed zones, prefer "auto": IPv6 is eligible when Kikimora publishes IPv6-ready; otherwise don't advertise it or install its routes. "enabled" alone must not bypass readiness.
-- No global IPv4-vs-IPv6 selection flag; no duplicate zones per family (ZoneMatcher currently returns the first matching zone).
+~~~rust
+pub enum ZoneChange {
+    Added(ZoneConfig),
+    Removed(ZoneConfig),
+    Changed { old: ZoneConfig, new: ZoneConfig },
+}
 
-Fix IPv6 CIDR exclusions as part of this work. On exclusive zones, excluded IPv6 networks must be recognized and not over-routed. Cross-family static CIDRs and invalid/mapped addresses should get explicit validation.
+pub fn diff_zones(old: &[ZoneConfig], new: &[ZoneConfig]) -> Vec<ZoneChange>;
+~~~
 
-## 4. Ownership boundary: should parking move into Leshy?
+Derive/implement `PartialEq/Eq` for config types used in this comparison.
 
-### Option A: move *only parking* into Leshy — NOT recommended
+A zone is `Changed` when any routing-relevant field changes:
 
-Pros: one service has DNS-derived IP knowledge and could coordinate real-route/park replacement.
+- route type;
+- route target / IPv6 route target;
+- IPv6 enable policy;
+- static routes;
+- mode/exclusion CIDRs;
+- domain/pattern ownership where it changes which zone can claim an IP.
 
-Cons: it does not know tunnel transport readiness, recovery/endpoint policy, product stop, per-family verification or underlay changes without a new contract. Kikimora already has a working parking manager and checkpoint/recovery ordering. Relocation creates duplicate state or transfers VPN orchestration authority into a DNS daemon. It also risks two independent components parking/unparking the same destination.
+Reload order for `Changed`:
 
-**Decision:** do not move parking alone.
+1. build/validate new config and matcher fully;
+2. prevent new requests from seeing half-applied config (current handler write lock is the transaction boundary);
+3. reconcile/add the new static/target state first where safe;
+4. remove explicit old-zone owned rows only after replacement rows are verified;
+5. swap config/matcher;
+6. clear DNS cache;
+7. mark affected registry entries Dirty and run one reconcile.
 
-### Option B: current split, with explicit ownership + lease protocol — recommended short-term
+For `Removed`, explicit kernel cleanup is allowed: removing a zone is operator intent that the destinations are no longer selected by that zone.
 
-Kikimora remains the policy/parking owner; Leshy owns its operational DNS-selected route add/replace and reports owned prefixes. To avoid two writers racing, add a barrier and generation/ack contract described below.
+For `ipv6: true -> false`, suppress new AAAA immediately. Existing IPv6 rows are explicit old-zone state and must be removed only through the reload reconciliation path; in Kikimora managed mode the integration layer parks/withdraws them before removal. Standalone mode documents that explicit family disable means the operator is relinquishing that selected-route policy.
 
-### Option C: managed backend with Kikimora as sole kernel writer — cleaner long-term candidate
+### Dynamic route lifetime
 
-Leshy becomes the DNS routing-intent producer in managed mode. Kikimora atomically arbitrates route ownership and serializes real selected route mutations with parking. Leshy still directly routes in standalone mode. This best satisfies "one owner per routing resource", but is a larger cross-repository migration, requires an IPC result before DNS success and must preserve standalone portability. Implement as a separately approved milestone after Option B is tested, not as an incidental refactor.
+Do not add automatic per-DNS-TTL deletion.
 
-## 5. Crucial safety model: desired ≠ installed ≠ authorized
+Dynamic entries remain until:
 
-Three separate truths, never a single installed HashSet:
+- zone is explicitly removed/replaced;
+- service performs an explicit owned-route shutdown cleanup;
+- a future separately reviewed retirement feature exists.
 
-1. **Desired:** the latest DNS-classified and static route intents by zone/family, including source/age/ownership references. Retain across temporary VPN withdrawal as pending, not as proof of usability.
-2. **Authorized:** whether current controller policy permits installation. For a Kikimora-managed zone, this is a per-family publication with a **monotonic generation/lease**, not merely the presence of an interface named "vpn0" or "amn0". If invalid, missing or ambiguous: no new real route.
-3. **Observed:** exact route/rule state in kernel (family, canonical prefix, table, metric, protocol, oif/ifindex or next hop). Kernel state can drift independently of memory. "Observed" carries an observation generation and invalidation flag.
+The 16384-entry admission limit prevents silent unbounded growth.
 
-Suggested RouteEntry state:
+## 12. Fixed Kikimora integration boundary
+
+After sections 1-11 are complete and green, add a second backend implementation:
 
 ~~~text
-Absent | Pending | Verified | Dirty | Denied | Error
-  + desired owner(s), desired target and family
-  + observed kernel row and generation
-  + last successful verification, last used, retry/backoff
-  + in-flight operation token / cancellation epoch
+Standalone mode:
+DNS -> Leshy RouteRegistry -> Local Platform RouteBackend -> kernel
+
+Kikimora managed mode:
+DNS -> Leshy RouteRegistry -> KikimoraRouteBackend
+                              -> local Kikimora control API
+                              -> Kikimora selected-route registry
+                              -> Kikimora Linux route executor
+                              -> kernel
 ~~~
 
-Only mark Verified after matching read-back or a trusted synchronized kernel snapshot. Never mark Verified before a successful mutation. Treat EEXIST as "inspect existing row", not as unconditional success; the route may belong to another program or point to a different device.
+**Leshy must not call `LinuxRouteBackend.ensure_route/remove_route` for a managed zone.**
 
-An unchanged DNS response for the same (zone,family,prefix,target,generation) performs **zero netlink writes** and in the normal fast path **zero full FIB dumps**.
+Add server configuration:
 
-### 5.1 Why re-adding a missing route is dangerous
+~~~toml
+routing_backend = "local"       # default / standalone
 
-There are two fundamentally different "missing" cases:
-
-- **Accidental drift:** VPN role/family is still published Ready; some external actor deleted or replaced a real route. Reconcile may restore it after verifying owner and authority.
-- **Intentional withdrawal:** Kikimora is parking a route, restarting VPN, or has revoked Ready. Reconciliation **must not** restore the route. The destination must be protected by Kikimora's park or a stricter family policy.
-
-A full FIB scan cannot tell the difference. The system needs a separate authority signal, with ordering.
-
-### 5.2 What Kikimora already provides
-
-Reviewed Kikimora Go/Toad integration:
-
-- toad/internal/leshy/bridge.go: Publish / Withdraw / Resync via an atomic zone .dev device-name file;
-- toad/internal/parking/manager.go: PrepareOwnedWithdrawal, ObserveRestorationFromKernel, Clear;
-- toad/internal/control/recovery_driver.go: capture baseline/selected ownership, prepare parking, withdraw publication, transport recovery, publish, verify restoration then release parks;
-- managed parks include /32 and /128 and use a high-metric unreachable route (typically 42760);
-- table 51890 underlay endpoint policy is separate and must never be treated as a Leshy user-route park.
-
-**Weaknesses to address at the boundary:**
-
-- Existing .dev files contain only interface name, **no generation, family readiness, lease or withdrawal acknowledgement**. File absence prevents future lookups but does not fence a pre-existing asynchronous add.
-- Kikimora currently learns some route ownership from kernel baseline+delta observation. A newly installed route can disappear before it is recorded; then the park inventory may be incomplete.
-- Current ObserveRestorationFromKernel checks a real row with lower metric, not all relevant target/owner identity fields; it should not release a park based on an unrelated lower-metric route.
-- Successful restoration is not established by interface UP alone; the exact family and target must match.
-
-Do not treat the file bridge as race-free. The target contract requires cooperation in both repositories.
-
-### 5.3 Recommended fenced publish/withdraw + owned-route protocol
-
-Extend managed-mode publication to carry:
-
-~~~text
-Publish(zone, family, generation, target, readiness=Ready)
-Withdraw(zone, family, generation) -> ACK
-  ACK means: all older authorized writes finished or were cancelled,
-             and no later add can execute under this generation
-ReserveOrReportOwnedRoute(zone, family, generation, prefix, expected_target)
-  -> ACK from controller, which has safely recorded ownership/protection
-Resync(zone, family, generation) -> verified / pending / denied route set
+# or
+routing_backend = "kikimora"
+kikimora_socket = "/run/kikimora/core.sock"
 ~~~
 
-Prefer local authenticated Unix-domain IPC with generation fencing and explicit ACK for correctness. An atomic JSON document and inotify may be a migration adapter, but **cannot alone guarantee withdrawal barriers**. Retain old .dev protocol for standalone/compatibility mode until cutover; do not silently claim it supplies the stronger safety guarantee.
+The managed backend:
 
-Implementation details:
+- uses the existing Kikimora framed local control socket;
+- calls API v3 `EnsureLeshyRoute` for a new/dirty intent;
+- receives controller route generation + exact status;
+- subscribes to core state and invalidates zone/family entries when readiness/generation changes;
+- on socket loss marks authority Unknown and does not trust a stale Verified entry for a new intent;
+- never falls back to the local writer in managed mode.
 
-- Serialize or fence every kernel write against publication changes. Each in-flight add carries a generation. During Withdraw, stop issuing new adds, await/cancel all older in-flight operations, then acknowledge. Re-check generation before committing registry state. A stale completion cannot be considered authorized.
-- For a **new prefix**, register/commit ownership with Kikimora **before** exposing a usable DNS address or creating an unprotected real-route window. If the owner cannot durably record it, fail closed. The precise persistence/ACK boundary needs integration tests.
-- An error/timeout talking to the controller cannot be treated as permission to install; do not fall back to stale .dev success in strict managed mode.
-- Don't use ifname alone as identity. A reconnect can reuse a name with a different ifindex and address-family capability; change generation and invalidate old Verified entries.
-- Runtime crashes and process restarts must not leave conflicting leases. Use a boot/process epoch and reconstruct managed ownership with read-back and checkpoint before declaring Ready.
-- In standalone Leshy, preserve local policies and allow normal route reconciliation without a Kikimora IPC dependency.
+Static and dynamic routes for a managed zone use the same controller backend; do not create a split writer.
 
-### 5.4 Exact fail-closed order
+The corresponding Go implementation sequence lives in Kikimora `docs/toad-steps/08d-leshy-managed-selected-routes.md`.
 
-**Healthy steady state:** each allowed zone/family has a matching real route; no redundant add. Unknown or disabled family is not advertised as safely routed.
+## 13. Ordered implementation sequence
 
-**Planned withdrawal:**
+The executor must land the fix in this order. Do not jump directly to Linux event monitoring or Kikimora IPC.
 
-1. Kikimora starts a withdrawal epoch for affected role/family.
-2. Revoke publication and obtain the Leshy quiescence ACK (no old-generation writes in flight). Do not let new DNS answers produce new functional routes during this transition.
-3. Using explicit registered owned prefixes (not a best-effort route scan alone), install fail-closed parks and verify they exist. This can be done in an order compatible with current parks and remaining real routes.
-4. Withdraw the lower-metric real selected routes / take down the tunnel, preserving parks. Never leave both the selected route and protective park absent while a physical/other-tunnel fallback exists.
-5. Any DNS request for that family remains denied/suppressed or protected; do not use simple fallback mode to leak via physical routing.
+### Commit 1 — model + fake backend + tests, no production behavior change
 
-**Unexpected tunnel disappearance/crash:**
+Files:
+- add `src/routing/model.rs`;
+- add `src/routing/backend.rs`;
+- add test fake backend;
+- adapt existing platform writers enough to compile.
 
-- The controller must have a previously acknowledged set of selected prefixes sufficient to park, and maintain checkpointed state. If no inventory exists, the guarantee cannot be established by periodic route discovery alone.
-- Leshy must treat publication loss, generation mismatch and controller error as non-authorized. It may remember intents but must not recreate a real route.
-- A kernel-link event invalidates target-specific verified entries. Real route disappearance is not reason to use the other VPN or physical route.
+Tests:
+- canonical IPv4/IPv6 prefixes;
+- family mismatch;
+- exact target equality;
+- fake backend mutation counters.
 
-**Recovery:**
+### Commit 2 — registry and unified non-aggregated route path
 
-1. Kikimora establishes endpoint underlay separately, restarts/rebinds transport and independently validates actual IPv4/IPv6 data-plane readiness.
-2. Publish a new per-family generation only for a ready family (IPv4 Ready does not imply IPv6 Ready).
-3. Reconcile desired routes under that generation. Validate exact table/prefix/oif/gateway/protocol and effective winning route. Verify selected real routes in kernel before releasing any corresponding park.
-4. Remove park **only** for a prefix whose correct expected winner is proven. A random lower-metric row on an unrelated interface is not proof. Keep other parks until their own restoration.
-5. Replay the same inputs: zero further kernel mutations.
+Files:
+- add `src/routing/registry.rs`;
+- refactor `src/routing/mod.rs`;
+- delete `add_route_simple`;
+- route both /32 and /128 through registry.
 
-If an old lower-metric real route still points at a dead interface, it can cause timeouts despite a high-metric park. The reconciliation must explicitly handle stale real-route removal; a higher-metric unreachable park alone will not override that route.
+Tests:
+- 1000 duplicate v4 -> one mutation;
+- 1000 duplicate v6 -> one mutation;
+- 100 concurrent same-key ensures -> one mutation;
+- different keys proceed independently;
+- failed add never becomes Verified;
+- EEXIST/conflict never becomes Verified without exact match;
+- capacity boundary.
 
-**Important limitation:** a DNS-only classifier cannot prevent direct-IP traffic or stale cached client addresses from using an unsafe default path after its specific route is removed. Truly global zero-leak behavior must be guaranteed by the Kikimora traffic/parking policy, not by DNS AAAA suppression alone.
+### Commit 3 — pure aggregator + safe action ordering
 
-### 5.5 Safety matrix
+Files:
+- `src/routing/aggregator.rs`;
+- `src/routing/mod.rs`.
 
-| Authority | Kernel state | Action |
-| --- | --- | --- |
-| Ready, matching generation | Exact real route matches target | No write, Verified |
-| Ready, matching generation | Missing | Reconcile owned route and verify |
-| Ready, matching generation | Existing foreign/conflicting row | Do not delete foreign route blindly; error/escalate |
-| Withdrawing / Unpublished | Missing or park only | Do not add; pending intent |
-| Withdrawing / Unpublished | Old real row remains | Do not restore; controller withdraws safely |
-| Unknown, stale epoch, controller unreachable | Any | No new add; fail closed |
-| New generation, changed ifindex/target | Old route | Invalidate; replace only with owner permission |
-| IPv6 not Ready, IPv4 Ready | IPv6 may be absent | Permit IPv4 only; prevent AAAA-induced bypass |
+Tests:
+- existing aggregation semantics retained;
+- canonical aggregate network;
+- same-zone covered IP no extra kernel mutation;
+- cross-zone split order is add-specifics before remove-broad;
+- injected failure leaves old broad route until replacements verified;
+- retry converges.
 
-## 6. Avoid full route dump per DNS cache hit
+### Commit 4 — Linux exact snapshot/reconciliation
 
-Proposed Linux design:
+Files:
+- `src/routing/linux.rs`;
+- `Cargo.toml` only if the existing rtnetlink version needs an explicit multicast helper.
 
-1. Initial **one-time kernel snapshot** of relevant tables, families and owned routes.
-2. Subscribe to netlink RTM_NEWROUTE/RTM_DELROUTE for IPv4/IPv6 (and link/address events for target changes). Update/invalidate affected entries; coalesce bursts.
-3. Fast path: verified entry with same desired key, target and current publication epoch and no invalidation -> no netlink I/O.
-4. On invalidation, new epoch, suspicious drift, listener restart or an uncertain state: perform **bounded batched** reconciliation; fetch one snapshot for many dirty routes rather than one full dump per DNS request.
-5. Low-rate periodic audit as a safety net for lost events. Audit rate, max work per tick, timeouts and backoff are configurable; no busy loops.
-6. Event streams are invalidation hints, not absolute proof; refresh kernel state when recovery safety depends on it.
-7. No locks held across unrelated async syscalls; coalesce concurrent DNS requests for the same RouteKey into one in-flight operation. Ensure a route-action transaction cannot silently leave the aggregator's installed map ahead of kernel state.
-8. Record counters for snapshot dumps, dirty entries, reconciliation passes, add/replace/delete success/failure, EEXIST, restore-after-drift and denied-by-authority.
+Tests:
+- synthetic snapshot parser;
+- exact dev match;
+- exact gateway match;
+- wrong ifindex/gateway/protocol rejected;
+- v4 destination/v6 gateway and v6 destination/v4 gateway rejected;
+- targeted invalidation;
+- monitor loss -> full dirty + one audit.
 
-For large IPv4 aggregates, compare canonical network prefixes rather than the individual member IP. Validate selected effective route after changes and avoid accidental replacement of unrelated routes.
+Privileged disposable netns test:
+- real /32 and /128 add/read-back/delete;
+- external deletion restored once;
+- stable state produces zero writes.
 
-## 7. Route retirement, cleanup and bounded growth — no leak regression
+### Commit 5 — dual-stack policy + exclusions
 
-Current cleanup_zone() drops only memory tracking; routes remain in the kernel. That causes stale accumulation. But simply deleting routes after DNS TTL, on zone removal, or on cache eviction can **immediately leak existing TCP/QUIC flows** through the physical default.
+Files:
+- `src/config.rs`;
+- `src/zones/matcher.rs`;
+- `config.example.toml`;
+- README.
 
-Retirement must therefore be a separate safe state transition:
+Tests:
+- ipv6 default false for dev and via;
+- ipv6 true dev route;
+- via v4 + v6 separate gateways;
+- missing v6 gateway rejected;
+- IPv6 exclusion /64;
+- plain IPv6 exclusion /128;
+- mapped-v6 rejection;
+- one zone returns both A and AAAA route intents.
 
-- Mark no-longer-desired dynamic route as Retiring rather than deleting it immediately.
-- Keep active-flow protection or explicit deny/park for addresses that may still be in use; use connection tracking and/or a policy-controlled quiescence/grace protocol only where justified and tested.
-- Do not repurpose DNS TTL as a connection lifetime. CDN A/AAAA rotation is normal and must not destroy ongoing sessions.
-- Never reclaim a dynamic route that is still referenced by another domain/zone, a static route, or a conflicting owner.
-- For managed zones, have Kikimora approve a safe retirement and ensure no direct-path fallback; in standalone mode select conservative behavior and document what guarantees cannot be offered.
-- Reconcile obsolete routes on zone removal, changed target, IPv6 disable and restart, but **only after** fail-closed transition/safe ownership checks.
-- Limit registry memory and provide observable high-watermark/pressure counters. Avoid an unsafe arbitrary LRU eviction that removes the last fail-closed protection.
+Bump package minor/major as appropriate for the config semantic change; document it as v0.6 behavior.
 
-Open design question (requires evidence before turning GC on by default): how to establish flow quiescence for routed flows, including UDP/QUIC and applications using already-resolved IPs, without retaining every old destination forever? A bounded host-route list by itself cannot deliver a universal no-leak guarantee. The first implementation should prioritize correct ownership and convergence, then enable conservative GC behind a validated policy.
+### Commit 6 — DNS typed safety results + cache fast path
 
-## 8. Execution stages
+Files:
+- `src/dns/handler.rs`;
+- test constructors/fakes.
 
-### Stage 0 — tests, contract, measurements
+Tests:
+- cache hit route fast path;
+- capacity -> SERVFAIL even with fallback configured;
+- conflict -> SERVFAIL;
+- disabled AAAA -> NODATA/no IPv6 intent;
+- enabled A+AAAA both verified before response;
+- one family failure cannot accidentally route the address through the other family.
 
-- Record current 0.5.2 behavior, managed/standalone modes, IPv4 and IPv6.
-- Add deterministic fake RouteAdder counters to prove cache-hit and concurrent-query behavior.
-- Capture route growth and churn counters; do not run privileged tests on the user's active host.
-- Agree on family policy semantics and explicit route ownership handshake before changing fail-closed behavior.
+### Commit 7 — reload diff + explicit owned cleanup
 
-### Stage 1 — unified cache and family-safe planner (Leshy-only)
+Files:
+- `src/reload.rs`;
+- `src/server.rs`;
+- `src/dns/handler.rs`;
+- `tests/hot_reload_test.rs`.
 
-- New RouteKey and RouteEntry abstractions covering both families.
-- Move IPv4-only CIDR aggregation behind a separate planner, not the shared cache.
-- Fix IPv6 exclusions, gateway-family validation, IPv4 canonical prefix check.
-- Commit installed state only after verified success. Handle partial aggregate update transactionally.
-- Coalesce concurrent per-key requests; remove IPv6 duplicate RTM_NEWROUTE.
-- Preserve existing device-zone IPv4-only default until readiness publication supports IPv6 safely.
+Tests:
+- removed zone deletes only its owned rows;
+- same-name target change is detected;
+- same-name IPv6 policy change is detected;
+- new target verified before old target removed where replacement applies;
+- foreign same-prefix row never deleted;
+- reload replay converges to zero mutations.
 
-### Stage 2 — efficient Linux kernel synchronization
+### Commit 8 — soak/performance regression
 
-- Netlink route/link/address event subscription; initial snapshot, batched read-back, dirty marking and periodic low-rate audit.
-- Exact table/prefix/protocol/metric/target owner verification.
-- Remove per-request full route dump from hot path.
-- Correct handling of stale ifindex and unexpected external route removal.
+Add a deterministic fake-kernel soak test:
 
-### Stage 3 — safe managed Kikimora interaction (cross-repo)
+- 10k DNS classifications over a fixed set of 100 v4 + 100 v6 addresses;
+- after first convergence, route mutation count remains constant;
+- no request-path snapshot calls;
+- one audit snapshot per configured audit interval simulation;
+- capacity denial at 16385th unique dynamic intent;
+- memory registry count remains bounded by capacity plus static entries.
 
-- Define and test per-family Publish/Withdraw ACK, generation fencing and exact owned-prefix registration.
-- Implement the compatibility transition from .dev file publication without two route owners or silent downgrade.
-- Fix Kikimora park-release proof: expected family, prefix, target, owner and winning route must match.
-- Test loss of publication, kernel drift and tunnel death at every handshake boundary.
+### Commit 9 — managed backend adapter, but do not enable it before Kikimora side exists
 
-### Stage 4 — safe retirement and configuration reload
+Files:
+- new `src/routing/kikimora.rs`;
+- `src/config.rs`;
+- `src/routing/mod.rs`;
+- protocol test fixture.
 
-- Diff changed zone content (not just removed names), family/target changes, static route changes.
-- Add retiring state with explicit safe-to-remove conditions; confirm protection before deletion.
-- Keep endpoint table 51890 and foreign/user routes untouched.
-- Test no leaks across cache expiration, long-lived connection, stale client IP and restart.
+This commit may be developed against a fake control API but must not become the generated/default Kikimora configuration until Kikimora packet 08D passes.
 
-### Stage 5 — optional managed sole-writer backend
+## 14. Test commands / acceptance gate
 
-- Evaluate moving managed-mode route *application* (not just parking) to Kikimora. If adopted, route intent becomes an IPC request whose kernel result arrives before DNS reply.
-- Do not merge this into Stages 1-4 without its own architectural review, failure/latency budget and migration tests.
+Required non-privileged:
 
-## 9. Required deterministic and privileged acceptance
+~~~bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+~~~
 
-**Pure Rust tests (no root):**
+Required Linux disposable namespace test, never the active workstation:
 
-1. Same IPv4 /32 repeated 1,000 times -> one kernel mutation; same IPv6 /128 repeated 1,000 times -> one mutation.
-2. Concurrent 100 duplicate DNS requests -> one in-flight kernel operation per key.
-3. Separate A+AAAA for one hostname -> both valid routes if both families Ready; only v4 if v6 not Ready; never incorrectly route the AAAA over v4.
-4. IPv6 exclusion CIDR matches; invalid family gateway rejected before syscall.
-5. Aggregation: canonical /N match, distinct zones cannot steal an aggregate, no partial action marks route installed on failed syscall.
-6. EEXIST for a foreign route is not accepted as verified ownership.
-7. Route deleted by external actor: Ready + valid generation -> restore once; Withdrawing/Unpublished -> zero restores.
-8. Route target changes at same zone name: invalidate and safely reconcile.
-9. Lost netlink notification: periodic audit recovers without repeated writes in the steady state.
-10. TTL expiry/duplicate domain ownership does not provoke a direct-route fallback.
+~~~bash
+sudo ./tests/linux-route-registry-netns.sh
+~~~
 
-**Isolated Linux network namespace tests (root in disposable namespace, NEVER active workstation):**
+The script must create its own namespace/interfaces and clean them with a trap.
 
-1. IPv4/IPv6 exact route add/read-back/delete/recover (test selected source and egress).
-2. Family-specific readiness, IPv6-disabled NODATA, IPv6-enabled correct path, no false readiness for a v4-only tunnel.
-3. Withdraw mid-write, before/after owner registration, during park setup, during device loss and during republish; old generations cannot recreate routes.
-4. With physical default and another VPN still present, failed-zone destination must not use either fallback for both /32 and /128.
-5. During restoration, parked route remains until a correct lower-metric selected route is verified; wrong interface must not release the park.
-6. Crash/restart with stale registry/ownership checkpoint and reused ifname/different ifindex.
-7. Foreign same-prefix routes, overlapping static CIDRs and table-51890 endpoint routes remain unmodified.
-8. High-volume replay on a fixed DNS dataset: after convergence **zero route mutations**, no per-query FIB dump, bounded CPU/memory, bounded reconciliation latency.
-9. Controlled dynamic address churn, active long-lived TCP and UDP/QUIC flows during conservative cleanup; prove no physical/default leak.
+Required regression assertions:
 
-**Metrics to capture:** per-family intents, verified routes, parks, denied operations, netlink adds/replaces/deletes, route dumps, duplicate coalesces, reconciliation cycles, drift repairs, publication epochs, GC candidates/retirements, kernel route counts and process CPU/RSS. Keep threshold values evidence-based; do not hardcode the legacy host's 1,244/hour as an acceptable budget.
+- stable DNS replay: zero route writes after convergence;
+- v4 and v6 have identical registry semantics;
+- no full FIB dump on DNS fast path;
+- external route loss is detected by monitor/audit and reconciled once;
+- no wrong-family gateway is accepted;
+- no IPv6 exclusion bypass;
+- no foreign route replacement/deletion;
+- max route capacity fails closed;
+- config reload is idempotent;
+- aggregation never opens a remove-before-replacement gap.
 
-**Definition of done:** v4/v6 functional parity; no duplicate kernel adds on stable DNS; no per-hit full-table dumps; safe revalidation after drift; no write after managed withdrawal ACK; park owner remains Kikimora; no IPv6 direct bypass; no uncontrolled route retirement; tests and documentation updated. Do not claim done based only on unit tests or on an IPv4-only environment.
+## 15. Definition of done for the Leshy-only fix
 
-## 10. Files likely to change
+Do not call this plan complete until all are true:
 
-**Leshy:** src/routing/mod.rs, src/routing/aggregator.rs, src/routing/linux.rs, src/dns/handler.rs, src/dns/cache.rs, src/zones/matcher.rs, src/config.rs, src/server.rs, src/reload.rs; tests/docker, new route-registry unit tests and Linux netns tests.
+- `add_route_simple` is gone;
+- IPv4 and IPv6 enter the same registry;
+- DNS cache replay produces zero kernel churn;
+- Linux no longer dumps the FIB per repeated DNS classification;
+- kernel drift is reconciled from invalidation/audit, not from request-path full scans;
+- exact kernel route identity is checked;
+- gateway family mismatch is rejected;
+- IPv6 exclusion CIDRs work;
+- same-name zone config changes reconcile;
+- explicit zone removal cleans owned rows;
+- dynamic route count is bounded and new over-capacity addresses fail closed;
+- all unit/integration/netns tests are green;
+- only then begin Kikimora 08D integration.
 
-**Kikimora integration:** toad/internal/leshy/bridge.go (new protocol alongside compatibility file bridge), toad/internal/control/recovery_driver.go, toad/internal/parking/manager.go, toad/internal/routing/ownership.go, and relevant route-parking/dual-stack acceptance tests.
+## 16. Explicit non-goals
 
-## 11. Unresolved decisions to review before implementation
-
-- Prefer Option B (split with explicit lease) short-term; revisit Option C (Kikimora sole writer in managed mode) when a measured need and migration plan exist.
-- Exact managed transport of generation + family capability + owned-prefix ACK (Unix socket vs file bridge plus stronger synchronization).
-- Safe kernel route protocol/ownership tag for Leshy without hijacking user routes.
-- What to do with IPv6 via-gateway when only IPv4 next hop is configured (fail validation vs explicit separate v6 gateway).
-- Conservative GC/retirement under a strict zero-direct-leak contract.
-- Whether managed DNS should suppress unavailable-family answers or return SERVFAIL for the whole request; must preserve independent v4 and v6 functionality.
-
-**Links for contract reviewers:** Kikimora docs/go-multi-vpn-architecture.md, docs/route-parking.md (historical Linux lifecycle details), docs/toad-steps/07b-routing-parking-failclosed.md (current Go parking work), docs/toad-steps/08-dual-stack-dns-route-stability.md (regression requirements).
+- No automatic route deletion based solely on DNS TTL.
+- No IPv6 prefix aggregation.
+- No moving VPN parking into Leshy.
+- No fallback from Kikimora managed backend to direct local FIB writes.
+- No deleting/replacing a route merely because its prefix matches; ownership/target must be proven.
+- No active-host privileged test while developing this fix.
