@@ -137,6 +137,19 @@ impl LinuxRouteBackend {
         Ok(rows.into_iter().find(|row| row.key == intent.key))
     }
 
+    /// A typed refusal to touch a destination someone else owns. The registry
+    /// classifies this as `RouteError::Conflict`, which the DNS layer answers
+    /// with SERVFAIL instead of handing out an unrouted address.
+    fn conflict_error(&self, intent: &RouteIntent, owner: &RouteTarget) -> anyhow::Error {
+        anyhow::anyhow!(super::backend::RouteConflict {
+            prefix: format!(
+                "{}/{}",
+                intent.key.prefix.network, intent.key.prefix.prefix_len
+            ),
+            owner: format!("{owner:?}"),
+        })
+    }
+
     /// Build the netlink add request for an intent.
     async fn add_row(&self, intent: &RouteIntent) -> Result<()> {
         let prefix = &intent.key.prefix;
@@ -341,12 +354,7 @@ impl RouteBackend for LinuxRouteBackend {
             if existing.target == intent.target {
                 return Ok(EnsureOutcome::AlreadyMatching);
             }
-            anyhow::bail!(
-                "route {} is already owned by {:?}, refusing to replace it with {:?}",
-                intent.key.prefix.network,
-                existing.target,
-                intent.target
-            );
+            return Err(self.conflict_error(intent, &existing.target));
         }
 
         self.add_row(intent).await?;
@@ -354,12 +362,9 @@ impl RouteBackend for LinuxRouteBackend {
         // Read back: the kernel is the only proof the route exists.
         match self.find_row(intent).await? {
             Some(row) if row.target == intent.target => Ok(EnsureOutcome::Added),
-            Some(row) => anyhow::bail!(
-                "route {} landed on {:?} instead of {:?}",
-                intent.key.prefix.network,
-                row.target,
-                intent.target
-            ),
+            // Something else took the destination between our add and the
+            // read-back; treat it as a foreign route, not ours to fix.
+            Some(row) => Err(self.conflict_error(intent, &row.target)),
             None => anyhow::bail!(
                 "route {} is missing right after it was added",
                 intent.key.prefix.network

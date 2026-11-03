@@ -22,10 +22,6 @@ mod windows;
 pub use model::{
     family_of, AddressFamily, RouteIntent, RouteKey, RoutePrefix, RouteSource, RouteTarget,
 };
-// The DNS handler starts classifying these in the typed-safety step; the
-// kernel monitor drives `reconcile_all`/`dynamic_route_count` in the Linux
-// snapshot step.
-#[allow(unused_imports)]
 pub use registry::{ReconcileReport, RouteError};
 
 use crate::config::ZoneConfig;
@@ -58,7 +54,8 @@ pub struct RouteManager {
     backend: Arc<dyn RouteBackend>,
     registry: Arc<RouteRegistry>,
     aggregator: Mutex<RouteAggregator>,
-    kernel_epoch: AtomicU64,
+    /// Shared so the monitor/audit tasks and the request path see one epoch.
+    kernel_epoch: Arc<AtomicU64>,
 }
 
 impl RouteManager {
@@ -73,7 +70,7 @@ impl RouteManager {
             backend,
             registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
             aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
-            kernel_epoch: AtomicU64::new(0),
+            kernel_epoch: Arc::new(AtomicU64::new(0)),
         };
         manager.start_kernel_watch();
         Ok(manager)
@@ -85,68 +82,74 @@ impl RouteManager {
     /// keeps the audit, and a failed audit is logged rather than fatal.
     fn start_kernel_watch(&self) {
         if let Some(mut rx) = self.backend.take_invalidation_receiver() {
+            let epoch = Arc::clone(&self.kernel_epoch);
             let registry = Arc::clone(&self.registry);
             let backend = Arc::clone(&self.backend);
-            let epoch = Arc::new(AtomicU64::new(0));
-
             tokio::spawn(async move {
                 while let Some(invalidation) = rx.recv().await {
-                    let next = epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                    registry.mark_dirty(invalidation, next).await;
-                    match backend.snapshot().await {
-                        Ok(snapshot) => {
-                            let report = registry
-                                .reconcile_dirty(backend.as_ref(), &snapshot, next)
-                                .await;
-                            if report.adds > 0 || report.removes > 0 {
-                                tracing::info!(
-                                    adds = report.adds,
-                                    removes = report.removes,
-                                    noops = report.noops,
-                                    "Kernel route drift reconciled"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Route snapshot failed after an invalidation");
-                        }
+                    let report = reconcile_after_invalidation(
+                        &registry,
+                        backend.as_ref(),
+                        &epoch,
+                        invalidation,
+                    )
+                    .await;
+                    if report.adds > 0 || report.removes > 0 {
+                        tracing::info!(
+                            adds = report.adds,
+                            removes = report.removes,
+                            noops = report.noops,
+                            "Kernel route drift reconciled"
+                        );
                     }
                 }
             });
         }
 
         // Periodic safety audit: catches drift the event stream missed.
+        let epoch = Arc::clone(&self.kernel_epoch);
         let registry = Arc::clone(&self.registry);
         let backend = Arc::clone(&self.backend);
-        let epoch = Arc::new(AtomicU64::new(0));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(AUDIT_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let next = epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                registry
-                    .mark_dirty(backend::RouteInvalidation::Full, next)
-                    .await;
-                match backend.snapshot().await {
-                    Ok(snapshot) => {
-                        let report = registry
-                            .reconcile_dirty(backend.as_ref(), &snapshot, next)
-                            .await;
-                        if report.adds > 0 || report.removes > 0 {
-                            tracing::info!(
-                                adds = report.adds,
-                                removes = report.removes,
-                                "Periodic route audit reconciled drift"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "Periodic route audit could not read the table");
-                    }
+                let report = reconcile_after_invalidation(
+                    &registry,
+                    backend.as_ref(),
+                    &epoch,
+                    backend::RouteInvalidation::Full,
+                )
+                .await;
+                if report.adds > 0 || report.removes > 0 {
+                    tracing::info!(
+                        adds = report.adds,
+                        removes = report.removes,
+                        "Periodic route audit reconciled drift"
+                    );
                 }
             }
         });
+    }
+
+    /// Apply one invalidation signal: bump the kernel epoch, mark matching
+    /// entries dirty and reconcile them against a fresh snapshot.
+    ///
+    /// The production monitor goes through [`reconcile_after_invalidation`]
+    /// directly; this is the test-facing entry point on an owned manager.
+    #[cfg(test)]
+    pub(crate) async fn handle_invalidation(
+        &self,
+        invalidation: backend::RouteInvalidation,
+    ) -> ReconcileReport {
+        reconcile_after_invalidation(
+            &self.registry,
+            self.backend.as_ref(),
+            &self.kernel_epoch,
+            invalidation,
+        )
+        .await
     }
 
     /// Construct a manager around an arbitrary backend. Used by tests to drive
@@ -164,7 +167,7 @@ impl RouteManager {
             backend,
             registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
             aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
-            kernel_epoch: AtomicU64::new(0),
+            kernel_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -336,19 +339,39 @@ impl RouteManager {
 
     /// Mark every entry dirty and reconcile against a fresh snapshot.
     ///
-    /// Called by the kernel monitor when it cannot map a change to individual
-    /// keys, and by the periodic safety audit.
-    #[allow(dead_code)]
+    /// Test-facing twin of [`reconcile_after_invalidation`] on an owned
+    /// manager; production callers go through the free function.
+    #[cfg(test)]
     pub async fn reconcile_all(&self) -> Result<ReconcileReport> {
-        let epoch = self.kernel_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        self.registry
-            .mark_dirty(backend::RouteInvalidation::Full, epoch)
-            .await;
-        let snapshot = self.backend.snapshot().await?;
         Ok(self
-            .registry
-            .reconcile_dirty(self.backend.as_ref(), &snapshot, epoch)
+            .handle_invalidation(backend::RouteInvalidation::Full)
             .await)
+    }
+}
+
+/// Bump the shared kernel epoch, mark entries dirty per the invalidation and
+/// reconcile them against one fresh snapshot.
+///
+/// Both the monitor task and the periodic audit go through this, so every
+/// reconcile makes the registry's verified epochs line up with
+/// [`RouteManager::kernel_epoch`] again and the DNS fast path stays exact.
+async fn reconcile_after_invalidation(
+    registry: &Arc<RouteRegistry>,
+    backend: &dyn RouteBackend,
+    kernel_epoch: &AtomicU64,
+    invalidation: backend::RouteInvalidation,
+) -> ReconcileReport {
+    kernel_epoch.fetch_add(1, Ordering::SeqCst);
+    let epoch = kernel_epoch.load(Ordering::SeqCst);
+    registry.mark_dirty(invalidation, epoch).await;
+    match backend.snapshot().await {
+        Ok(snapshot) => registry.reconcile_dirty(backend, &snapshot, epoch).await,
+        Err(e) => {
+            // The epoch already advanced, so no entry can claim Verified
+            // against stale kernel state until the next reconcile succeeds.
+            tracing::debug!(error = %e, "Route snapshot failed after an invalidation");
+            ReconcileReport::default()
+        }
     }
 }
 

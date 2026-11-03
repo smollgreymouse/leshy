@@ -26,6 +26,29 @@ pub enum EnsureOutcome {
     AlreadyMatching,
 }
 
+/// A route Leshy does not own occupies the destination prefix.
+///
+/// Leshy never replaces or deletes a route it cannot prove ownership of; the
+/// DNS layer turns this into a fail-closed SERVFAIL instead of answering with
+/// an address that has no selected route.
+#[derive(Debug)]
+pub struct RouteConflict {
+    pub prefix: String,
+    pub owner: String,
+}
+
+impl std::fmt::Display for RouteConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "route {} is already owned by {}",
+            self.prefix, self.owner
+        )
+    }
+}
+
+impl std::error::Error for RouteConflict {}
+
 /// A kernel-state change that invalidates registry verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteInvalidation {
@@ -81,6 +104,8 @@ pub(crate) mod fake {
         pub resolves: AtomicU64,
         /// Scripted result for the next `ensure_route` calls.
         outcome: Mutex<Option<Result<EnsureOutcome>>>,
+        /// Scripted foreign-route conflict for the next `ensure_route` calls.
+        conflict: Mutex<Option<(String, String)>>,
         /// Scripted result for the next `resolve_target` calls.
         resolved: Mutex<Option<RouteTarget>>,
         pub ensured: Mutex<Vec<RouteIntent>>,
@@ -97,6 +122,7 @@ pub(crate) mod fake {
                 snapshots: AtomicU64::new(0),
                 resolves: AtomicU64::new(0),
                 outcome: Mutex::new(None),
+                conflict: Mutex::new(None),
                 resolved: Mutex::new(None),
                 ensured: Mutex::new(Vec::new()),
                 removed: Mutex::new(Vec::new()),
@@ -140,6 +166,11 @@ pub(crate) mod fake {
 
         pub(crate) fn set_outcome(&self, outcome: Result<EnsureOutcome>) {
             *self.state.outcome.lock().unwrap() = Some(outcome);
+        }
+
+        /// Script a foreign route conflict for the next `ensure_route` calls.
+        pub(crate) fn set_conflict(&self, prefix: &str, owner: &str) {
+            *self.state.conflict.lock().unwrap() = Some((prefix.to_string(), owner.to_string()));
         }
 
         pub(crate) fn set_resolved(&self, target: RouteTarget) {
@@ -206,6 +237,9 @@ pub(crate) mod fake {
         async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
             self.state.ensures.fetch_add(1, Ordering::SeqCst);
             self.state.ensured.lock().unwrap().push(intent.clone());
+            if let Some((prefix, owner)) = self.state.conflict.lock().unwrap().clone() {
+                return Err(anyhow::anyhow!(super::RouteConflict { prefix, owner }));
+            }
             match self.state.outcome.lock().unwrap().as_ref() {
                 Some(Ok(outcome)) => Ok(*outcome),
                 Some(Err(e)) => Err(anyhow::anyhow!("{e}")),

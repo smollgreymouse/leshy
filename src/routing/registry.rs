@@ -13,7 +13,7 @@
 // the rollout; until then it is exercised only by its own tests.
 #![allow(dead_code)]
 
-use crate::routing::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
+use crate::routing::backend::{EnsureOutcome, RouteBackend, RouteConflict, RouteInvalidation};
 use crate::routing::model::*;
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -133,6 +133,9 @@ impl RouteRegistry {
             Err(e) => {
                 locked.state = RouteState::Error;
                 locked.last_error = Some(e.to_string());
+                if e.downcast_ref::<RouteConflict>().is_some() {
+                    bail!(RouteError::Conflict);
+                }
                 bail!(RouteError::Apply(e));
             }
         };
@@ -296,6 +299,7 @@ impl RouteRegistry {
 // ---------------------------------------------------------------------------
 
 /// Result of a reconcile_dirty call.
+#[derive(Default)]
 pub struct ReconcileReport {
     pub adds: usize,
     pub removes: usize,
@@ -309,10 +313,19 @@ pub struct ZoneRemovalReport {
 }
 
 /// Typed routing errors for the DNS handler.
+///
+/// `CapacityExceeded`, `Conflict` and `AuthorityDenied` are safety denials:
+/// the address must never be answered without its selected route, regardless
+/// of the configured `route_failure_mode`. Only `Apply` honours the legacy
+/// compatibility fallback.
 #[derive(Debug)]
 pub enum RouteError {
     Apply(anyhow::Error),
     CapacityExceeded,
+    Conflict,
+    /// Reserved for the Kikimora managed backend: the controller refused the
+    /// intent, which is a safety denial like any other.
+    AuthorityDenied,
 }
 
 impl std::fmt::Display for RouteError {
@@ -320,6 +333,8 @@ impl std::fmt::Display for RouteError {
         match self {
             RouteError::Apply(e) => write!(f, "route apply: {e}"),
             RouteError::CapacityExceeded => write!(f, "route capacity exceeded"),
+            RouteError::Conflict => write!(f, "route conflict with a foreign kernel route"),
+            RouteError::AuthorityDenied => write!(f, "route authority denied by the controller"),
         }
     }
 }
