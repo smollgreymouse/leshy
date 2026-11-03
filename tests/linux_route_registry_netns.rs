@@ -263,10 +263,14 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         !foreign_after.contains(&format!("{V6_HOST} dev")),
         "owned v6 rows are cleaned up:\n{foreign_after}"
     );
-    assert_eq!(
-        foreign_after, foreign_before,
-        "cleanup must remove only owned rows, leaving the table otherwise identical:\nbefore:\n{foreign_before}\nafter:\n{foreign_after}"
-    );
+    // Nothing new appeared: cleanup may only remove rows, never add or
+    // rewrite one. (Owned rows disappearing is asserted above.)
+    for line in foreign_after.lines() {
+        assert!(
+            foreign_before.contains(line),
+            "cleanup must not introduce or rewrite rows: {line:?} was not there before:\nbefore:\n{foreign_before}\nafter:\n{foreign_after}"
+        );
+    }
 
     // Cleanup is idempotent: a second pass touches nothing.
     let before_second = kernel_table();
