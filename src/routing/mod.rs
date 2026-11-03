@@ -769,4 +769,124 @@ mod tests {
         assert_eq!(report.removes, 0);
         assert_eq!(report.noops, 1);
     }
+
+    // -----------------------------------------------------------------
+    // Soak / performance regression (plan commit 8): deterministic
+    // fake-kernel load that must stay flat after convergence.
+    // -----------------------------------------------------------------
+
+    /// Publish every owned intent as observed, so audits see a matching
+    /// kernel instead of re-adding the routes.
+    async fn publish_all_as_observed(backend: &FakeBackend, mgr: &RouteManager) {
+        for zone in ["corp4", "corp6"] {
+            for intent in mgr.zone_intents(zone).await {
+                backend.push_observed(ObservedRoute {
+                    key: intent.key,
+                    target: intent.target,
+                    protocol: 0,
+                    metric: 0,
+                });
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn soak_ten_thousand_classifications_over_200_addresses() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let zone4 = via_zone("corp4", "192.168.1.1");
+        let mut zone6 = via_zone("corp6", "192.168.1.1");
+        zone6.ipv6 = true;
+        zone6.route_target_ipv6 = Some("2001:db8::1".to_string());
+
+        let v4: Vec<Ipv4Addr> = (0..100u32)
+            .map(|i| Ipv4Addr::from(0x0A010000u32 + i))
+            .collect();
+        let v6: Vec<Ipv6Addr> = (0..100u16)
+            .map(|i| Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i))
+            .collect();
+
+        // First pass converges: exactly one mutation per address, and the
+        // request path never touches a FIB dump.
+        for ip in &v4 {
+            mgr.add_route(IpAddr::V4(*ip), &zone4).await.unwrap();
+        }
+        for ip in &v6 {
+            mgr.add_route(IpAddr::V6(*ip), &zone6).await.unwrap();
+        }
+        assert_eq!(backend.ensure_count(), 200);
+        assert_eq!(backend.snapshot_count(), 0);
+
+        // 10k more classifications over the same set: mutations stay flat.
+        for round in 0..10_000u32 {
+            let i = (round % 100) as usize;
+            mgr.add_route(IpAddr::V4(v4[i]), &zone4).await.unwrap();
+            mgr.add_route(IpAddr::V6(v6[i]), &zone6).await.unwrap();
+        }
+        assert_eq!(backend.ensure_count(), 200);
+        assert_eq!(backend.snapshot_count(), 0);
+
+        // One audit per simulated interval: exactly one snapshot each, and
+        // a matching kernel mutates nothing.
+        publish_all_as_observed(&backend, &mgr).await;
+        let ensures_before = backend.ensure_count();
+        let snapshots_before = backend.snapshot_count();
+        for _ in 0..10 {
+            let report = mgr
+                .handle_invalidation(backend::RouteInvalidation::Full)
+                .await;
+            assert_eq!(report.adds, 0);
+            assert_eq!(report.removes, 0);
+        }
+        assert_eq!(backend.snapshot_count(), snapshots_before + 10);
+        assert_eq!(backend.ensure_count(), ensures_before);
+
+        // External loss of one row is reconciled exactly once, and the
+        // following audit is flat again.
+        backend.clear_observed();
+        let report = mgr
+            .handle_invalidation(backend::RouteInvalidation::Full)
+            .await;
+        assert_eq!(report.adds, 200);
+        publish_all_as_observed(&backend, &mgr).await;
+        let report = mgr
+            .handle_invalidation(backend::RouteInvalidation::Full)
+            .await;
+        assert_eq!(report.adds, 0);
+    }
+
+    #[tokio::test]
+    async fn capacity_denies_the_16385th_unique_dynamic_intent() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr =
+            RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        // The registry fills to exactly the configured capacity.
+        for i in 0..DEFAULT_MAX_DYNAMIC_ROUTES as u32 {
+            let ip = Ipv4Addr::from(0x0A000000u32 + i);
+            mgr.add_route(IpAddr::V4(ip), &zone).await.unwrap();
+        }
+        assert_eq!(
+            mgr.dynamic_route_count().await,
+            DEFAULT_MAX_DYNAMIC_ROUTES as u64
+        );
+
+        // The next unique address is denied fail-closed and consumes no slot.
+        let ip = Ipv4Addr::from(0x0A000000u32 + DEFAULT_MAX_DYNAMIC_ROUTES as u32);
+        let result = mgr.add_route(IpAddr::V4(ip), &zone).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "route capacity exceeded");
+        assert_eq!(
+            mgr.dynamic_route_count().await,
+            DEFAULT_MAX_DYNAMIC_ROUTES as u64
+        );
+
+        // Static entries never consume the dynamic quota.
+        mgr.add_static_route("172.16.0.0/12", &zone).await.unwrap();
+        assert_eq!(
+            mgr.dynamic_route_count().await,
+            DEFAULT_MAX_DYNAMIC_ROUTES as u64
+        );
+    }
 }

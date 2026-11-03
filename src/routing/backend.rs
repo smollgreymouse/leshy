@@ -189,6 +189,12 @@ pub(crate) mod fake {
             self.state.observed.lock().unwrap().push(route);
         }
 
+        /// Drop everything the fake reports as observed, simulating external
+        /// deletion of the rows.
+        pub(crate) fn clear_observed(&self) {
+            self.state.observed.lock().unwrap().clear();
+        }
+
         /// Zero the mutation counters without dropping recorded intents.
         pub(crate) fn reset_counters(&self) {
             self.state.ensures.store(0, Ordering::SeqCst);
