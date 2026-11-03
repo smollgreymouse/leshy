@@ -1,7 +1,6 @@
 use crate::config::{Config, ZoneConfig};
 use anyhow::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -117,27 +116,67 @@ impl ConfigWatcher {
     }
 }
 
-/// Compares two zone configurations and returns zones that need cleanup
-pub fn get_zones_to_cleanup(old_zones: &[ZoneConfig], new_zones: &[ZoneConfig]) -> Vec<String> {
-    let old_zone_names: HashSet<String> = old_zones.iter().map(|z| z.name.clone()).collect();
-    let new_zone_names: HashSet<String> = new_zones.iter().map(|z| z.name.clone()).collect();
-
-    // Zones that are in old but not in new need cleanup
-    old_zone_names
-        .difference(&new_zone_names)
-        .cloned()
-        .collect()
+/// A routing-relevant difference between the old and the new zone sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZoneChange {
+    /// The zone is new in the upcoming configuration.
+    Added(ZoneConfig),
+    /// The zone was deleted; its owned rows are explicitly retired.
+    Removed(ZoneConfig),
+    /// A same-name zone whose route policy changed. Replacement rows are
+    /// applied before the old-zone owned rows are removed.
+    Changed {
+        old: Box<ZoneConfig>,
+        new: Box<ZoneConfig>,
+    },
 }
 
-/// Compares two zone configurations and returns new zones
-pub fn get_new_zones(old_zones: &[ZoneConfig], new_zones: &[ZoneConfig]) -> Vec<ZoneConfig> {
-    let old_zone_names: HashSet<String> = old_zones.iter().map(|z| z.name.clone()).collect();
+/// Whether two zone configurations carry the same routing policy.
+///
+/// Only fields that decide which routes are installed count here: a pure
+/// cache-TTL or upstream-address change must not trigger route churn on an
+/// otherwise idempotent reload replay.
+fn same_routing_policy(a: &ZoneConfig, b: &ZoneConfig) -> bool {
+    a.mode == b.mode
+        && a.route_type == b.route_type
+        && a.route_target == b.route_target
+        && a.route_target_ipv6 == b.route_target_ipv6
+        && a.ipv6 == b.ipv6
+        && a.static_routes == b.static_routes
+        && a.domains == b.domains
+        && a.patterns == b.patterns
+}
 
-    new_zones
-        .iter()
-        .filter(|z| !old_zone_names.contains(&z.name))
-        .cloned()
-        .collect()
+/// Diff the old and new zone sets into routing-relevant changes.
+///
+/// Zones are identified by name. A same-name zone is `Changed` when any
+/// routing-relevant field differs (route type, targets, IPv6 policy, static
+/// routes/exclusions, mode, domain/pattern ownership); cosmetic changes such
+/// as cache TTLs do not show up.
+pub fn diff_zones(old: &[ZoneConfig], new: &[ZoneConfig]) -> Vec<ZoneChange> {
+    let mut changes = Vec::new();
+
+    for zone in new {
+        match old.iter().find(|z| z.name == zone.name) {
+            Some(previous) => {
+                if !same_routing_policy(previous, zone) {
+                    changes.push(ZoneChange::Changed {
+                        old: Box::new(previous.clone()),
+                        new: Box::new(zone.clone()),
+                    });
+                }
+            }
+            None => changes.push(ZoneChange::Added(zone.clone())),
+        }
+    }
+
+    for zone in old {
+        if !new.iter().any(|z| z.name == zone.name) {
+            changes.push(ZoneChange::Removed(zone.clone()));
+        }
+    }
+
+    changes
 }
 
 #[cfg(test)]
@@ -165,30 +204,98 @@ mod tests {
     }
 
     #[test]
-    fn test_get_zones_to_cleanup() {
+    fn removed_zone_is_reported() {
         let old_zones = vec![
             test_zone("zone1", RouteType::Via, "192.168.1.1"),
             test_zone("zone2", RouteType::Via, "192.168.1.1"),
         ];
-
         let new_zones = vec![test_zone("zone2", RouteType::Via, "192.168.1.1")];
 
-        let to_cleanup = get_zones_to_cleanup(&old_zones, &new_zones);
-        assert_eq!(to_cleanup.len(), 1);
-        assert!(to_cleanup.contains(&"zone1".to_string()));
+        let changes = diff_zones(&old_zones, &new_zones);
+        assert_eq!(
+            changes,
+            vec![ZoneChange::Removed(test_zone(
+                "zone1",
+                RouteType::Via,
+                "192.168.1.1"
+            ))]
+        );
     }
 
     #[test]
-    fn test_get_new_zones() {
+    fn added_zone_is_reported() {
         let old_zones = vec![test_zone("zone1", RouteType::Via, "192.168.1.1")];
-
         let new_zones = vec![
             test_zone("zone1", RouteType::Via, "192.168.1.1"),
             test_zone("zone2", RouteType::Dev, "/tmp/test.dev"),
         ];
 
-        let new = get_new_zones(&old_zones, &new_zones);
-        assert_eq!(new.len(), 1);
-        assert_eq!(new[0].name, "zone2");
+        let changes = diff_zones(&old_zones, &new_zones);
+        assert_eq!(
+            changes,
+            vec![ZoneChange::Added(test_zone(
+                "zone2",
+                RouteType::Dev,
+                "/tmp/test.dev"
+            ))]
+        );
+    }
+
+    #[test]
+    fn same_name_target_change_is_detected() {
+        let old_zones = vec![test_zone("corp", RouteType::Via, "192.168.1.1")];
+        let new_zones = vec![test_zone("corp", RouteType::Via, "10.0.0.1")];
+
+        let changes = diff_zones(&old_zones, &new_zones);
+        assert!(matches!(&changes[..], [ZoneChange::Changed { old, new }]
+                if old.route_target == "192.168.1.1" && new.route_target == "10.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn same_name_ipv6_policy_change_is_detected() {
+        let mut old_zone = test_zone("corp", RouteType::Via, "192.168.1.1");
+        let mut new_zone = old_zone.clone();
+        new_zone.ipv6 = true;
+        new_zone.route_target_ipv6 = Some("2001:db8::1".to_string());
+        old_zone.ipv6 = false;
+
+        let changes = diff_zones(&[old_zone.clone()], &[new_zone.clone()]);
+        assert_eq!(
+            changes,
+            vec![ZoneChange::Changed {
+                old: Box::new(old_zone),
+                new: Box::new(new_zone),
+            }]
+        );
+    }
+
+    #[test]
+    fn static_route_change_is_detected() {
+        let mut old_zone = test_zone("corp", RouteType::Via, "192.168.1.1");
+        let mut new_zone = old_zone.clone();
+        new_zone.static_routes = vec!["10.0.0.0/8".to_string()];
+        old_zone.static_routes = vec![];
+
+        assert!(matches!(
+            diff_zones(&[old_zone], &[new_zone])[0],
+            ZoneChange::Changed { .. }
+        ));
+    }
+
+    #[test]
+    fn cosmetic_change_is_not_a_routing_change() {
+        let mut old_zone = test_zone("corp", RouteType::Via, "192.168.1.1");
+        let mut new_zone = old_zone.clone();
+        new_zone.cache_max_ttl = Some(900);
+        old_zone.cache_max_ttl = None;
+
+        assert!(diff_zones(&[old_zone], &[new_zone]).is_empty());
+    }
+
+    #[test]
+    fn identical_reload_replay_produces_no_changes() {
+        let zones = vec![test_zone("corp", RouteType::Via, "192.168.1.1")];
+        assert!(diff_zones(&zones, &zones).is_empty());
     }
 }

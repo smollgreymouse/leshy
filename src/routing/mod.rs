@@ -135,10 +135,6 @@ impl RouteManager {
 
     /// Apply one invalidation signal: bump the kernel epoch, mark matching
     /// entries dirty and reconcile them against a fresh snapshot.
-    ///
-    /// The production monitor goes through [`reconcile_after_invalidation`]
-    /// directly; this is the test-facing entry point on an owned manager.
-    #[cfg(test)]
     pub(crate) async fn handle_invalidation(
         &self,
         invalidation: backend::RouteInvalidation,
@@ -329,6 +325,33 @@ impl RouteManager {
             "Zone routes retired"
         );
         Ok(())
+    }
+
+    /// Snapshot the route intents currently owned by a zone (reload support).
+    pub async fn zone_intents(&self, zone: &str) -> Vec<RouteIntent> {
+        self.registry.zone_intents(zone).await
+    }
+
+    /// Retire exactly these owned intents (old-zone state during a reload).
+    ///
+    /// A replacement intent that was verified in the meantime keeps its
+    /// registry entry and kernel row; a foreign row on the same prefix is
+    /// never touched by the backend.
+    pub async fn retire_intents(&self, intents: &[RouteIntent]) -> usize {
+        let mut retired = 0usize;
+        for intent in intents {
+            if self
+                .registry
+                .retire_intent(intent, self.backend.as_ref())
+                .await
+            {
+                retired += 1;
+            }
+        }
+        if retired > 0 {
+            tracing::info!(retired, "Old-zone route intents retired");
+        }
+        retired
     }
 
     /// Count of dynamic (DNS-sourced) intents currently registered.
@@ -664,5 +687,86 @@ mod tests {
             0,
             "the broad route must not be removed when a replacement failed"
         );
+    }
+
+    #[tokio::test]
+    async fn removed_zone_deletes_only_its_owned_rows() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let corp = via_zone("corp", "192.168.1.1");
+        let other = via_zone("other", "192.168.2.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &corp)
+            .await
+            .unwrap();
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)), &other)
+            .await
+            .unwrap();
+        backend.reset_counters();
+
+        mgr.cleanup_zone("corp").await.unwrap();
+        let removed = backend.removed();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].zone, "corp");
+        assert_eq!(mgr.dynamic_route_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_spares_a_replacement_verified_in_the_meantime() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), None);
+        let old_zone = via_zone("corp", "192.168.1.1");
+        let mut new_zone = via_zone("corp", "10.8.0.1");
+        new_zone.static_routes = vec!["10.0.0.1".to_string()];
+
+        // Old zone state: a dynamic host route through the old gateway.
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &old_zone)
+            .await
+            .unwrap();
+        let old_intents = mgr.zone_intents("corp").await;
+        assert_eq!(old_intents.len(), 1);
+
+        // Reload: the replacement (static, new gateway) is verified first...
+        mgr.add_static_route("10.0.0.1", &new_zone).await.unwrap();
+        assert_eq!(backend.ensure_count(), 2);
+
+        // ...then the old intent is retired. The registry key now belongs to
+        // the replacement, so neither the row nor the entry may be deleted.
+        let retired = mgr.retire_intents(&old_intents).await;
+        assert_eq!(retired, 0);
+        assert_eq!(
+            backend.remove_count(),
+            0,
+            "a verified replacement row must not be deleted by old-zone retirement"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_replay_converges_to_zero_mutations() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr =
+            RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        // First reload: one static route add.
+        mgr.add_static_route("10.9.0.0/16", &zone).await.unwrap();
+        assert_eq!(backend.ensure_count(), 1);
+
+        // Publish the row as observed so a reconcile sees a matching kernel.
+        let intent = mgr.zone_intents("corp").await.remove(0);
+        backend.push_observed(ObservedRoute {
+            key: intent.key,
+            target: intent.target,
+            protocol: 0,
+            metric: 0,
+        });
+
+        // Reload replay: re-applying the identical state mutates nothing.
+        mgr.add_static_route("10.9.0.0/16", &zone).await.unwrap();
+        let report = mgr.reconcile_all().await.unwrap();
+        assert_eq!(backend.ensure_count(), 1);
+        assert_eq!(report.adds, 0);
+        assert_eq!(report.removes, 0);
+        assert_eq!(report.noops, 1);
     }
 }

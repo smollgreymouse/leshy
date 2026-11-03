@@ -89,7 +89,7 @@ fn default_max_dynamic_routes() -> usize {
     crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ZoneConfig {
     pub name: String,
 
@@ -208,7 +208,7 @@ impl ZoneConfig {
 }
 
 /// Per-server DNS configuration with optional cache TTL overrides.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DnsServerConfig {
     pub address: SocketAddr,
     #[serde(default)]

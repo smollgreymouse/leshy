@@ -3,7 +3,8 @@
 
 use leshy::config::Config;
 use leshy::dns::DnsHandler;
-use leshy::reload::{get_new_zones, get_zones_to_cleanup};
+use leshy::reload::diff_zones;
+use leshy::server::apply_reload;
 use leshy::zones::ZoneMatcher;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,22 +41,11 @@ patterns = []
     // Create a channel to simulate reload signals (same as ConfigWatcher produces)
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::unbounded_channel::<Config>();
 
-    // Spawn reload handler task (same logic as main.rs)
+    // Spawn reload handler task running the production reload transaction
     let handler_clone = handler.clone();
     tokio::spawn(async move {
         while let Some(new_config) = reload_rx.recv().await {
-            let mut handler_guard = handler_clone.write().await;
-            let old_config = handler_guard.config().clone();
-
-            let zones_to_cleanup = get_zones_to_cleanup(&old_config.zones, &new_config.zones);
-
-            for zone_name in zones_to_cleanup {
-                let _ = handler_guard.cleanup_zone(&zone_name).await;
-            }
-
-            if let Ok(new_matcher) = ZoneMatcher::new(new_config.zones.clone()) {
-                let _ = handler_guard.update_config(new_config, new_matcher).await;
-            }
+            let _ = apply_reload(&handler_clone, new_config).await;
         }
     });
 
@@ -257,12 +247,37 @@ domains = ["office.local"]
     "#,
     )?;
 
-    let to_cleanup = get_zones_to_cleanup(&old_config.zones, &new_config.zones);
-    assert_eq!(to_cleanup, vec!["eu".to_string()]);
+    let changes = diff_zones(&old_config.zones, &new_config.zones);
+    assert_eq!(changes.len(), 2);
+    assert!(
+        matches!(&changes[0], leshy::reload::ZoneChange::Added(z) if z.name == "office"),
+        "added zone must be reported"
+    );
+    assert!(
+        matches!(&changes[1], leshy::reload::ZoneChange::Removed(z) if z.name == "eu"),
+        "removed zone must be reported"
+    );
 
-    let new_zones = get_new_zones(&old_config.zones, &new_config.zones);
-    assert_eq!(new_zones.len(), 1);
-    assert_eq!(new_zones[0].name, "office");
+    // A same-name zone whose route target changed is a Changed zone.
+    let retargeted: Config = toml::from_str(
+        r#"
+[server]
+listen_address = "127.0.0.1:15383"
+default_upstream = ["8.8.8.8:53"]
+
+[[zones]]
+name = "eu"
+route_type = "via"
+route_target = "10.8.0.1"
+domains = ["github.com"]
+    "#,
+    )?;
+    let changes = diff_zones(&old_config.zones, &retargeted.zones);
+    assert_eq!(changes.len(), 2);
+    assert!(
+        matches!(&changes[..], [leshy::reload::ZoneChange::Changed { old, new }, ..]
+        if old.name == "eu" && new.route_target == "10.8.0.1")
+    );
 
     println!("✓ Zone diff functions test passed!");
     Ok(())

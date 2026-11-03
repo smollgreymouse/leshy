@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::dns::{DnsHandler, DnsServer};
-use crate::reload::{get_new_zones, get_zones_to_cleanup, ConfigWatcher};
+use crate::reload::{diff_zones, ConfigWatcher, ZoneChange};
 use crate::zones::ZoneMatcher;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,7 +96,6 @@ pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Spawn config watcher if auto_reload is enabled
     if auto_reload {
-        let handler_clone = handler.clone();
         let config_dir = config.server.config_dir.as_ref().map(PathBuf::from);
         let (watcher, mut reload_rx) = ConfigWatcher::new(config_path.clone(), config_dir);
 
@@ -113,49 +112,8 @@ pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
             while let Some(new_config) = reload_rx.recv().await {
                 tracing::info!("Applying new configuration");
 
-                // Get current handler
-                let mut handler_guard = handler_clone.write().await;
-                let old_config = handler_guard.config().clone();
-
-                // Determine zones to cleanup and new zones
-                let zones_to_cleanup = get_zones_to_cleanup(&old_config.zones, &new_config.zones);
-                let new_zones = get_new_zones(&old_config.zones, &new_config.zones);
-
-                // Cleanup routes for removed zones
-                for zone_name in zones_to_cleanup {
-                    tracing::info!(zone = zone_name, "Removing zone and cleaning up routes");
-                    if let Err(e) = handler_guard.cleanup_zone(&zone_name).await {
-                        tracing::error!(zone = zone_name, error = %e, "Failed to cleanup zone");
-                    }
-                }
-
-                // Create new matcher with updated zones
-                match ZoneMatcher::new(new_config.zones.clone()) {
-                    Ok(new_matcher) => {
-                        // Update handler with new config and matcher
-                        if let Err(e) = handler_guard
-                            .update_config(new_config.clone(), new_matcher)
-                            .await
-                        {
-                            tracing::error!(error = %e, "Failed to update handler config");
-                        } else {
-                            let failures = handler_guard.apply_static_routes().await;
-                            if failures > 0 && handler_guard.has_static_routes() {
-                                let handler_retry = handler_for_reload.clone();
-                                tokio::spawn(async move {
-                                    retry_static_routes(handler_retry).await;
-                                });
-                            }
-                            tracing::info!(
-                                zones_added = new_zones.len(),
-                                total_zones = new_config.zones.len(),
-                                "Configuration applied successfully"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to create zone matcher, keeping old config");
-                    }
+                if let Err(e) = apply_reload(&handler_for_reload, new_config).await {
+                    tracing::error!(error = %e, "Failed to apply reload, keeping old config");
                 }
             }
         });
@@ -164,6 +122,88 @@ pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     // Run server
     server.run().await?;
 
+    Ok(())
+}
+
+/// Apply one reload transaction against the running handler.
+///
+/// The handler write lock is the transaction boundary: no request observes a
+/// half-applied configuration. The order follows the reconciliation plan:
+/// build and validate the new state, add replacement rows, retire old-zone
+/// owned rows only afterwards, swap config/matcher, then one dirty+reconcile.
+pub async fn apply_reload(
+    handler: &Arc<RwLock<DnsHandler>>,
+    new_config: Config,
+) -> anyhow::Result<()> {
+    let mut handler_guard = handler.write().await;
+    let old_config = handler_guard.config().clone();
+
+    // (1) Build and validate the new matcher first: a broken config must
+    // never retire the old routes.
+    let new_matcher = ZoneMatcher::new(new_config.zones.clone())?;
+    let changes = diff_zones(&old_config.zones, &new_config.zones);
+
+    // Snapshot the owned intents of same-name changed zones before the new
+    // state replaces them in the registry.
+    let mut old_intents = Vec::new();
+    for change in &changes {
+        if let ZoneChange::Changed { old, .. } = change {
+            old_intents.push(handler_guard.zone_route_intents(&old.name).await);
+        }
+    }
+
+    // (2)+(3) Apply the new static/target state first, so replacement rows
+    // exist before any old row is removed.
+    for change in &changes {
+        if let ZoneChange::Changed { new, .. } = change {
+            let failures = handler_guard.apply_static_routes_for_zone(new).await;
+            if failures > 0 {
+                anyhow::bail!(
+                    "zone '{}': {failures} new static route(s) failed to verify",
+                    new.name
+                );
+            }
+        }
+    }
+
+    // (4) Remove explicit old-zone owned rows. Removing a zone is operator
+    // intent (full cleanup); a changed zone retires exactly its old intents,
+    // and a replacement row on the same prefix is never deleted.
+    for change in &changes {
+        if let ZoneChange::Removed(old) = change {
+            tracing::info!(zone = old.name, "Removing zone and cleaning up routes");
+            if let Err(e) = handler_guard.cleanup_zone(&old.name).await {
+                tracing::error!(zone = old.name, error = %e, "Failed to cleanup zone");
+            }
+        }
+    }
+    for intents in &old_intents {
+        handler_guard.retire_zone_intents(intents).await;
+    }
+
+    // (5)+(6) Swap config/matcher; the DNS cache is cleared with it.
+    handler_guard
+        .update_config(new_config.clone(), new_matcher)
+        .await?;
+
+    // Static routes for added zones (and a re-assert of unchanged ones, free
+    // through registry dedupe).
+    let failures = handler_guard.apply_static_routes().await;
+    if failures > 0 && handler_guard.has_static_routes() {
+        let handler_retry = Arc::clone(handler);
+        tokio::spawn(async move {
+            retry_static_routes(handler_retry).await;
+        });
+    }
+
+    // (7) Mark affected registry entries dirty and run one reconcile.
+    handler_guard.reconcile_routes_after_reload().await;
+
+    tracing::info!(
+        changes = changes.len(),
+        total_zones = new_config.zones.len(),
+        "Configuration applied successfully"
+    );
     Ok(())
 }
 

@@ -374,6 +374,59 @@ impl DnsHandler {
         failures
     }
 
+    /// Apply static routes for one zone. Exclusive zones use `static_routes`
+    /// as exclusion ranges, not routes. Registry dedupe makes re-applying an
+    /// unchanged zone free.
+    pub async fn apply_static_routes_for_zone(&self, zone: &ZoneConfig) -> usize {
+        if zone.mode == ZoneMode::Exclusive {
+            return 0;
+        }
+        let route_manager = self.route_manager.read().await;
+        let mut failures = 0;
+        for cidr in &zone.static_routes {
+            if let Err(e) = route_manager.add_static_route(cidr, zone).await {
+                tracing::warn!(
+                    cidr = cidr,
+                    zone = zone.name,
+                    error = %e,
+                    "Failed to add static route"
+                );
+                failures += 1;
+            }
+        }
+        failures
+    }
+
+    /// Snapshot the route intents currently owned by a zone (reload support).
+    pub async fn zone_route_intents(&self, zone: &str) -> Vec<crate::routing::RouteIntent> {
+        let route_manager = self.route_manager.read().await;
+        route_manager.zone_intents(zone).await
+    }
+
+    /// Retire exactly these owned intents (old-zone state during a reload).
+    /// Returns how many were retired.
+    pub async fn retire_zone_intents(&self, intents: &[crate::routing::RouteIntent]) -> usize {
+        let route_manager = self.route_manager.read().await;
+        route_manager.retire_intents(intents).await
+    }
+
+    /// Mark every registry entry dirty and run one reconcile (the tail step
+    /// of a config reload).
+    pub async fn reconcile_routes_after_reload(&self) -> usize {
+        let route_manager = self.route_manager.read().await;
+        let report = route_manager
+            .handle_invalidation(crate::routing::backend::RouteInvalidation::Full)
+            .await;
+        if report.adds > 0 || report.removes > 0 {
+            tracing::info!(
+                adds = report.adds,
+                removes = report.removes,
+                "Reload reconciliation applied route changes"
+            );
+        }
+        report.adds + report.removes
+    }
+
     /// Returns true if any zone has static routes configured
     pub fn has_static_routes(&self) -> bool {
         self.config

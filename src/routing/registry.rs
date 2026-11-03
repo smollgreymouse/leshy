@@ -288,6 +288,75 @@ impl RouteRegistry {
         ZoneRemovalReport { removed, errors }
     }
 
+    /// Snapshot the intents currently owned by a zone (reload support).
+    pub(crate) async fn zone_intents(&self, zone: &str) -> Vec<RouteIntent> {
+        let map = self.entries.read().await;
+        let mut intents = Vec::new();
+        for entry in map.values() {
+            let locked = entry.lock().await;
+            if let Some(intent) = &locked.desired {
+                if intent.zone == zone {
+                    intents.push(intent.clone());
+                }
+            }
+        }
+        intents
+    }
+
+    /// Retire exactly one owned intent (old-zone state during a reload).
+    ///
+    /// The kernel row is deleted and the registry entry dropped only when the
+    /// entry's desired intent is still `intent` — a replacement intent that
+    /// was verified in the meantime keeps the entry and its kernel row. The
+    /// backend additionally refuses to delete a foreign row on the prefix.
+    /// Returns `true` when the intent was retired.
+    pub(crate) async fn retire_intent(
+        &self,
+        intent: &RouteIntent,
+        backend: &dyn RouteBackend,
+    ) -> bool {
+        // Decide and mutate the kernel under the entry lock; the map read
+        // guard is dropped before the (rare) entry removal below.
+        let retired = {
+            let map = self.entries.read().await;
+            match map.get(&intent.key) {
+                Some(entry) => {
+                    let mut locked = entry.lock().await;
+                    if locked.desired.as_ref() != Some(intent) {
+                        // A replacement intent owns this key now.
+                        false
+                    } else {
+                        match backend.remove_route(intent).await {
+                            Ok(()) => {
+                                locked.desired = None;
+                                locked.observed = None;
+                                locked.state = RouteState::Pending;
+                                true
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                }
+                None => false,
+            }
+        };
+
+        if retired {
+            let mut map = self.entries.write().await;
+            if let Some(entry) = map.get(&intent.key) {
+                let locked = entry.lock().await;
+                if locked.desired.is_none() {
+                    drop(locked);
+                    map.remove(&intent.key);
+                    if intent.source == RouteSource::Dns {
+                        self.dynamic_count.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        retired
+    }
+
     /// Count dynamic (DNS-sourced) intents in the registry.
     pub(crate) async fn count_dynamic(&self) -> u64 {
         self.dynamic_count.load(Ordering::SeqCst)
