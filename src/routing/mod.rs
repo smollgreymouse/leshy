@@ -12,6 +12,8 @@ pub(crate) mod registry;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod linux_monitor;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
@@ -49,6 +51,9 @@ const MAIN_TABLE: u32 = 254;
 /// Default cap on dynamic (DNS-sourced) route intents.
 pub const DEFAULT_MAX_DYNAMIC_ROUTES: usize = 16384;
 
+/// How often the safety audit re-reads the routing table.
+const AUDIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct RouteManager {
     backend: Arc<dyn RouteBackend>,
     registry: Arc<RouteRegistry>,
@@ -66,12 +71,84 @@ impl RouteManager {
         max_dynamic_routes: usize,
     ) -> Result<Self> {
         let backend = Arc::new(PlatformBackend::new()?);
-        Ok(Self {
+        let manager = Self {
             backend,
             registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
             aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
             kernel_epoch: AtomicU64::new(0),
-        })
+        };
+        manager.start_kernel_watch();
+        Ok(manager)
+    }
+
+    /// Start the kernel invalidation listener and the periodic safety audit.
+    ///
+    /// Both are best-effort: a platform without an invalidation stream simply
+    /// keeps the audit, and a failed audit is logged rather than fatal.
+    fn start_kernel_watch(&self) {
+        if let Some(mut rx) = self.backend.take_invalidation_receiver() {
+            let registry = Arc::clone(&self.registry);
+            let backend = Arc::clone(&self.backend);
+            let epoch = Arc::new(AtomicU64::new(0));
+
+            tokio::spawn(async move {
+                while let Some(invalidation) = rx.recv().await {
+                    let next = epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                    registry.mark_dirty(invalidation, next).await;
+                    match backend.snapshot().await {
+                        Ok(snapshot) => {
+                            let report = registry
+                                .reconcile_dirty(backend.as_ref(), &snapshot, next)
+                                .await;
+                            if report.adds > 0 || report.removes > 0 {
+                                tracing::info!(
+                                    adds = report.adds,
+                                    removes = report.removes,
+                                    noops = report.noops,
+                                    "Kernel route drift reconciled"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Route snapshot failed after an invalidation");
+                        }
+                    }
+                }
+            });
+        }
+
+        // Periodic safety audit: catches drift the event stream missed.
+        let registry = Arc::clone(&self.registry);
+        let backend = Arc::clone(&self.backend);
+        let epoch = Arc::new(AtomicU64::new(0));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(AUDIT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let next = epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                registry
+                    .mark_dirty(backend::RouteInvalidation::Full, next)
+                    .await;
+                match backend.snapshot().await {
+                    Ok(snapshot) => {
+                        let report = registry
+                            .reconcile_dirty(backend.as_ref(), &snapshot, next)
+                            .await;
+                        if report.adds > 0 || report.removes > 0 {
+                            tracing::info!(
+                                adds = report.adds,
+                                removes = report.removes,
+                                "Periodic route audit reconciled drift"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "Periodic route audit could not read the table");
+                    }
+                }
+            }
+        });
     }
 
     /// Construct a manager around an arbitrary backend. Used by tests to drive

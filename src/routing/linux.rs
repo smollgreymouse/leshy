@@ -17,7 +17,7 @@ use netlink_packet_route::route::{RouteAddress, RouteProtocol, RouteScope};
 use rtnetlink::{new_connection, Handle, IpVersion};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 /// Protocol stamped on every row Leshy creates.
 ///
@@ -34,13 +34,28 @@ const MAIN_TABLE_U8: u8 = MAIN_TABLE as u8;
 
 pub struct LinuxRouteBackend {
     handle: Handle,
+    invalidation_rx: Mutex<Option<mpsc::UnboundedReceiver<RouteInvalidation>>>,
 }
 
 impl LinuxRouteBackend {
     pub fn new() -> Result<Self> {
         let (connection, handle, _) = new_connection()?;
         tokio::spawn(connection);
-        Ok(Self { handle })
+
+        // A monitor that cannot start is not fatal: the periodic audit still
+        // catches drift, just later.
+        let invalidation_rx = match super::linux_monitor::spawn_monitor() {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                tracing::warn!(error = %e, "Kernel route monitor unavailable, relying on the periodic audit");
+                None
+            }
+        };
+
+        Ok(Self {
+            handle,
+            invalidation_rx: Mutex::new(invalidation_rx),
+        })
     }
 
     /// Resolve an interface name to its current index.
@@ -386,9 +401,10 @@ impl RouteBackend for LinuxRouteBackend {
     }
 
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
-        // The netlink monitor lands in a later step; until then the registry
-        // relies on explicit reconciliation only.
-        None
+        self.invalidation_rx
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 }
 

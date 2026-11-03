@@ -60,6 +60,8 @@ notify = "6"
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"
+netlink-packet-core = "0.7"
+netlink-sys = { version = "0.8", features = ["tokio_socket"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
