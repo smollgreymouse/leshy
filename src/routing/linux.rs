@@ -239,6 +239,12 @@ impl LinuxRouteBackend {
     async fn delete_row(&self, intent: &RouteIntent) -> Result<()> {
         let prefix = &intent.key.prefix;
         let mut msg = netlink_packet_route::route::RouteMessage::default();
+        // The doit handler is registered per family: a DEL with an unspecified
+        // family is rejected by the kernel before the prefix is even looked at.
+        msg.header.address_family = match prefix.network {
+            IpAddr::V4(_) => netlink_packet_route::AddressFamily::Inet,
+            IpAddr::V6(_) => netlink_packet_route::AddressFamily::Inet6,
+        };
         msg.header.destination_prefix_length = prefix.prefix_len;
         msg.header.protocol = LESHY_PROTOCOL;
         msg.header.table = MAIN_TABLE_U8;

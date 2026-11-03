@@ -25,6 +25,14 @@ pub use model::{
 };
 pub use registry::{ReconcileReport, RouteError};
 
+/// Direct handle on the kernel invalidation stream for the disposable-namespace
+/// monitor probe (`tests/netns_monitor_probe.rs`).
+#[cfg(target_os = "linux")]
+pub fn spawn_monitor_probe(
+) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<backend::RouteInvalidation>> {
+    linux_monitor::spawn_monitor()
+}
+
 use crate::config::{RoutingBackend, ServerConfig, ZoneConfig};
 use aggregator::{RouteAction, RouteAggregator};
 use anyhow::{Context, Result};
