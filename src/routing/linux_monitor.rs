@@ -50,15 +50,18 @@ pub fn spawn_monitor() -> anyhow::Result<mpsc::UnboundedReceiver<RouteInvalidati
 
 /// Read notifications until the socket fails.
 async fn run(socket: Socket, tx: mpsc::UnboundedSender<RouteInvalidation>) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; 32 * 1024];
     let mut pending: Option<RouteInvalidation> = None;
 
     loop {
         // Drain everything currently queued, folding it into one signal.
+        // recv_from_full returns one exact datagram per call; a reused
+        // BufMut buffer would accumulate messages and every later slice
+        // would start mid-stream, which silently drops all notifications
+        // after the first one.
         loop {
-            match socket.recv_from(&mut buffer, 0) {
-                Ok((len, _addr)) => {
-                    if let Some(signal) = classify(&buffer[..len]) {
+            match socket.recv_from_full() {
+                Ok((data, _addr)) => {
+                    if let Some(signal) = classify(&data) {
                         pending = Some(merge(pending.take(), signal));
                     }
                 }
