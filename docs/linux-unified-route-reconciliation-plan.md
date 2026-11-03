@@ -1,8 +1,8 @@
-# Implementation plan: unified dual-stack route registry and reconciliation
+# Implementation plan: unified dual-stack route registry and reconciliation (Linux + Windows)
 
 **Status:** implementation-ready plan. No design choices are intentionally left to the executor.  
 **Leshy baseline reviewed:** master at `ba53d42ac12f2efefe66f0a1a27f8d47544d2267`; code baseline before this document is v0.5.2 / `277fd6d9699fd6a08e148a37a268e4bdefbedabc`.  
-**Primary target:** Linux. macOS and Windows must continue to compile and preserve current behavior until their equivalent kernel-observation implementation is added.  
+**Primary targets:** Linux and Windows. Both must receive the same registry, dedupe, exact-observation and event-driven reconciliation semantics in this fix. macOS must continue to compile and preserve current behavior; its equivalent kernel-observation/event implementation may follow separately.  
 **Kikimora integration:** explicitly deferred until the standalone/local route registry is complete; the final integration architecture is fixed in section 12 and in Kikimora's own integration packet.
 
 ## 0. Final architecture decisions
@@ -35,6 +35,12 @@ The current code has these concrete defects.
 - `src/routing/mod.rs::cleanup_zone`: tracking is forgotten but kernel routes are deliberately left behind.
 - `src/dns/handler.rs::handle_request`: cache hits call `add_routes_from_response` again, which is correct for safety, but the current route layer turns that into repeated kernel work.
 - Linux has no bounded dynamic-route admission policy. An active long-lived zone can accumulate CDN destinations indefinitely.
+- `src/routing/windows.rs::find_route_rows` calls `GetIpForwardTable2` and filters the entire forwarding table. Because common `RouteManager::add_route_v4` invokes `route_matches` for repeated known IPv4 destinations, Windows has the same request-path O(FIB) scan class as Linux.
+- Windows IPv6 also goes through common `add_route_simple`, so every repeated AAAA classification calls `CreateIpForwardEntry2`; on `ERROR_OBJECT_ALREADY_EXISTS` the current code then calls `find_route_rows`, turning repeated IPv6 into an add attempt plus full-table enumeration.
+- `src/routing/windows.rs::create_route` deletes every same-prefix row that does not match the desired interface/metric/next hop before retrying create. A same-prefix foreign route can therefore be deleted. This must be replaced by ownership-aware conflict handling.
+- `src/routing/windows.rs::delete_routes` deletes all rows matching only destination/prefix, again without proving Leshy ownership.
+- `src/routing/windows.rs::route_matches` treats matching ifindex or next-hop as success but does not require the full expected row identity; it must move to the same exact `ObservedRoute` comparison as Linux.
+- Windows has the same canonical-prefix bug for IPv4 aggregation: looking up the original host address with a wider prefix does not identify the canonical aggregate network reliably.
 
 The observed legacy 0.4.0 host showed the practical form of the IPv6 defect: 1,225 IPv6 add attempts in one hour for only 127 distinct IPv6 addresses. That field measurement is a regression input, not evidence about v0.5.2 behavior.
 
@@ -51,7 +57,7 @@ src/routing/
   backend.rs         platform backend trait and common outcomes
   linux.rs           Linux backend + snapshot/event monitor
   macos.rs           existing writer adapted to backend trait
-  windows.rs         existing writer adapted to backend trait
+  windows.rs         Windows IP Helper backend + snapshot/event monitor
 ~~~
 
 Do not put DNS TTL/cache types in `routing/`.
@@ -157,7 +163,7 @@ pub enum RouteInvalidation {
 }
 ~~~
 
-macOS/Windows may return `None` for the invalidation receiver in the first implementation. They still use registry dedupe; their periodic full audit may remain disabled until a platform read-back implementation exists. Linux must implement snapshot and invalidation.
+macOS may return `None` for the invalidation receiver in the first implementation. **Linux and Windows must both implement `snapshot()` and route-change invalidation in this fix.** The common registry fast path is platform-independent; neither Linux nor Windows may perform a full route-table enumeration because a DNS response was replayed.
 
 ### Exact entry points
 
@@ -424,6 +430,113 @@ Linux comparison must include:
 
 A route for the same destination through another interface is not success.
 
+
+## 7W. Windows backend: same registry semantics, IP Helper implementation
+
+### Entry point: `src/routing/windows.rs`
+
+Windows is not a compatibility-only target for this fix. It implements the same `RouteBackend` contract and the same `RouteRegistry` state machine as Linux. Only the kernel API differs.
+
+### 7W.1 Target resolution
+
+`resolve_target`:
+
+- `dev`: read the device file once for the operation, resolve the adapter alias/index through `ConvertInterfaceAliasToLuid` / `ConvertInterfaceLuidToIndex` with the current case-insensitive fallback, and return `RouteTarget::Device { name, ifindex: Some(index) }`;
+- `via`: obtain the family-specific gateway from `ZoneConfig::gateway_for(family)`, require gateway family == destination family, resolve the egress interface through `GetBestInterface` / `GetBestInterfaceEx`, and retain both gateway and interface index in the desired Windows row identity.
+
+Do not allow `build_route_row` to receive a destination and next hop from different address families.
+
+### 7W.2 Snapshot
+
+Replace request-path `find_route_rows` scans with one backend snapshot cache.
+
+`snapshot()` calls:
+
+~~~text
+GetIpForwardTable2(AF_UNSPEC)
+~~~
+
+once and converts every relevant row into the common `ObservedRoute` representation. `AF_UNSPEC` intentionally returns both IPv4 and IPv6 in one table enumeration.
+
+The converter must canonicalize `DestinationPrefix` through `RoutePrefix::new` and preserve enough identity to distinguish:
+
+- canonical destination/prefix;
+- interface index;
+- next hop;
+- route metric offset;
+- route protocol;
+- any row flags required to distinguish an on-link row from a gateway row.
+
+Free every returned table with `FreeMibTable` on all success paths.
+
+### 7W.3 Route-change monitor
+
+Register one `NotifyRouteChange2(AF_UNSPEC, ...)` subscription. Windows supports `AF_UNSPEC` here specifically to receive both IPv4 and IPv6 route changes. The callback must be minimal and non-blocking:
+
+1. if the notification is initial or the row pointer is null, enqueue `RouteInvalidation::Full`;
+2. otherwise copy only the route key material needed to identify the changed prefix into owned Rust data while the callback row is valid;
+3. enqueue `RouteInvalidation::Prefix(key)`;
+4. return immediately.
+
+Do not perform `GetIpForwardTable2`, registry locking, DNS work or reconciliation inside the native callback.
+
+The callback row is documented as incomplete. When exact row identity is needed, the async reconciliation side may initialize a `MIB_IPFORWARD_ROW2` from destination/next-hop/interface identity and call `GetIpForwardEntry2`, or refresh the shared snapshot. Do not interpret the incomplete callback row as a fully verified route.
+
+Store the notification handle in the Windows backend. On backend shutdown/drop, deregister with `CancelMibChangeNotify2` from a thread/task that is not the notification callback. Never call `CancelMibChangeNotify2` from inside that callback because the Windows API explicitly permits deadlock in that case.
+
+Use the same 30-second full safety audit as Linux. The audit is insurance against missed notifications; DNS requests do not initiate it.
+
+### 7W.4 Exact ensure semantics
+
+Delete the current `create_route` replacement behavior that removes every nonmatching same-prefix row.
+
+New `ensure_route(intent)`:
+
+1. consult the shared observed snapshot/cache for the canonical prefix;
+2. if an exact Leshy-owned matching row exists, return `AlreadyMatching`;
+3. if a same-prefix row exists but is not provably the row owned by this registry entry, return `RouteConflict`; **do not delete or replace it**;
+4. if the registry proves an older row is this intent's previous owned identity (for example previous ifindex after a controlled target change), delete/update only that exact old row;
+5. create the desired row with `CreateIpForwardEntry2`;
+6. on `ERROR_OBJECT_ALREADY_EXISTS`, do not treat it as success and do not broad-delete; refresh the exact prefix state and classify it as matching owned / foreign conflict / retryable drift;
+7. verify the exact created row before returning success.
+
+The route identity comparison must include at least destination/prefix, InterfaceIndex, NextHop, Metric and Protocol. An on-link route has an unspecified next hop of the matching family; that is part of its identity.
+
+### 7W.5 Exact removal semantics
+
+Delete `delete_routes(family, ip, prefix_len)` as a broad removal primitive from normal registry use.
+
+`remove_route(intent)` may delete only the exact row identity stored/verified for that registry intent. If the prefix exists but the row identity differs, return conflict/absence and leave the foreign row untouched.
+
+Zone cleanup therefore has the same ownership guarantee on Windows as on Linux.
+
+### 7W.6 Windows tests
+
+Pure/unit tests in `windows.rs` and common registry tests:
+
+- canonical /32, /128 and wider aggregate destinations survive SOCKADDR conversion;
+- destination/next-hop family mismatch is rejected before IP Helper calls;
+- snapshot conversion preserves prefix, ifindex, next hop, metric and protocol;
+- exact matching row -> `AlreadyMatching`;
+- same-prefix wrong ifindex -> conflict/no delete;
+- same-prefix wrong gateway -> conflict/no delete;
+- same-prefix wrong protocol/metric -> conflict/no delete;
+- owned previous row may be replaced explicitly;
+- broad delete helper is not used by registry cleanup;
+- notification callback converts v4 and v6 rows into targeted invalidations;
+- initial/null notification becomes `Full`;
+- 1000 repeated v4 and 1000 repeated v6 registry ensures produce no IP Helper mutations or table scans after convergence.
+
+Windows integration test (elevated disposable runner/VM):
+
+1. create an isolated test adapter/known loopback route target;
+2. add/read-back/remove one IPv4 /32 and one IPv6 /128;
+3. externally delete a Leshy-owned row and verify one notification-driven restoration;
+4. add a foreign same-prefix row and verify Leshy reports conflict without deleting it;
+5. replay stable intents and verify `GetIpForwardTable2` count does not grow with DNS request count.
+
+The existing `windows-latest` CI unit job remains mandatory. Add a privileged Windows integration job only when the runner environment can guarantee route-table mutation privileges; until then the disposable Windows VM acceptance test is a release gate.
+
 ## 8. Family policy and dual-stack configuration
 
 ### Entry point: `src/config.rs`
@@ -643,7 +756,7 @@ The corresponding Go implementation sequence lives in Kikimora `docs/toad-steps/
 
 ## 13. Ordered implementation sequence
 
-The executor must land the fix in this order. Do not jump directly to Linux event monitoring or Kikimora IPC.
+The executor must land the fix in this order. Do not jump directly to Linux/Windows event monitoring or Kikimora IPC.
 
 ### Commit 1 — model + fake backend + tests, no production behavior change
 
@@ -690,25 +803,38 @@ Tests:
 - injected failure leaves old broad route until replacements verified;
 - retry converges.
 
-### Commit 4 — Linux exact snapshot/reconciliation
+### Commit 4 — Linux + Windows exact snapshot/reconciliation
 
 Files:
 - `src/routing/linux.rs`;
-- `Cargo.toml` only if the existing rtnetlink version needs an explicit multicast helper.
+- `src/routing/windows.rs`;
+- `Cargo.toml` only if the Linux rtnetlink monitor or Windows bindings need an additional feature/dependency.
 
-Tests:
-- synthetic snapshot parser;
+Common tests:
+- synthetic snapshot conversion;
 - exact dev match;
 - exact gateway match;
 - wrong ifindex/gateway/protocol rejected;
 - v4 destination/v6 gateway and v6 destination/v4 gateway rejected;
 - targeted invalidation;
-- monitor loss -> full dirty + one audit.
+- monitor loss/invalid state -> full dirty + one audit;
+- no DNS-request-path table enumeration after convergence.
 
-Privileged disposable netns test:
-- real /32 and /128 add/read-back/delete;
+Linux-specific:
+- rtnetlink route/link invalidations;
+- privileged disposable netns: real /32 and /128 add/read-back/delete;
 - external deletion restored once;
 - stable state produces zero writes.
+
+Windows-specific:
+- `GetIpForwardTable2(AF_UNSPEC)` snapshot conversion;
+- `NotifyRouteChange2(AF_UNSPEC)` v4/v6 invalidation;
+- `CancelMibChangeNotify2` lifecycle outside callback;
+- `ERROR_OBJECT_ALREADY_EXISTS` cannot trigger broad same-prefix deletion;
+- foreign same-prefix row is conflict/no delete;
+- exact owned row add/read-back/remove;
+- external deletion restored once on an elevated disposable Windows VM;
+- stable state produces zero IP Helper writes and zero request-driven full-table scans.
 
 ### Commit 5 — dual-stack policy + exclusions
 
@@ -799,6 +925,14 @@ sudo ./tests/linux-route-registry-netns.sh
 
 The script must create its own namespace/interfaces and clean them with a trap.
 
+Required Windows release acceptance on an elevated disposable Windows VM/runner, never a user's active route table:
+
+~~~powershell
+powershell -ExecutionPolicy Bypass -File .\tests\windows-route-registry.ps1
+~~~
+
+The script must snapshot the routes it creates, use dedicated test destinations/interfaces, and remove only its own exact rows in `finally`.
+
 Required regression assertions:
 
 - stable DNS replay: zero route writes after convergence;
@@ -820,6 +954,7 @@ Do not call this plan complete until all are true:
 - IPv4 and IPv6 enter the same registry;
 - DNS cache replay produces zero kernel churn;
 - Linux no longer dumps the FIB per repeated DNS classification;
+- Windows no longer calls `GetIpForwardTable2` per repeated DNS classification or repeated IPv6 EEXIST;
 - kernel drift is reconciled from invalidation/audit, not from request-path full scans;
 - exact kernel route identity is checked;
 - gateway family mismatch is rejected;
@@ -827,7 +962,7 @@ Do not call this plan complete until all are true:
 - same-name zone config changes reconcile;
 - explicit zone removal cleans owned rows;
 - dynamic route count is bounded and new over-capacity addresses fail closed;
-- all unit/integration/netns tests are green;
+- all unit/integration/Linux-netns/Windows-disposable-VM tests are green;
 - only then begin Kikimora 08D integration.
 
 ## 16. Explicit non-goals
