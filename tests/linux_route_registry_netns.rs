@@ -43,6 +43,22 @@ fn ip(args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+/// The prefixes the acceptance walks use; cleared best-effort before each
+/// test so a previously failed run cannot poison the next one.
+fn clear_test_prefixes() {
+    for prefix in [
+        "10.55.7.1/32",
+        "10.55.8.1/32",
+        "10.55.9.9/32",
+        "fd00:55::7/128",
+        "fd00:55::8/128",
+    ] {
+        let _ = Command::new("ip")
+            .args(["route", "del", prefix, "table", "main"])
+            .output();
+    }
+}
+
 /// `ip route show table main` for both families, the kernel's own truth.
 fn kernel_table() -> String {
     format!(
@@ -117,6 +133,7 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
     };
     assert!(running_as_root(), "the netns harness runs as root");
     init_tracing();
+    clear_test_prefixes();
 
     let (manager, config) = manager_with_dev_zone().await;
     let zone = config.zones[0].clone();
@@ -260,6 +277,7 @@ async fn real_kernel_dual_stack_through_one_device() {
         eprintln!("skipping: not inside the netns harness (LESHY_NETNS_DEV unset)");
         return;
     };
+    clear_test_prefixes();
 
     let (manager, config) = manager_with_dev_zone().await;
     let zone = config.zones[0].clone();

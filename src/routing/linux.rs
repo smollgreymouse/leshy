@@ -135,6 +135,17 @@ impl LinuxRouteBackend {
         Ok(rows.into_iter().find(|row| row.key == intent.key))
     }
 
+    /// Whether a refused add means "a row for this destination already
+    /// exists": EEXIST outright, or EBUSY — what the IPv6 route code answers
+    /// for an identical existing route.
+    fn is_busy_class(e: &anyhow::Error) -> bool {
+        matches!(
+            e.downcast_ref::<rtnetlink::Error>(),
+            Some(rtnetlink::Error::NetlinkError(err))
+                if matches!(err.code, Some(code) if code.get() == -17 || code.get() == -16)
+        )
+    }
+
     /// A typed refusal to touch a destination someone else owns. The registry
     /// classifies this as `RouteError::Conflict`, which the DNS layer answers
     /// with SERVFAIL instead of handing out an unrouted address.
@@ -361,7 +372,28 @@ impl RouteBackend for LinuxRouteBackend {
             return Err(self.conflict_error(intent, &existing.target));
         }
 
-        self.add_row(intent).await?;
+        if let Err(e) = self.add_row(intent).await {
+            // A concurrent writer may have installed the exact row between
+            // our lookup and the add; the kernel then refuses the add with
+            // EEXIST — or EBUSY, which is what IPv6 answers for an identical
+            // existing route. Only an exact read-back turns that into a
+            // verified no-op; anything else keeps the error.
+            if is_busy_class(&e) {
+                match self.find_row(intent).await? {
+                    Some(row) if row.target == intent.target => {
+                        return Ok(EnsureOutcome::AlreadyMatching);
+                    }
+                    Some(row) => return Err(self.conflict_error(intent, &row.target)),
+                    None => {
+                        return Err(e).context(format!(
+                            "route {} add was refused and the row is absent",
+                            intent.key.prefix.network
+                        ))
+                    }
+                }
+            }
+            return Err(e);
+        }
 
         // Read back: the kernel is the only proof the route exists.
         match self.find_row(intent).await? {
