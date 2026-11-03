@@ -252,7 +252,7 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
     .await;
     let foreign_after = kernel_table();
     assert!(
-        foreign_after.contains(FOREIGN),
+        foreign_after.contains(FOREIGN_ROW),
         "the foreign row must survive the zone cleanup:\n{foreign_after}"
     );
     assert!(
