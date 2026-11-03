@@ -1,27 +1,49 @@
-use crate::config::RouteType;
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
+//! Pure IPv4 desired-prefix planner.
+//!
+//! The aggregator decides which prefixes Leshy *wants* in the kernel; it never
+//! claims to know what is actually there. Verification belongs to the registry
+//! and the platform backend.
+//!
+//! Splitting a broad aggregate is ordered so a failure can never open a gap:
+//! the more-specific replacements are added and verified first, the conflicting
+//! host route is added next, and the superseded broad route is removed last.
 
-/// Describes a kernel route action the caller must execute.
+use crate::config::RouteType;
+use crate::routing::model::{RouteIntent, RouteKey, RoutePrefix, RouteSource, RouteTarget};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
+
+/// The main routing table every Leshy route lives in.
+const MAIN_TABLE: u32 = 254;
+
+/// Who owns a desired prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteAction {
-    Add {
-        network: Ipv4Addr,
-        prefix_len: u8,
-        route_type: RouteType,
-        route_target: String,
-    },
-    Remove {
-        network: Ipv4Addr,
-        prefix_len: u8,
-    },
+pub struct RouteOwner {
+    pub zone_name: String,
+    pub route_type: RouteType,
+    pub route_target: String,
 }
 
-#[derive(Debug, Clone)]
-struct RouteOwner {
-    zone_name: String,
-    route_type: RouteType,
-    route_target: String,
+/// One step the caller must execute, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteAction {
+    Add(RouteIntent),
+    Remove(RouteIntent),
+}
+
+/// The result of planning one address.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AggregationPlan {
+    /// Actions in execution order: adds first, removals last.
+    pub actions: Vec<RouteAction>,
+}
+
+impl AggregationPlan {
+    /// Whether the plan needs no kernel work at all.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
 }
 
 /// Aggregates individual /32 host routes into wider CIDR prefixes to reduce
@@ -32,9 +54,9 @@ struct RouteOwner {
 /// are automatic no-ops. If an IP from a *different* zone falls into an
 /// existing aggregate, the aggregate is split into non-conflicting sub-prefixes.
 pub struct RouteAggregator {
-    /// Installed kernel routes: (network_addr_as_u32, prefix_len) -> owner
-    installed: HashMap<(u32, u8), RouteOwner>,
-    /// Ground truth: individual IP -> zone name (for conflict detection)
+    /// Desired prefixes: (network_as_u32, prefix_len) -> owner.
+    desired: HashMap<(u32, u8), RouteOwner>,
+    /// Ground truth: individual IP -> zone name (for conflict detection).
     known_ips: HashMap<Ipv4Addr, String>,
     /// Target aggregation prefix length (e.g. 22 for /22). 32 = disabled.
     prefix_len: u8,
@@ -43,272 +65,231 @@ pub struct RouteAggregator {
 impl RouteAggregator {
     pub fn new(prefix_len: Option<u8>) -> Self {
         Self {
-            installed: HashMap::new(),
+            desired: HashMap::new(),
             known_ips: HashMap::new(),
             prefix_len: prefix_len.unwrap_or(32),
         }
     }
 
-    /// Main entry point: process an IP and return kernel route actions.
-    pub fn process_ip(
+    /// Plan the actions needed to route `ip` through `zone_name`.
+    ///
+    /// The returned actions are ordered so that a partial failure leaves a
+    /// route in place rather than a hole: every add precedes every remove.
+    pub fn plan_ip(
         &mut self,
         ip: Ipv4Addr,
         zone_name: &str,
         route_type: RouteType,
         route_target: &str,
-    ) -> Vec<RouteAction> {
-        // Record this IP's zone ownership
+    ) -> AggregationPlan {
         self.known_ips.insert(ip, zone_name.to_string());
 
-        // Disabled (prefix_len == 32): always install /32
+        let owner = RouteOwner {
+            zone_name: zone_name.to_string(),
+            route_type,
+            route_target: route_target.to_string(),
+        };
+
+        // Disabled (prefix_len == 32): always install /32.
         if self.prefix_len >= 32 {
             let key = (u32::from(ip), 32);
-            if self.installed.contains_key(&key) {
-                return vec![];
+            if self.desired.contains_key(&key) {
+                return AggregationPlan::default();
             }
-            self.installed.insert(
-                key,
-                RouteOwner {
-                    zone_name: zone_name.to_string(),
-                    route_type,
-                    route_target: route_target.to_string(),
-                },
-            );
-            return vec![RouteAction::Add {
-                network: ip,
-                prefix_len: 32,
-                route_type,
-                route_target: route_target.to_string(),
-            }];
+            self.desired.insert(key, owner.clone());
+            return AggregationPlan {
+                actions: vec![RouteAction::Add(intent_for(ip, 32, &owner))],
+            };
         }
 
-        // Check if IP is already covered by an installed aggregate
-        if let Some((existing_key, existing_owner)) = self.find_covering_route(ip) {
+        // Already covered by a desired prefix of the same zone: nothing to do.
+        if let Some((existing_key, existing_owner)) = self.find_covering(ip) {
             if existing_owner.zone_name == zone_name {
-                // Same zone — already covered, no-op
-                return vec![];
+                return AggregationPlan::default();
             }
 
-            // Different zone — must split the existing aggregate
+            // A different zone owns a prefix covering this address: split it.
             let old_net = existing_key.0;
             let old_prefix = existing_key.1;
             let old_owner = existing_owner.clone();
-            self.installed.remove(&(old_net, old_prefix));
+            self.desired.remove(&(old_net, old_prefix));
 
-            let mut actions = vec![RouteAction::Remove {
-                network: Ipv4Addr::from(old_net),
-                prefix_len: old_prefix,
-            }];
-
-            // Split: repeatedly halve, adding the half that does NOT contain
-            // the conflicting IP, until we reach /32
+            let mut adds = Vec::new();
             let mut cur_net = old_net;
             let mut cur_prefix = old_prefix;
+            let ip_u32 = u32::from(ip);
 
+            // Halve repeatedly, keeping the half that does not contain the
+            // conflicting address, until the /32 slot is reached.
             while cur_prefix < 32 {
                 let child_prefix = cur_prefix + 1;
                 let (left, right) = split_network(cur_net, cur_prefix);
-
-                let ip_u32 = u32::from(ip);
                 let (contains_ip, sibling) = if ip_in_network(ip_u32, left, child_prefix) {
                     (left, right)
                 } else {
                     (right, left)
                 };
 
-                // Install sibling for original zone
-                self.installed.insert(
-                    (sibling, child_prefix),
-                    RouteOwner {
-                        zone_name: old_owner.zone_name.clone(),
-                        route_type: old_owner.route_type,
-                        route_target: old_owner.route_target.clone(),
-                    },
-                );
-                actions.push(RouteAction::Add {
-                    network: Ipv4Addr::from(sibling),
-                    prefix_len: child_prefix,
-                    route_type: old_owner.route_type,
-                    route_target: old_owner.route_target.clone(),
-                });
+                self.desired
+                    .insert((sibling, child_prefix), old_owner.clone());
+                adds.push(RouteAction::Add(intent_for(
+                    Ipv4Addr::from(sibling),
+                    child_prefix,
+                    &old_owner,
+                )));
 
                 cur_net = contains_ip;
                 cur_prefix = child_prefix;
             }
 
-            // Install /32 for the new (conflicting) IP
-            self.installed.insert(
-                (u32::from(ip), 32),
-                RouteOwner {
-                    zone_name: zone_name.to_string(),
-                    route_type,
-                    route_target: route_target.to_string(),
-                },
-            );
-            actions.push(RouteAction::Add {
-                network: ip,
-                prefix_len: 32,
-                route_type,
-                route_target: route_target.to_string(),
-            });
+            // The conflicting host route goes in after its siblings.
+            self.desired.insert((ip_u32, 32), owner.clone());
+            adds.push(RouteAction::Add(intent_for(ip, 32, &owner)));
 
-            return actions;
+            // The superseded broad route is removed last, once every
+            // replacement is in place.
+            let mut actions = adds;
+            actions.push(RouteAction::Remove(intent_for(
+                Ipv4Addr::from(old_net),
+                old_prefix,
+                &old_owner,
+            )));
+            return AggregationPlan { actions };
         }
 
-        // Not covered — create a new aggregate
+        // Not covered: create a new aggregate, carving out known conflicts.
         let agg_net = network_address(u32::from(ip), self.prefix_len);
 
-        // Check if any known IPs from OTHER zones fall within this aggregate
-        let conflicts: Vec<(Ipv4Addr, String)> = self
+        let conflicts: Vec<Ipv4Addr> = self
             .known_ips
             .iter()
             .filter(|(known_ip, known_zone)| {
                 *known_zone != zone_name
                     && ip_in_network(u32::from(**known_ip), agg_net, self.prefix_len)
             })
-            .map(|(ip, zone)| (*ip, zone.clone()))
+            .map(|(known_ip, _)| *known_ip)
             .collect();
 
+        self.desired
+            .insert((agg_net, self.prefix_len), owner.clone());
+        let mut adds = vec![RouteAction::Add(intent_for(
+            Ipv4Addr::from(agg_net),
+            self.prefix_len,
+            &owner,
+        ))];
+
         if conflicts.is_empty() {
-            // No conflicts — install the full aggregate
-            self.installed.insert(
-                (agg_net, self.prefix_len),
-                RouteOwner {
-                    zone_name: zone_name.to_string(),
-                    route_type,
-                    route_target: route_target.to_string(),
-                },
-            );
-            return vec![RouteAction::Add {
-                network: Ipv4Addr::from(agg_net),
-                prefix_len: self.prefix_len,
-                route_type,
-                route_target: route_target.to_string(),
-            }];
+            return AggregationPlan { actions: adds };
         }
 
-        // Conflicts exist — install the aggregate then carve out each conflict
-        self.installed.insert(
-            (agg_net, self.prefix_len),
-            RouteOwner {
-                zone_name: zone_name.to_string(),
-                route_type,
-                route_target: route_target.to_string(),
-            },
-        );
-        let mut actions = vec![RouteAction::Add {
-            network: Ipv4Addr::from(agg_net),
-            prefix_len: self.prefix_len,
-            route_type,
-            route_target: route_target.to_string(),
-        }];
-
-        // For each conflicting IP, split around it
-        for (conflict_ip, _conflict_zone) in &conflicts {
-            // Find which installed aggregate currently covers this conflict
-            if let Some((cov_key, cov_owner)) = self.find_covering_route(*conflict_ip) {
-                if cov_owner.zone_name == zone_name {
-                    // The aggregate we just installed covers this conflict — split it
-                    let cov_net = cov_key.0;
-                    let cov_prefix = cov_key.1;
-                    let cov_owner = cov_owner.clone();
-                    self.installed.remove(&(cov_net, cov_prefix));
-
-                    actions.push(RouteAction::Remove {
-                        network: Ipv4Addr::from(cov_net),
-                        prefix_len: cov_prefix,
-                    });
-
-                    let mut cur_net = cov_net;
-                    let mut cur_prefix = cov_prefix;
-                    let conflict_u32 = u32::from(*conflict_ip);
-
-                    while cur_prefix < 32 {
-                        let child_prefix = cur_prefix + 1;
-                        let (left, right) = split_network(cur_net, cur_prefix);
-
-                        let (contains_conflict, sibling) =
-                            if ip_in_network(conflict_u32, left, child_prefix) {
-                                (left, right)
-                            } else {
-                                (right, left)
-                            };
-
-                        self.installed.insert(
-                            (sibling, child_prefix),
-                            RouteOwner {
-                                zone_name: cov_owner.zone_name.clone(),
-                                route_type: cov_owner.route_type,
-                                route_target: cov_owner.route_target.clone(),
-                            },
-                        );
-                        actions.push(RouteAction::Add {
-                            network: Ipv4Addr::from(sibling),
-                            prefix_len: child_prefix,
-                            route_type: cov_owner.route_type,
-                            route_target: cov_owner.route_target.clone(),
-                        });
-
-                        cur_net = contains_conflict;
-                        cur_prefix = child_prefix;
-                    }
-
-                    // The /32 slot for the conflict IP is now empty — don't install
-                    // anything there (it belongs to another zone and will be
-                    // installed when that zone's aggregator path runs for it,
-                    // or it was already installed previously).
-                }
+        // Carve each conflicting address out of the aggregate we just planned.
+        for conflict_ip in conflicts {
+            let Some((cov_key, cov_owner)) = self.find_covering(conflict_ip) else {
+                continue;
+            };
+            if cov_owner.zone_name != zone_name {
+                continue;
             }
+            let cov_net = cov_key.0;
+            let cov_prefix = cov_key.1;
+            let cov_owner = cov_owner.clone();
+            self.desired.remove(&(cov_net, cov_prefix));
+
+            let mut cur_net = cov_net;
+            let mut cur_prefix = cov_prefix;
+            let conflict_u32 = u32::from(conflict_ip);
+
+            while cur_prefix < 32 {
+                let child_prefix = cur_prefix + 1;
+                let (left, right) = split_network(cur_net, cur_prefix);
+                let (contains_conflict, sibling) =
+                    if ip_in_network(conflict_u32, left, child_prefix) {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+
+                self.desired
+                    .insert((sibling, child_prefix), cov_owner.clone());
+                adds.push(RouteAction::Add(intent_for(
+                    Ipv4Addr::from(sibling),
+                    child_prefix,
+                    &cov_owner,
+                )));
+
+                cur_net = contains_conflict;
+                cur_prefix = child_prefix;
+            }
+
+            // The /32 slot for the conflict belongs to another zone; it is
+            // installed when that zone's own plan runs.
         }
 
-        actions
+        // The broad aggregate is superseded by its carved-out children, so it
+        // is removed after they are in place.
+        let mut actions = adds;
+        actions.push(RouteAction::Remove(intent_for(
+            Ipv4Addr::from(agg_net),
+            self.prefix_len,
+            &owner,
+        )));
+        AggregationPlan { actions }
     }
 
-    /// Register a static route's IPs so aggregates don't overlap with them.
-    /// Does NOT return actions (static routes are installed directly).
-    /// Prefix the aggregator already installed for this address, if any.
-    ///
-    /// Used by the manager to re-verify the kernel row before trusting the
-    /// dedupe: the aggregator's map is bookkeeping, not the routing table.
-    pub fn installed_prefix(&self, ip: Ipv4Addr) -> Option<u8> {
-        let bits = u32::from(ip);
-        self.installed
-            .keys()
-            .filter(|(network, prefix)| {
-                let mask = if *prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - *prefix as u32)
-                };
-                *network == (bits & mask)
-            })
-            .map(|(_, prefix)| *prefix)
-            .max()
-    }
-
+    /// Register a static route's IP so aggregates don't overlap with it.
     pub fn register_static_ip(&mut self, ip: Ipv4Addr, zone_name: &str) {
         self.known_ips.insert(ip, zone_name.to_string());
     }
 
     /// Remove all tracking for a zone.
     pub fn cleanup_zone(&mut self, zone_name: &str) {
-        self.installed
-            .retain(|_, owner| owner.zone_name != zone_name);
+        self.desired.retain(|_, owner| owner.zone_name != zone_name);
         self.known_ips.retain(|_, zone| zone != zone_name);
     }
 
-    /// Find an installed route that covers the given IP.
-    /// Returns the key and a reference to the owner.
-    fn find_covering_route(&self, ip: Ipv4Addr) -> Option<((u32, u8), &RouteOwner)> {
+    /// The most specific desired prefix covering `ip`, if any.
+    pub fn installed_prefix(&self, ip: Ipv4Addr) -> Option<u8> {
+        self.find_covering(ip).map(|(key, _)| key.1)
+    }
+
+    /// Find a desired prefix that covers the given IP.
+    fn find_covering(&self, ip: Ipv4Addr) -> Option<((u32, u8), &RouteOwner)> {
         let ip_u32 = u32::from(ip);
-        // Check from most-specific to least-specific
         for prefix in (0..=32).rev() {
             let net = network_address(ip_u32, prefix);
-            if let Some(owner) = self.installed.get(&(net, prefix)) {
+            if let Some(owner) = self.desired.get(&(net, prefix)) {
                 return Some(((net, prefix), owner));
             }
         }
         None
+    }
+}
+
+/// Build the intent for a planned prefix.
+fn intent_for(network: Ipv4Addr, prefix_len: u8, owner: &RouteOwner) -> RouteIntent {
+    let target = match owner.route_type {
+        // A `via` target is a literal gateway address; a `dev` target is a
+        // device-file path the backend resolves at execution time.
+        RouteType::Via => owner
+            .route_target
+            .trim()
+            .parse::<IpAddr>()
+            .map(RouteTarget::Gateway)
+            .unwrap_or(RouteTarget::Unreachable),
+        RouteType::Dev => RouteTarget::Device {
+            name: owner.route_target.clone(),
+            ifindex: None,
+        },
+    };
+    RouteIntent {
+        key: RouteKey {
+            prefix: RoutePrefix::new(IpAddr::V4(network), prefix_len)
+                .expect("planner only produces valid prefixes"),
+            table: MAIN_TABLE,
+        },
+        zone: owner.zone_name.clone(),
+        target,
+        source: RouteSource::Dns,
     }
 }
 
@@ -338,209 +319,224 @@ fn ip_in_network(ip: u32, network: u32, prefix_len: u8) -> bool {
 mod tests {
     use super::*;
 
+    fn adds(plan: &AggregationPlan) -> Vec<&RouteIntent> {
+        plan.actions
+            .iter()
+            .filter_map(|a| match a {
+                RouteAction::Add(intent) => Some(intent),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn removes(plan: &AggregationPlan) -> Vec<&RouteIntent> {
+        plan.actions
+            .iter()
+            .filter_map(|a| match a {
+                RouteAction::Remove(intent) => Some(intent),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn basic_aggregation() {
         let mut agg = RouteAggregator::new(Some(24));
-        let actions = agg.process_ip(
+        let plan = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
-        assert_eq!(actions.len(), 1);
+        assert_eq!(plan.actions.len(), 1);
+        let add = adds(&plan);
+        assert_eq!(add.len(), 1);
         assert_eq!(
-            actions[0],
-            RouteAction::Add {
-                network: Ipv4Addr::new(10, 0, 0, 0),
-                prefix_len: 24,
-                route_type: RouteType::Via,
-                route_target: "192.168.1.1".to_string(),
-            }
+            add[0].key.prefix.network,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0))
         );
+        assert_eq!(add[0].key.prefix.prefix_len, 24);
     }
 
     #[test]
     fn same_zone_noop() {
         let mut agg = RouteAggregator::new(Some(24));
-        agg.process_ip(
+        agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
-
-        // Second IP in same /24, same zone — no new actions
-        let actions = agg.process_ip(
+        let plan = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 100),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
-        assert!(actions.is_empty());
+        assert!(plan.is_empty());
     }
 
     #[test]
-    fn cross_zone_conflict_splits_aggregate() {
+    fn cross_zone_split_adds_before_removing_the_broad_route() {
         let mut agg = RouteAggregator::new(Some(24));
-        agg.process_ip(
+        agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
 
-        // Different zone, same /24 — must split
-        let actions = agg.process_ip(
+        let plan = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 200),
             "zone2",
             RouteType::Via,
             "192.168.2.1",
         );
 
-        // Should have: 1 Remove + 8 sibling Adds (24->32 = 8 splits) + 1 /32 Add = 10 actions
-        let removes: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, RouteAction::Remove { .. }))
-            .collect();
-        let adds: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, RouteAction::Add { .. }))
-            .collect();
-
-        assert_eq!(removes.len(), 1);
-        assert_eq!(
-            removes[0],
-            &RouteAction::Remove {
-                network: Ipv4Addr::new(10, 0, 0, 0),
-                prefix_len: 24,
+        // The broad /24 must be the very last action: a failure before it
+        // leaves the old route in place instead of opening a gap.
+        let last = plan.actions.last().unwrap();
+        match last {
+            RouteAction::Remove(intent) => {
+                assert_eq!(intent.key.prefix.prefix_len, 24);
+                assert_eq!(
+                    intent.key.prefix.network,
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0))
+                );
             }
+            other => panic!("expected the broad removal last, got {other:?}"),
+        }
+
+        // Every add precedes the removal.
+        let remove_index = plan.actions.len() - 1;
+        for (index, action) in plan.actions.iter().enumerate() {
+            if matches!(action, RouteAction::Remove(_)) {
+                assert_eq!(index, remove_index, "only the broad route is removed");
+            }
+        }
+
+        // 8 siblings for zone1 plus the /32 for zone2.
+        assert_eq!(adds(&plan).len(), 9);
+        assert_eq!(removes(&plan).len(), 1);
+    }
+
+    #[test]
+    fn cross_zone_split_keeps_the_conflicting_host_route() {
+        let mut agg = RouteAggregator::new(Some(24));
+        agg.plan_ip(
+            Ipv4Addr::new(10, 0, 0, 5),
+            "zone1",
+            RouteType::Via,
+            "192.168.1.1",
+        );
+        let plan = agg.plan_ip(
+            Ipv4Addr::new(10, 0, 0, 200),
+            "zone2",
+            RouteType::Via,
+            "192.168.2.1",
         );
 
-        // 8 siblings for zone1 + 1 /32 for zone2 = 9 adds
-        assert_eq!(adds.len(), 9);
-
-        // The last add should be the /32 for the conflicting IP
-        assert_eq!(
-            *adds.last().unwrap(),
-            &RouteAction::Add {
-                network: Ipv4Addr::new(10, 0, 0, 200),
-                prefix_len: 32,
-                route_type: RouteType::Via,
-                route_target: "192.168.2.1".to_string(),
-            }
-        );
+        let host = adds(&plan)
+            .into_iter()
+            .find(|intent| {
+                intent.key.prefix.prefix_len == 32
+                    && intent.key.prefix.network == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 200))
+            })
+            .expect("the conflicting host route must be planned");
+        assert_eq!(host.zone, "zone2");
     }
 
     #[test]
     fn new_aggregate_with_preexisting_conflicts() {
         let mut agg = RouteAggregator::new(Some(24));
 
-        // First, add an IP in zone2 at 10.0.0.100
-        agg.process_ip(
+        // zone2 already owns 10.0.0.100.
+        agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 100),
             "zone2",
             RouteType::Via,
             "192.168.2.1",
         );
 
-        // Now add an IP in zone1 at 10.0.0.5 — same /24, but zone1 wants the aggregate
-        // The aggregate for zone1 must carve out 10.0.0.100 which belongs to zone2
-        let actions = agg.process_ip(
+        // zone1 now wants the whole /24, which must carve 10.0.0.100 out.
+        let plan = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
 
-        // Should install the /24 aggregate, then immediately split around
-        // the conflicting 10.0.0.100
-        let adds: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, RouteAction::Add { .. }))
-            .collect();
-        let removes: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, RouteAction::Remove { .. }))
-            .collect();
+        assert!(!adds(&plan).is_empty());
+        assert!(!removes(&plan).is_empty());
 
-        // At least one add and one remove (the original /24 gets removed during carve-out)
-        assert!(!adds.is_empty());
-        assert!(!removes.is_empty());
-
-        // The /32 for 10.0.0.100 should NOT be in the adds (it belongs to zone2,
-        // already installed). Verify no /32 for 10.0.0.100 with zone1's target.
-        let conflict_adds: Vec<_> = adds
-            .iter()
-            .filter(|a| {
-                matches!(a, RouteAction::Add { network, prefix_len: 32, .. } if *network == Ipv4Addr::new(10, 0, 0, 100))
-            })
-            .collect();
-        assert!(conflict_adds.is_empty());
+        // The carve-out must not install a /32 for the other zone's address.
+        let conflict_host = adds(&plan).into_iter().find(|intent| {
+            intent.key.prefix.prefix_len == 32
+                && intent.key.prefix.network == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100))
+        });
+        assert!(conflict_host.is_none());
     }
 
     #[test]
     fn disabled_always_returns_32() {
-        // prefix_len = 32 means disabled
         let mut agg = RouteAggregator::new(Some(32));
-        let actions = agg.process_ip(
+        let plan = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
-        assert_eq!(actions.len(), 1);
-        assert_eq!(
-            actions[0],
-            RouteAction::Add {
-                network: Ipv4Addr::new(10, 0, 0, 5),
-                prefix_len: 32,
-                route_type: RouteType::Via,
-                route_target: "192.168.1.1".to_string(),
-            }
-        );
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(adds(&plan)[0].key.prefix.prefix_len, 32);
 
-        // Same IP again — no-op
-        let actions2 = agg.process_ip(
+        let again = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
-        assert!(actions2.is_empty());
+        assert!(again.is_empty());
     }
 
     #[test]
-    fn disabled_none_always_returns_32() {
-        // None means disabled
+    fn none_means_disabled() {
         let mut agg = RouteAggregator::new(None);
-        let actions = agg.process_ip(
+        let plan = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
-        assert_eq!(actions.len(), 1);
-        assert_eq!(
-            actions[0],
-            RouteAction::Add {
-                network: Ipv4Addr::new(10, 0, 0, 5),
-                prefix_len: 32,
-                route_type: RouteType::Via,
-                route_target: "192.168.1.1".to_string(),
-            }
+        assert_eq!(adds(&plan)[0].key.prefix.prefix_len, 32);
+    }
+
+    #[test]
+    fn aggregate_network_is_canonical() {
+        let mut agg = RouteAggregator::new(Some(22));
+        let plan = agg.plan_ip(
+            Ipv4Addr::new(104, 16, 133, 229),
+            "zone1",
+            RouteType::Via,
+            "192.168.1.1",
         );
+        let add = adds(&plan)[0];
+        assert_eq!(
+            add.key.prefix.network,
+            IpAddr::V4(Ipv4Addr::new(104, 16, 132, 0))
+        );
+        assert_eq!(add.key.prefix.prefix_len, 22);
     }
 
     #[test]
     fn cleanup_zone_removes_tracking() {
         let mut agg = RouteAggregator::new(Some(24));
-        agg.process_ip(
+        agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
-        agg.process_ip(
+        agg.plan_ip(
             Ipv4Addr::new(10, 1, 0, 5),
             "zone2",
             RouteType::Via,
@@ -549,35 +545,55 @@ mod tests {
 
         agg.cleanup_zone("zone1");
 
-        // zone1's aggregate should be gone from installed
-        assert!(!agg.installed.values().any(|o| o.zone_name == "zone1"));
-        // zone1's known IPs should be gone
+        assert!(!agg.desired.values().any(|o| o.zone_name == "zone1"));
         assert!(!agg.known_ips.values().any(|z| z == "zone1"));
-        // zone2 should still be present
-        assert!(agg.installed.values().any(|o| o.zone_name == "zone2"));
+        assert!(agg.desired.values().any(|o| o.zone_name == "zone2"));
     }
 
     #[test]
     fn register_static_ip_prevents_overlap() {
         let mut agg = RouteAggregator::new(Some(24));
-
-        // Register a static IP for zone2 in the 10.0.0.0/24 range
         agg.register_static_ip(Ipv4Addr::new(10, 0, 0, 50), "zone2");
 
-        // Now zone1 wants to aggregate in that range — should carve out 10.0.0.50
-        let actions = agg.process_ip(
+        let plan = agg.plan_ip(
             Ipv4Addr::new(10, 0, 0, 5),
             "zone1",
             RouteType::Via,
             "192.168.1.1",
         );
+        assert!(!removes(&plan).is_empty());
+    }
 
-        // Should have carve-out: initial add + remove + sibling adds
-        let removes: Vec<_> = actions
-            .iter()
-            .filter(|a| matches!(a, RouteAction::Remove { .. }))
-            .collect();
-        assert!(!removes.is_empty());
+    #[test]
+    fn installed_prefix_reports_the_covering_aggregate() {
+        let mut agg = RouteAggregator::new(Some(24));
+        agg.plan_ip(
+            Ipv4Addr::new(10, 0, 0, 5),
+            "zone1",
+            RouteType::Via,
+            "192.168.1.1",
+        );
+        assert_eq!(agg.installed_prefix(Ipv4Addr::new(10, 0, 0, 200)), Some(24));
+        assert_eq!(agg.installed_prefix(Ipv4Addr::new(10, 0, 1, 1)), None);
+    }
+
+    #[test]
+    fn dev_zone_plans_a_device_target() {
+        let mut agg = RouteAggregator::new(Some(24));
+        let plan = agg.plan_ip(
+            Ipv4Addr::new(10, 0, 0, 5),
+            "corp",
+            RouteType::Dev,
+            "/run/vpn/corp.dev",
+        );
+        let add = adds(&plan)[0];
+        assert_eq!(
+            add.target,
+            RouteTarget::Device {
+                name: "/run/vpn/corp.dev".to_string(),
+                ifindex: None,
+            }
+        );
     }
 
     #[test]

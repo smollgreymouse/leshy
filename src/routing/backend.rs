@@ -158,6 +158,14 @@ pub(crate) mod fake {
             self.state.observed.lock().unwrap().push(route);
         }
 
+        /// Zero the mutation counters without dropping recorded intents.
+        pub(crate) fn reset_counters(&self) {
+            self.state.ensures.store(0, Ordering::SeqCst);
+            self.state.removes.store(0, Ordering::SeqCst);
+            self.state.snapshots.store(0, Ordering::SeqCst);
+            self.state.resolves.store(0, Ordering::SeqCst);
+        }
+
         /// Shared handle for passing the same fake into several owners.
         pub(crate) fn shared(&self) -> Arc<FakeState> {
             Arc::clone(&self.state)

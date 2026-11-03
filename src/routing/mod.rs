@@ -26,7 +26,7 @@ pub use model::{
 #[allow(unused_imports)]
 pub use registry::{ReconcileReport, RouteError};
 
-use crate::config::{RouteType, ZoneConfig};
+use crate::config::ZoneConfig;
 use aggregator::{RouteAction, RouteAggregator};
 use anyhow::{Context, Result};
 use backend::{EnsureOutcome, RouteBackend};
@@ -130,12 +130,12 @@ impl RouteManager {
         zone: &ZoneConfig,
         target: RouteTarget,
     ) -> Result<()> {
-        let actions = {
+        let plan = {
             let mut agg = self.aggregator.lock().await;
-            agg.process_ip(ip, &zone.name, zone.route_type, &zone.route_target)
+            agg.plan_ip(ip, &zone.name, zone.route_type, &zone.route_target)
         };
 
-        if actions.is_empty() {
+        if plan.actions.is_empty() {
             // The aggregator already covers this address. The registry still
             // has to confirm the covering prefix is verified, otherwise a row
             // dropped outside Leshy would stay missing.
@@ -155,7 +155,9 @@ impl RouteManager {
             return self.ensure_intent(intent).await.map(|_| ());
         }
 
-        for action in &actions {
+        // The planner orders every add before every remove, so a failure part
+        // way through leaves a route in place instead of a hole.
+        for action in &plan.actions {
             self.execute_action(action, zone).await?;
         }
         Ok(())
@@ -164,48 +166,25 @@ impl RouteManager {
     /// Execute one aggregator action against the registry.
     async fn execute_action(&self, action: &RouteAction, zone: &ZoneConfig) -> Result<()> {
         match action {
-            RouteAction::Add {
-                network,
-                prefix_len,
-                route_type,
-                route_target,
-            } => {
-                let family = AddressFamily::V4;
-                let target = match route_type {
-                    RouteType::Via => RouteTarget::Gateway(
-                        route_target
-                            .trim()
-                            .parse()
-                            .with_context(|| format!("parse gateway {route_target}"))?,
-                    ),
-                    RouteType::Dev => self.backend.resolve_target(zone, family).await?,
-                };
-                let intent = RouteIntent {
-                    key: RouteKey {
-                        prefix: RoutePrefix::new(IpAddr::V4(*network), *prefix_len)?,
-                        table: MAIN_TABLE,
-                    },
-                    zone: zone.name.clone(),
-                    target,
-                    source: RouteSource::Dns,
+            RouteAction::Add(intent) => {
+                // A `dev` target carries the device-file path; resolve it to a
+                // real interface before the backend sees the intent.
+                let intent = match &intent.target {
+                    RouteTarget::Device {
+                        name,
+                        ifindex: None,
+                    } if name == &zone.route_target => {
+                        let resolved = self.backend.resolve_target(zone, AddressFamily::V4).await?;
+                        RouteIntent {
+                            target: resolved,
+                            ..intent.clone()
+                        }
+                    }
+                    _ => intent.clone(),
                 };
                 self.ensure_intent(intent).await.map(|_| ())
             }
-            RouteAction::Remove {
-                network,
-                prefix_len,
-            } => {
-                let intent = RouteIntent {
-                    key: RouteKey {
-                        prefix: RoutePrefix::new(IpAddr::V4(*network), *prefix_len)?,
-                        table: MAIN_TABLE,
-                    },
-                    zone: zone.name.clone(),
-                    target: RouteTarget::Unreachable,
-                    source: RouteSource::Dns,
-                };
-                self.backend.remove_route(&intent).await
-            }
+            RouteAction::Remove(intent) => self.backend.remove_route(intent).await,
         }
     }
 
@@ -309,7 +288,7 @@ fn parse_prefix(cidr: &str) -> Result<RoutePrefix> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DnsProtocol, ZoneMode};
+    use crate::config::{DnsProtocol, RouteType, ZoneMode};
     use crate::routing::backend::fake::FakeBackend;
     use crate::routing::model::ObservedRoute;
     use std::net::Ipv6Addr;
@@ -519,5 +498,53 @@ mod tests {
         assert_eq!(report.noops, 1);
         assert_eq!(report.adds, 0);
         assert_eq!(backend.ensure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_zone_split_never_removes_before_replacing() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), Some(24));
+        let zone1 = via_zone("zone1", "192.168.1.1");
+        let zone2 = via_zone("zone2", "192.168.2.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), &zone1)
+            .await
+            .unwrap();
+        backend.reset_counters();
+
+        // A second zone in the same /24 forces a split of zone1's aggregate.
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 200)), &zone2)
+            .await
+            .unwrap();
+
+        // Every replacement add must land before the broad route is removed.
+        assert_eq!(backend.remove_count(), 1);
+        assert!(backend.ensure_count() >= 9);
+    }
+
+    #[tokio::test]
+    async fn failed_split_keeps_the_broad_route() {
+        let backend = Arc::new(FakeBackend::new());
+        let mgr = manager(Arc::clone(&backend), Some(24));
+        let zone1 = via_zone("zone1", "192.168.1.1");
+        let zone2 = via_zone("zone2", "192.168.2.1");
+
+        mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), &zone1)
+            .await
+            .unwrap();
+        backend.reset_counters();
+
+        // The first replacement add fails, so the broad route must survive.
+        backend.set_outcome(Err(anyhow::anyhow!("netlink EPERM")));
+        let result = mgr
+            .add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 200)), &zone2)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            backend.remove_count(),
+            0,
+            "the broad route must not be removed when a replacement failed"
+        );
     }
 }
