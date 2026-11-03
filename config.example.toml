@@ -40,6 +40,15 @@ cache_negative_ttl = 30
 # silently growing the routing table. Static routes do not count.
 # max_dynamic_routes = 16384
 
+# Route writer (default: "local").
+# - "local": Leshy writes the kernel routes itself (standalone mode).
+# - "kikimora": Kikimora is the single route writer; Leshy only sends route
+#   intents over its control socket and never touches the local FIB, with no
+#   fallback to the local writer. Enable this only when the Kikimora core
+#   advertises the `managed_selected_routes_v1` capability.
+# routing_backend = "local"
+# kikimora_socket = "/run/kikimora/core.sock"
+
 # Example Zone 1: Corporate VPN with device-based routing
 # Routes traffic through a VPN tunnel device that may connect/disconnect
 [[zones]]

@@ -40,10 +40,7 @@ pub struct DnsHandler {
 
 impl DnsHandler {
     pub fn new(config: Config, matcher: ZoneMatcher) -> anyhow::Result<Self> {
-        let route_manager = RouteManager::with_capacity(
-            config.server.route_aggregation_prefix,
-            config.server.max_dynamic_routes,
-        )?;
+        let route_manager = RouteManager::for_server(&config.server)?;
         let cache = Arc::new(DnsCache::new(config.server.cache_size));
 
         Ok(Self {
@@ -745,6 +742,8 @@ mod tests {
             cache_negative_ttl: negative_ttl,
             route_aggregation_prefix: None,
             max_dynamic_routes: crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+            routing_backend: crate::config::RoutingBackend::Local,
+            kikimora_socket: None,
         }
     }
 
@@ -1250,5 +1249,46 @@ route_target = "192.0.2.1"
         // AAAA-only (or any other) answer.
         let answer = run_query(&handler, "example.com", RecordType::A).await;
         assert_eq!(answer.response_code(), ResponseCode::ServFail);
+    }
+
+    #[tokio::test]
+    async fn managed_controller_denial_is_servfail_even_with_fallback_configured() {
+        use crate::routing::kikimora::{
+            fake::{applied_result, FakeTransport},
+            KikimoraRouteBackend,
+        };
+
+        // The controller refuses the intent: the address must not be
+        // answered without its selected route, whatever the fallback says.
+        let transport = Arc::new(FakeTransport::new());
+        let mut result = applied_result("1.2.3.4/32", 4);
+        result.state = "denied".to_string();
+        transport.set_result(result);
+
+        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+        let config = e2e_config(
+            RouteFailureMode::Fallback,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+        );
+        let matcher = ZoneMatcher::new(config.zones.clone()).unwrap();
+        let manager = RouteManager::with_backend(
+            Arc::new(backend),
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        );
+        let handler = DnsHandler::with_route_manager(config, matcher, manager);
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        handler.cache.insert(
+            "example.com.",
+            RecordType::A,
+            cached_response("example.com.", &[ip]),
+            Duration::from_secs(60),
+        );
+
+        let answer = run_query(&handler, "example.com", RecordType::A).await;
+        assert_eq!(answer.response_code(), ResponseCode::ServFail);
+        // The refusal reached the controller exactly once; no local writer
+        // was ever involved.
+        assert_eq!(transport.call_count(), 1);
     }
 }

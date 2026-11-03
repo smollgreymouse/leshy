@@ -7,6 +7,7 @@
 
 mod aggregator;
 pub(crate) mod backend;
+pub(crate) mod kikimora;
 mod model;
 pub(crate) mod registry;
 
@@ -24,7 +25,7 @@ pub use model::{
 };
 pub use registry::{ReconcileReport, RouteError};
 
-use crate::config::ZoneConfig;
+use crate::config::{RoutingBackend, ServerConfig, ZoneConfig};
 use aggregator::{RouteAction, RouteAggregator};
 use anyhow::{Context, Result};
 use backend::{EnsureOutcome, RouteBackend};
@@ -59,21 +60,46 @@ pub struct RouteManager {
 }
 
 impl RouteManager {
-    /// Production constructor: creates the platform backend, the registry and
-    /// the Linux monitor/audit task.
+    /// Production constructor driven by the server configuration: picks the
+    /// standalone platform backend or the Kikimora managed backend, creates
+    /// the registry and the Linux monitor/audit task.
+    pub fn for_server(server: &ServerConfig) -> Result<Self> {
+        match server.routing_backend {
+            RoutingBackend::Local => {
+                Self::with_capacity(server.route_aggregation_prefix, server.max_dynamic_routes)
+            }
+            RoutingBackend::Kikimora => {
+                let socket = server
+                    .kikimora_socket
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("routing_backend = \"kikimora\" requires kikimora_socket")
+                    })?;
+                let backend: Arc<dyn RouteBackend> =
+                    Arc::new(kikimora::KikimoraRouteBackend::new(socket)?);
+                Ok(Self::from_backend(
+                    backend,
+                    server.route_aggregation_prefix,
+                    server.max_dynamic_routes,
+                ))
+            }
+        }
+    }
+
+    /// Production constructor for the standalone mode: creates the platform
+    /// backend, the registry and the Linux monitor/audit task.
     pub fn with_capacity(
         aggregation_prefix: Option<u8>,
         max_dynamic_routes: usize,
     ) -> Result<Self> {
-        let backend = Arc::new(PlatformBackend::new()?);
-        let manager = Self {
+        let backend: Arc<dyn RouteBackend> = Arc::new(PlatformBackend::new()?);
+        Ok(Self::from_backend(
             backend,
-            registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
-            aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
-            kernel_epoch: Arc::new(AtomicU64::new(0)),
-        };
-        manager.start_kernel_watch();
-        Ok(manager)
+            aggregation_prefix,
+            max_dynamic_routes,
+        ))
     }
 
     /// Start the kernel invalidation listener and the periodic safety audit.
@@ -113,6 +139,9 @@ impl RouteManager {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(AUDIT_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // interval's first tick completes immediately; the registry has
+            // nothing stale that early, so consume it without auditing.
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 let report = reconcile_after_invalidation(
@@ -148,8 +177,8 @@ impl RouteManager {
         .await
     }
 
-    /// Construct a manager around an arbitrary backend. Used by tests to drive
-    /// reconciliation against a fake kernel.
+    /// Assemble a manager around an arbitrary backend. Tests use it to drive
+    /// reconciliation against a fake kernel or the managed backend.
     #[cfg(test)]
     pub(crate) fn with_backend<B>(
         backend: Arc<B>,
@@ -159,12 +188,26 @@ impl RouteManager {
     where
         B: RouteBackend + 'static,
     {
-        Self {
+        Self::from_backend(
+            backend as Arc<dyn RouteBackend>,
+            aggregation_prefix,
+            max_dynamic_routes,
+        )
+    }
+
+    fn from_backend(
+        backend: Arc<dyn RouteBackend>,
+        aggregation_prefix: Option<u8>,
+        max_dynamic_routes: usize,
+    ) -> Self {
+        let manager = Self {
             backend,
             registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
             aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
             kernel_epoch: Arc::new(AtomicU64::new(0)),
-        }
+        };
+        manager.start_kernel_watch();
+        manager
     }
 
     /// Current kernel epoch. Bumped whenever the kernel state is invalidated.

@@ -60,6 +60,31 @@ pub struct ServerConfig {
     /// of silently growing the routing table. Static routes do not count.
     #[serde(default = "default_max_dynamic_routes")]
     pub max_dynamic_routes: usize,
+
+    /// Which writer installs the selected routes.
+    ///
+    /// `local` (default) is the standalone mode: Leshy writes the kernel FIB
+    /// itself through its platform backend. `kikimora` is the managed mode:
+    /// Leshy only sends route intents to the Kikimora control socket and
+    /// never touches the local FIB (no fallback either way).
+    #[serde(default)]
+    pub routing_backend: RoutingBackend,
+
+    /// Path to the Kikimora control socket, required for
+    /// `routing_backend = "kikimora"` (e.g. "/run/kikimora/core.sock").
+    #[serde(default)]
+    pub kikimora_socket: Option<String>,
+}
+
+/// Route-writer selection for the server (plan section 12).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingBackend {
+    /// Standalone: Leshy's own platform backend writes the kernel routes.
+    #[default]
+    Local,
+    /// Managed: Kikimora is the single FIB writer for Leshy-selected routes.
+    Kikimora,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -368,6 +393,23 @@ impl Config {
         // Validate listen address is not 0.0.0.0:0
         if self.server.listen_address.port() == 0 {
             anyhow::bail!("Server listen port cannot be 0");
+        }
+
+        // Managed mode needs to know where the controller listens. There is
+        // no auto-detection and no fallback to the local writer.
+        if self.server.routing_backend == RoutingBackend::Kikimora
+            && self
+                .server
+                .kikimora_socket
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            anyhow::bail!(
+                "routing_backend = \"kikimora\" requires kikimora_socket \
+                 (e.g. \"/run/kikimora/core.sock\")"
+            );
         }
 
         // Validate default upstream not empty

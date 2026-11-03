@@ -13,7 +13,9 @@
 // the rollout; until then it is exercised only by its own tests.
 #![allow(dead_code)]
 
-use crate::routing::backend::{EnsureOutcome, RouteBackend, RouteConflict, RouteInvalidation};
+use crate::routing::backend::{
+    ControllerDenied, EnsureOutcome, RouteBackend, RouteConflict, RouteInvalidation,
+};
 use crate::routing::model::*;
 use anyhow::{bail, Result};
 use std::collections::{HashMap, HashSet};
@@ -136,6 +138,9 @@ impl RouteRegistry {
                 if e.downcast_ref::<RouteConflict>().is_some() {
                     bail!(RouteError::Conflict);
                 }
+                if e.downcast_ref::<ControllerDenied>().is_some() {
+                    bail!(RouteError::AuthorityDenied);
+                }
                 bail!(RouteError::Apply(e));
             }
         };
@@ -152,6 +157,17 @@ impl RouteRegistry {
     pub(crate) async fn mark_dirty(&self, invalidation: RouteInvalidation, epoch: u64) {
         let mut map = self.entries.write().await;
         match invalidation {
+            RouteInvalidation::Zone(zone) => {
+                for entry in map.values_mut() {
+                    let mut locked = entry.lock().await;
+                    if let Some(ref intent) = locked.desired {
+                        if intent.zone == zone {
+                            locked.state = RouteState::Dirty;
+                            locked.dirty_epoch = epoch;
+                        }
+                    }
+                }
+            }
             RouteInvalidation::Full => {
                 for entry in map.values_mut() {
                     let mut locked = entry.lock().await;
@@ -684,5 +700,24 @@ mod tests {
         let dns_intent2 = host_intent_v4(10, 0, 0, 3, "corp");
         let result = reg.ensure(dns_intent2, &backend, 1).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn zone_invalidation_marks_only_that_zones_entries() {
+        let reg = make_registry(100);
+        let backend = make_backend();
+        let i1 = host_intent_v4(10, 0, 0, 1, "corp");
+        let i2 = host_intent_v4(10, 0, 0, 2, "other");
+        let _ = reg.ensure(i1.clone(), &backend, 1).await.unwrap();
+        let _ = reg.ensure(i2.clone(), &backend, 1).await.unwrap();
+
+        reg.mark_dirty(RouteInvalidation::Zone("corp".to_string()), 2)
+            .await;
+
+        let map = reg.entries.read().await;
+        let e1 = map.get(&i1.key).unwrap().lock().await;
+        assert_eq!(e1.state, RouteState::Dirty);
+        let e2 = map.get(&i2.key).unwrap().lock().await;
+        assert_eq!(e2.state, RouteState::Verified);
     }
 }

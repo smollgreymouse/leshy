@@ -49,6 +49,22 @@ impl std::fmt::Display for RouteConflict {
 
 impl std::error::Error for RouteConflict {}
 
+/// The Kikimora controller refused the intent (role not ready, family not
+/// Ready, frozen, capacity). A safety denial: the DNS layer must not answer
+/// with the affected address, whatever the legacy fallback says.
+#[derive(Debug)]
+pub struct ControllerDenied {
+    pub reason: String,
+}
+
+impl std::fmt::Display for ControllerDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "controller denied the route: {}", self.reason)
+    }
+}
+
+impl std::error::Error for ControllerDenied {}
+
 /// A kernel-state change that invalidates registry verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteInvalidation {
@@ -56,6 +72,10 @@ pub enum RouteInvalidation {
     Prefix(RouteKey),
     /// Everything routed through an interface is no longer trustworthy.
     Interface(u32),
+    /// Everything selected by one zone is no longer trustworthy. Used by the
+    /// Kikimora managed backend when the controller's route generation or
+    /// family readiness for that zone changed.
+    Zone(String),
     /// The kernel state cannot be mapped to individual keys.
     Full,
 }
