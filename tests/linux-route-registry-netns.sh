@@ -31,6 +31,7 @@ cleanup() {
 trap cleanup EXIT
 
 ip netns add "$NS"
+ip -n "$NS" link set lo up
 ip -n "$NS" link add "$DEV" type dummy
 ip -n "$NS" address add 10.55.0.254/24 dev "$DEV"
 ip -n "$NS" -6 address add fd00:55::254/64 dev "$DEV"

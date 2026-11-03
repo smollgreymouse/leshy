@@ -257,8 +257,15 @@ impl LinuxRouteBackend {
             IpAddr::V6(_) => netlink_packet_route::AddressFamily::Inet6,
         };
         msg.header.destination_prefix_length = prefix.prefix_len;
-        msg.header.protocol = LESHY_PROTOCOL;
         msg.header.table = MAIN_TABLE_U8;
+        // Ownership was already proven by the exact read-back before this
+        // delete runs, so the DEL must match the row whatever its scope,
+        // protocol or metric are: the kernel compares all three and an
+        // assumed Boot/link delete silently misses the row (ESRCH), leaving
+        // it in the table. NOWHERE scope and UNSPEC protocol mean "match
+        // any"; an absent priority matches any metric.
+        msg.header.scope = RouteScope::Nowhere;
+        msg.header.protocol = RouteProtocol::Unspec;
         match prefix.network {
             IpAddr::V4(addr) => {
                 msg.attributes
