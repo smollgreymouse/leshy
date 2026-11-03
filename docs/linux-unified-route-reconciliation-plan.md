@@ -1,6 +1,6 @@
 # Implementation plan: unified dual-stack route registry and reconciliation
 
-**Status:** implementation-ready plan. No design choices are intentionally left to the executor.  
+**Status:** COMPLETE — commits 1–9 landed and the acceptance gate is green (fmt, clippy `-D warnings`, full test suite, and the privileged netns harness `tests/linux-route-registry-netns.sh` on a disposable kernel; the managed backend stays unenabled until Kikimora packet 08D).  
 **Leshy baseline reviewed:** master at `ba53d42ac12f2efefe66f0a1a27f8d47544d2267`; code baseline before this document is v0.5.2 / `277fd6d9699fd6a08e148a37a268e4bdefbedabc`.  
 **Primary target:** Linux. macOS and Windows must continue to compile and preserve current behavior until their equivalent kernel-observation implementation is added.  
 **Kikimora integration:** explicitly deferred until the standalone/local route registry is complete; the final integration architecture is fixed in section 12 and in Kikimora's own integration packet.
