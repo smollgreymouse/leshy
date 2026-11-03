@@ -60,7 +60,7 @@ async fn manager_with_dev_zone() -> (RouteManager, Config) {
     let config: Config = toml::from_str(&format!(
         r#"
 [server]
-listen_address = "127.0.0.1:0"
+listen_address = "127.0.0.1:15390"
 default_upstream = ["10.55.0.254:53"]
 route_failure_mode = "servfail"
 

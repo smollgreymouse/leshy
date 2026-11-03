@@ -6,9 +6,7 @@
 //! followed by a read-back of the affected prefix.
 
 use super::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
-use super::model::{
-    family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget,
-};
+use super::model::{AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget};
 use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
