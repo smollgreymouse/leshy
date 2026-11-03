@@ -378,7 +378,7 @@ impl RouteBackend for LinuxRouteBackend {
             // EEXIST — or EBUSY, which is what IPv6 answers for an identical
             // existing route. Only an exact read-back turns that into a
             // verified no-op; anything else keeps the error.
-            if is_busy_class(&e) {
+            if Self::is_busy_class(&e) {
                 match self.find_row(intent).await? {
                     Some(row) if row.target == intent.target => {
                         return Ok(EnsureOutcome::AlreadyMatching);
