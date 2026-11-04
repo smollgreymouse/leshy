@@ -768,4 +768,113 @@ domains = ["example.com"]
         .unwrap();
         assert_eq!(cfg.server.max_dynamic_routes, 512);
     }
+
+    #[test]
+    fn gateway_for_rejects_an_invalid_gateway_string() {
+        let mut zone = via_zone();
+        zone.route_target = "not-an-ip".to_string();
+        let err = zone.gateway_for(AddressFamily::V4).unwrap_err();
+        assert!(err.to_string().contains("invalid gateway"));
+    }
+
+    #[test]
+    fn gateway_for_rejects_family_mismatch() {
+        let mut zone = via_zone();
+        // A v4 address sitting in the IPv6 gateway slot: the parse succeeds,
+        // then the family check refuses it.
+        zone.route_target_ipv6 = Some("192.0.2.1".to_string());
+        let err = zone.gateway_for(AddressFamily::V6).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not match the V6 route family"));
+    }
+
+    #[test]
+    fn gateway_for_requires_route_target_ipv6_for_v6_via_zones() {
+        let zone = via_zone();
+        let err = zone.gateway_for(AddressFamily::V6).unwrap_err();
+        assert!(err.to_string().contains("route_target_ipv6 is required"));
+    }
+
+    #[test]
+    fn managed_backend_requires_the_socket() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+routing_backend = "kikimora"
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("kikimora_socket"));
+    }
+
+    #[test]
+    fn managed_backend_with_socket_is_valid() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+routing_backend = "kikimora"
+kikimora_socket = "/run/kikimora/core.sock"
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.server.routing_backend, RoutingBackend::Kikimora);
+    }
+
+    #[test]
+    fn listen_port_zero_is_rejected() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:0"
+default_upstream = ["1.1.1.1:53"]
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("port cannot be 0"));
+    }
+
+    fn via_zone() -> ZoneConfig {
+        ZoneConfig {
+            name: "gw".to_string(),
+            mode: crate::config::ZoneMode::Inclusive,
+            dns_servers: vec![],
+            route_type: RouteType::Via,
+            route_target: "192.0.2.1".to_string(),
+            route_target_ipv6: None,
+            domains: vec!["example.com".to_string()],
+            patterns: vec![],
+            static_routes: vec![],
+            dns_protocol: DnsProtocol::Udp,
+            cache_min_ttl: None,
+            cache_max_ttl: None,
+            cache_negative_ttl: None,
+            ipv6: false,
+        }
+    }
 }

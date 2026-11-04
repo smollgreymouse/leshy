@@ -472,30 +472,41 @@ async fn subscription_session(
         let Some(snapshot) = response.snapshot else {
             continue;
         };
-        for role in &snapshot.roles {
-            let Some(publication) = &role.publication else {
-                continue;
-            };
-            // The controller bumps the generation on every change that makes
-            // the previous routes stale (transport generation, ifindex,
-            // family readiness, freeze/withdraw cycles).
-            let changed = match publication.generation {
-                Some(gen) => generations.insert(role.id.clone(), gen) != Some(gen),
-                None => false,
-            };
-            if !changed {
-                continue;
-            }
-            match &publication.zone {
-                Some(zone) if !zone.is_empty() => {
-                    let _ = tx.send(RouteInvalidation::Zone(zone.clone()));
-                }
-                _ => {
-                    let _ = tx.send(RouteInvalidation::Full);
-                }
-            }
+        for invalidation in snapshot_invalidations(&mut generations, &snapshot) {
+            let _ = tx.send(invalidation);
         }
     }
+}
+
+/// Pure core of the pump: given the previous per-role generations and a fresh
+/// controller snapshot, decide the invalidations and advance the map.
+///
+/// The controller bumps the generation on every change that makes the
+/// previous routes stale (transport generation, ifindex, family readiness,
+/// freeze/withdraw cycles). A role with a zone invalidates just that zone;
+/// anything unattributable invalidates everything.
+fn snapshot_invalidations(
+    generations: &mut HashMap<String, u64>,
+    snapshot: &CoreSnapshot,
+) -> Vec<RouteInvalidation> {
+    let mut out = Vec::new();
+    for role in &snapshot.roles {
+        let Some(publication) = &role.publication else {
+            continue;
+        };
+        let changed = match publication.generation {
+            Some(gen) => generations.insert(role.id.clone(), gen) != Some(gen),
+            None => false,
+        };
+        if !changed {
+            continue;
+        }
+        match &publication.zone {
+            Some(zone) if !zone.is_empty() => out.push(RouteInvalidation::Zone(zone.clone())),
+            _ => out.push(RouteInvalidation::Full),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -913,5 +924,69 @@ mod tests {
         };
         let rendered = format!("{target:?}");
         assert!(rendered.contains("kikimora"));
+    }
+
+    #[test]
+    fn generation_change_invalidates_the_zone() {
+        let mut generations = HashMap::new();
+        generations.insert("primary".to_string(), 9);
+        let snapshot: CoreSnapshot = serde_json::from_str(
+            r#"{"roles":[{"id":"primary","publication":{"zone":"primary","generation":10}}]}"#,
+        )
+        .unwrap();
+        let out = snapshot_invalidations(&mut generations, &snapshot);
+        assert_eq!(out, vec![RouteInvalidation::Zone("primary".to_string())]);
+        // The map advanced: the same generation again is a no-op.
+        let out = snapshot_invalidations(&mut generations, &snapshot);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn generation_change_without_a_zone_invalidates_everything() {
+        let mut generations = HashMap::new();
+        let snapshot: CoreSnapshot = serde_json::from_str(
+            r#"{"roles":[{"id":"secondary","publication":{"published":true,"generation":3}}]}"#,
+        )
+        .unwrap();
+        let out = snapshot_invalidations(&mut generations, &snapshot);
+        assert_eq!(out, vec![RouteInvalidation::Full]);
+    }
+
+    #[test]
+    fn first_snapshot_invalidates_once_then_settles() {
+        // A fresh pump has no generation memory: the first snapshot marks the
+        // role stale once (a restarted Leshy must not trust stale Verified
+        // entries), and every following identical snapshot is a no-op.
+        let mut generations = HashMap::new();
+        let snapshot: CoreSnapshot = serde_json::from_str(
+            r#"{"roles":[{"id":"primary","publication":{"zone":"primary","generation":5}}]}"#,
+        )
+        .unwrap();
+        let out = snapshot_invalidations(&mut generations, &snapshot);
+        assert_eq!(out, vec![RouteInvalidation::Zone("primary".to_string())]);
+        assert!(snapshot_invalidations(&mut generations, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn roles_without_publication_are_skipped() {
+        let mut generations = HashMap::new();
+        let snapshot: CoreSnapshot =
+            serde_json::from_str(r#"{"roles":[{"id":"idle"},{"id":"empty","publication":{}}]}"#)
+                .unwrap();
+        assert!(snapshot_invalidations(&mut generations, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn frame_rejects_a_zero_size_header() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(64);
+            client.write_all(&[0, 0, 0, 0]).await.unwrap();
+            drop(client);
+            let err = read_frame::<_, LeshyRouteResultWire>(&mut server)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("invalid control frame size 0"));
+        });
     }
 }

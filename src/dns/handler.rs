@@ -1399,4 +1399,217 @@ route_target = "192.0.2.1"
         let answer = run_query(&handler, "example.com", RecordType::A).await;
         assert_eq!(answer.response_code(), ResponseCode::ServFail);
     }
+
+    // --- live forwarding: a real stub upstream answers over UDP/TCP -------
+
+    /// Behavior of the in-test upstream server.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StubMode {
+        /// Answer every A query with 203.0.113.10.
+        Answer,
+        /// Receive and never answer: Leshy must time out into SERVFAIL.
+        Drop,
+        /// Reply with garbage bytes: Leshy must treat it as a parse failure.
+        Garbage,
+    }
+
+    /// Spawn a stub upstream. Returns the UDP address (the query target) and
+    /// the TCP address (for zones pinned to `dns_protocol = "tcp"`).
+    async fn spawn_stub_upstream(mode: StubMode) -> (SocketAddr, SocketAddr) {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let tcp_addr = tcp.local_addr().unwrap();
+        // UDP and TCP sides run as independent loops: blocking one must not
+        // starve the other.
+        tokio::spawn(async move {
+            loop {
+                let mut buf = vec![0u8; 4096];
+                if let Ok((len, peer)) = udp.recv_from(&mut buf).await {
+                    let payload: Option<Vec<u8>> = match mode {
+                        StubMode::Drop => None,
+                        StubMode::Garbage => Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                        StubMode::Answer => stub_answer(&buf[..len]),
+                    };
+                    if let Some(payload) = payload {
+                        let _ = udp.send_to(&payload, peer).await;
+                    }
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = tcp.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut header = [0u8; 2];
+                    if stream.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let len = u16::from_be_bytes(header) as usize;
+                    let mut query = vec![0u8; len];
+                    if stream.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+                    match mode {
+                        StubMode::Drop => {}
+                        StubMode::Garbage => {
+                            let _ = stream
+                                .write_all(&[0x00, 0x04, 0xde, 0xad, 0xbe, 0xef])
+                                .await;
+                        }
+                        StubMode::Answer => {
+                            if let Some(reply) = stub_answer(&query) {
+                                let framed = [
+                                    (reply.len() as u16).to_be_bytes().as_slice(),
+                                    reply.as_slice(),
+                                ]
+                                .concat();
+                                let _ = stream.write_all(&framed).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (udp_addr, tcp_addr)
+    }
+
+    /// Build a canned upstream response for a parsed query.
+    fn stub_answer(query: &[u8]) -> Option<Vec<u8>> {
+        let query = Message::from_vec(query).ok()?;
+        let question = query.queries().first()?.clone();
+        let mut reply = Message::new();
+        reply.set_id(query.id());
+        reply.set_message_type(MessageType::Response);
+        reply.set_response_code(ResponseCode::NoError);
+        reply.set_recursion_desired(query.recursion_desired());
+        reply.add_query(question.clone());
+        let record_type = question.query_type();
+        let name = question.name().clone();
+        let answer = match record_type {
+            RecordType::A => Record::from_rdata(
+                name,
+                60,
+                RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(203, 0, 113, 10))),
+            ),
+            RecordType::AAAA => Record::from_rdata(
+                name,
+                60,
+                RData::AAAA(hickory_proto::rr::rdata::AAAA(std::net::Ipv6Addr::new(
+                    0x2001, 0xdb8, 0, 0, 0, 0, 0, 10,
+                ))),
+            ),
+            _ => return Some(reply.to_vec().ok()?),
+        };
+        reply.add_answer(answer);
+        reply.to_vec().ok()
+    }
+
+    #[tokio::test]
+    async fn udp_forwarding_answers_and_installs_routes() {
+        let (udp_addr, _tcp_addr) = spawn_stub_upstream(StubMode::Answer).await;
+        let backend = Arc::new(FakeBackend::new());
+        let mut config = e2e_config(
+            RouteFailureMode::Servfail,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+        );
+        config.server.default_upstream = vec![udp_addr];
+        let matcher = ZoneMatcher::new(config.zones.clone()).unwrap();
+        let manager = RouteManager::with_backend(
+            Arc::clone(&backend),
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        );
+        let handler = DnsHandler::with_route_manager(config, matcher, manager);
+
+        // Cache miss: the query reaches the stub upstream, then routes are
+        // installed and the answer goes out.
+        let answer = run_query(&handler, "example.com", RecordType::A).await;
+        assert_eq!(answer.response_code(), ResponseCode::NoError);
+        let types: Vec<_> = answer.answers().iter().map(|r| r.record_type()).collect();
+        assert_eq!(types, vec![RecordType::A]);
+        assert_eq!(backend.ensure_count(), 1);
+        assert_eq!(
+            backend.ensured()[0].key.prefix,
+            RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)))
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pinned_zone_forwards_over_tcp() {
+        let (_udp_addr, tcp_addr) = spawn_stub_upstream(StubMode::Answer).await;
+        let backend = Arc::new(FakeBackend::new());
+        let mut config = e2e_config(
+            RouteFailureMode::Servfail,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+        );
+        let mut zone = config.zones[0].clone();
+        zone.dns_servers = vec![crate::config::DnsServerConfig {
+            address: tcp_addr,
+            cache_min_ttl: None,
+            cache_max_ttl: None,
+            cache_negative_ttl: None,
+        }];
+        zone.dns_protocol = crate::config::DnsProtocol::Tcp;
+        config.zones[0] = zone;
+        let matcher = ZoneMatcher::new(config.zones.clone()).unwrap();
+        let manager = RouteManager::with_backend(
+            Arc::clone(&backend),
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        );
+        let handler = DnsHandler::with_route_manager(config, matcher, manager);
+
+        let answer = run_query(&handler, "example.com", RecordType::A).await;
+        assert_eq!(answer.response_code(), ResponseCode::NoError);
+        let types: Vec<_> = answer.answers().iter().map(|r| r.record_type()).collect();
+        assert_eq!(types, vec![RecordType::A]);
+        assert_eq!(backend.ensure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn dead_upstream_servfails_and_never_installs_routes() {
+        // A silent upstream: Leshy must time out into SERVFAIL without a
+        // single kernel mutation.
+        let (drop_addr, _tcp) = spawn_stub_upstream(StubMode::Drop).await;
+        let backend = Arc::new(FakeBackend::new());
+        let mut config = e2e_config(
+            RouteFailureMode::Servfail,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+        );
+        config.server.default_upstream = vec![drop_addr];
+        let matcher = ZoneMatcher::new(config.zones.clone()).unwrap();
+        let manager = RouteManager::with_backend(
+            Arc::clone(&backend),
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        );
+        let handler = DnsHandler::with_route_manager(config, matcher, manager);
+
+        let answer = run_query(&handler, "example.com", RecordType::A).await;
+        assert_eq!(answer.response_code(), ResponseCode::ServFail);
+        assert_eq!(backend.ensure_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn garbage_upstream_response_servfails() {
+        let (udp_addr, _tcp_addr) = spawn_stub_upstream(StubMode::Garbage).await;
+        let backend = Arc::new(FakeBackend::new());
+        let mut config = e2e_config(
+            RouteFailureMode::Servfail,
+            crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+        );
+        config.server.default_upstream = vec![udp_addr];
+        let matcher = ZoneMatcher::new(config.zones.clone()).unwrap();
+        let manager = RouteManager::with_backend(
+            Arc::clone(&backend),
+            config.server.route_aggregation_prefix,
+            config.server.max_dynamic_routes,
+        );
+        let handler = DnsHandler::with_route_manager(config, matcher, manager);
+
+        let answer = run_query(&handler, "example.com", RecordType::A).await;
+        assert_eq!(answer.response_code(), ResponseCode::ServFail);
+        assert_eq!(backend.ensure_count(), 0);
+    }
 }
