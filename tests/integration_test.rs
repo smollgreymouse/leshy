@@ -153,3 +153,63 @@ patterns = ["[bad"]
         "Error should mention zone name: {err}"
     );
 }
+
+// The real hickory serve loop: DnsServer::new binds, run() accepts, and a
+// real UDP client gets a real answer through DnsHandler. Covers the
+// bootstrap that unit tests cannot reach (dns/server.rs).
+#[tokio::test]
+async fn dns_server_binds_and_answers_over_udp() -> anyhow::Result<()> {
+    use leshy::config::{Config, RouteFailureMode, ServerConfig};
+    use leshy::dns::server::DnsServer;
+    use leshy::zones::ZoneMatcher;
+    use std::sync::Arc;
+
+    let config = Config {
+        server: ServerConfig {
+            listen_address: "127.0.0.1:0".parse()?,
+            default_upstream: vec!["127.0.0.1:1".parse()?],
+            route_failure_mode: RouteFailureMode::Fallback,
+            auto_reload: false,
+            config_dir: None,
+            cache_size: 100,
+            cache_min_ttl: 0,
+            cache_max_ttl: 3600,
+            cache_negative_ttl: 30,
+            route_aggregation_prefix: None,
+            max_dynamic_routes: leshy::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
+            routing_backend: Default::default(),
+            kikimora_socket: None,
+        },
+        zones: vec![],
+    };
+    let matcher = ZoneMatcher::new(config.zones.clone())?;
+    let handler = Arc::new(tokio::sync::RwLock::new(leshy::dns::DnsHandler::new(
+        config, matcher,
+    )?));
+
+    // Bound-then-drop proves the bootstrap (socket bind + registration).
+    let server = DnsServer::new("127.0.0.1:0".parse()?, handler.clone()).await?;
+    drop(server);
+
+    // The serving path: bind on a known port, query over real UDP.
+    let known: std::net::SocketAddr = "127.0.0.1:15399".parse()?;
+    let server = DnsServer::new(known, handler).await?;
+    let task = tokio::spawn(async move { server.run().await });
+
+    let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in ["example", "com"] {
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    sock.send_to(&query, known).await?;
+    let mut buf = vec![0u8; 512];
+    let (len, _from) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv_from(&mut buf)).await??;
+    assert!(len > 12, "a DNS response must come back ({} bytes)", len);
+    // No zone matched and the upstream is unreachable: NXDOMAIN/SERVFAIL is
+    // fine — the point is that the serve loop answered.
+    task.abort();
+    Ok(())
+}
