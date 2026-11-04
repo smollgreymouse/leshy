@@ -1499,7 +1499,7 @@ route_target = "192.0.2.1"
                     0x2001, 0xdb8, 0, 0, 0, 0, 0, 10,
                 ))),
             ),
-            _ => return Some(reply.to_vec().ok()?),
+            _ => return reply.to_vec().ok(),
         };
         reply.add_answer(answer);
         reply.to_vec().ok()
