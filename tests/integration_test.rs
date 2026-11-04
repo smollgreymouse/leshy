@@ -157,7 +157,7 @@ patterns = ["[bad"]
 // The real hickory serve loop: DnsServer::new binds, run() accepts, and a
 // real UDP client gets a real answer through DnsHandler. Covers the
 // bootstrap that unit tests cannot reach (dns/server.rs).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn dns_server_binds_and_answers_over_udp() -> anyhow::Result<()> {
     use leshy::config::{Config, RouteFailureMode, ServerConfig};
     use leshy::dns::server::DnsServer;
