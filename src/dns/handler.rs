@@ -761,6 +761,7 @@ mod tests {
             max_dynamic_routes: crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
             routing_backend: crate::config::RoutingBackend::Local,
             kikimora_socket: None,
+            writer_lock: None,
         }
     }
 

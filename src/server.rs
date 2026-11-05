@@ -64,6 +64,18 @@ pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::from_file_with_includes(&config_path)?;
     let auto_reload = config.server.auto_reload;
 
+    // Process-lifetime writer fence (08D1 §31.2): taken before RouteManager
+    // construction, DNS binding, or any route mutation. Held for the whole
+    // run; a second Leshy on the same generated installation fails here.
+    let _writer_lease = crate::lease::WriterLease::acquire_optional(
+        config
+            .server
+            .writer_lock
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+    )?;
+
     tracing::info!(
         listen = %config.server.listen_address,
         zones = config.zones.len(),

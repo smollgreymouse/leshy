@@ -179,6 +179,7 @@ async fn dns_server_binds_and_answers_over_udp() -> anyhow::Result<()> {
             max_dynamic_routes: leshy::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
             routing_backend: Default::default(),
             kikimora_socket: None,
+            writer_lock: None,
         },
         zones: vec![],
     };

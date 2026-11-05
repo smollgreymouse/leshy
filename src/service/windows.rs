@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceDependency, ServiceErrorControl,
+    ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
@@ -32,7 +32,12 @@ pub const SERVICE_LAUNCH_FLAG: &str = "--service";
 static SERVICE_NAME: OnceLock<String> = OnceLock::new();
 static SERVICE_CONFIG: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-fn build_service_info(name: &str, binary: &Path, config: &Path) -> ServiceInfo {
+fn build_service_info(
+    name: &str,
+    binary: &Path,
+    config: &Path,
+    depend_on: Option<&str>,
+) -> ServiceInfo {
     ServiceInfo {
         name: name.into(),
         display_name: format!("Leshy ({name})").into(),
@@ -49,7 +54,40 @@ fn build_service_info(name: &str, binary: &Path, config: &Path) -> ServiceInfo {
         // None = run as LocalSystem, which holds the rights to install routes.
         account_name: None,
         account_password: None,
-        dependencies: Vec::new(),
+        // SCM dependency on the Kikimora core service (08D1 §31.3): the SCM
+        // does not start this service until the dependency reports Running
+        // after application readiness.
+        dependencies: dependencies_for(depend_on),
+    }
+}
+
+/// Maps the requested dependency name onto SCM service dependencies. Tests
+/// assert the mapping; the real SCM effect is a release-VM contract.
+fn dependencies_for(depend_on: Option<&str>) -> Vec<ServiceDependency> {
+    match depend_on {
+        Some(name) if !name.trim().is_empty() => vec![ServiceDependency::Service(name.into())],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+
+    #[test]
+    fn empty_dependency_is_none() {
+        assert!(dependencies_for(None).is_empty());
+        assert!(dependencies_for(Some("")).is_empty());
+        assert!(dependencies_for(Some("  ")).is_empty());
+    }
+
+    #[test]
+    fn dependency_name_maps_to_service_dependency() {
+        let deps = dependencies_for(Some("KikimoraCore"));
+        assert_eq!(
+            deps,
+            vec![ServiceDependency::Service("KikimoraCore".into())]
+        );
     }
 }
 
@@ -84,7 +122,7 @@ fn set_failure_recovery(raw_handle: windows_sys::Win32::System::Services::SC_HAN
     Ok(())
 }
 
-pub fn install(name: &str, binary: &Path, config: &Path) -> Result<()> {
+pub fn install(name: &str, binary: &Path, config: &Path, depend_on: Option<&str>) -> Result<()> {
     if !config.exists() {
         anyhow::bail!(
             "Config file {} does not exist. Create it first (see config.example.toml).",
@@ -100,7 +138,7 @@ pub fn install(name: &str, binary: &Path, config: &Path) -> Result<()> {
 
     let service = manager
         .create_service(
-            &build_service_info(name, binary, config),
+            &build_service_info(name, binary, config, depend_on),
             ServiceAccess::CHANGE_CONFIG,
         )
         .context("failed to create the service (run as Administrator)")?;
@@ -288,6 +326,7 @@ mod tests {
             "leshy",
             Path::new(r"C:\Program Files\leshy\leshy.exe"),
             Path::new(r"C:\ProgramData\leshy\config.toml"),
+            None,
         );
 
         assert_eq!(info.name, os("leshy"));
@@ -313,7 +352,12 @@ mod tests {
 
     #[test]
     fn custom_name_in_display_name() {
-        let info = build_service_info("leshy-corp", Path::new("leshy.exe"), Path::new("corp.toml"));
+        let info = build_service_info(
+            "leshy-corp",
+            Path::new("leshy.exe"),
+            Path::new("corp.toml"),
+            None,
+        );
         assert_eq!(info.display_name, os("Leshy (leshy-corp)"));
     }
 

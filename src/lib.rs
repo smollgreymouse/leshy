@@ -2,6 +2,7 @@
 pub mod config;
 pub mod dns;
 pub mod error;
+pub mod lease;
 pub mod reload;
 pub mod routing;
 pub mod server;

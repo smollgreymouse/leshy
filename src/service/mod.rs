@@ -36,7 +36,7 @@ pub fn default_name() -> &'static str {
     DEFAULT_NAME
 }
 
-pub fn install(name: Option<&str>, config: Option<&Path>) -> Result<()> {
+pub fn install(name: Option<&str>, config: Option<&Path>, depend_on: Option<&str>) -> Result<()> {
     let name = name.unwrap_or(DEFAULT_NAME);
     let config = config.unwrap_or_else(|| Path::new(DEFAULT_CONFIG));
     let binary = detect_binary();
@@ -54,7 +54,7 @@ pub fn install(name: Option<&str>, config: Option<&Path>) -> Result<()> {
     macos::install(name, &binary, config)?;
 
     #[cfg(target_os = "windows")]
-    windows::install(name, &binary, config)?;
+    windows::install(name, &binary, config, depend_on)?;
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     anyhow::bail!("service install is not supported on this platform");

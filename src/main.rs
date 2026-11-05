@@ -1,6 +1,7 @@
 mod config;
 mod dns;
 mod error;
+mod lease;
 mod reload;
 mod routing;
 mod server;
@@ -41,6 +42,12 @@ enum ServiceAction {
         /// Service name (allows running multiple instances)
         #[arg(long, default_value = service::default_name())]
         name: String,
+
+        /// Windows: SCM service this installation depends on (08D1 §31.3).
+        /// The packaged Kikimora pairing passes its core service name so a
+        /// partial core startup never leaves Leshy running against it.
+        #[arg(long)]
+        depend_on: Option<String>,
     },
     /// Remove the system service
     Uninstall {
@@ -72,8 +79,12 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Service { action }) => match action {
-            ServiceAction::Install { config, name } => {
-                service::install(Some(&name), Some(&config))?;
+            ServiceAction::Install {
+                config,
+                name,
+                depend_on,
+            } => {
+                service::install(Some(&name), Some(&config), depend_on.as_deref())?;
             }
             ServiceAction::Uninstall { name } => {
                 service::uninstall(Some(&name))?;
@@ -124,7 +135,7 @@ mod cli_tests {
         .unwrap();
         match cli.command {
             Some(Command::Service {
-                action: ServiceAction::Install { config, name },
+                action: ServiceAction::Install { config, name, .. },
             }) => {
                 assert_eq!(config, PathBuf::from("/etc/leshy/c.toml"));
                 assert_eq!(name, "leshy-corp");

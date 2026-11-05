@@ -74,6 +74,14 @@ pub struct ServerConfig {
     /// `routing_backend = "kikimora"` (e.g. "/run/kikimora/core.sock").
     #[serde(default)]
     pub kikimora_socket: Option<String>,
+
+    /// Process-lifetime writer lease path (08D1 §31.2). When set, Leshy
+    /// takes an exclusive non-blocking OS lock on this file before
+    /// constructing RouteManager, binding DNS, or touching routes; a second
+    /// Leshy on the same generated installation fails before any mutation.
+    /// The file content is never authority.
+    #[serde(default)]
+    pub writer_lock: Option<String>,
 }
 
 /// Route-writer selection for the server (plan section 12).
@@ -876,5 +884,58 @@ domains = ["example.com"]
             cache_negative_ttl: None,
             ipv6: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod writer_lock_tests {
+    use super::*;
+
+    fn parse(toml_src: &str) -> anyhow::Result<Config> {
+        let config: Config = toml::from_str(toml_src)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn writer_lock_is_optional_by_default() {
+        let cfg = parse(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+
+[[zones]]
+name = "corp"
+route_type = "dev"
+route_target = "/run/vpn/corp.dev"
+domains = ["corp.example.com"]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.server.writer_lock.is_none());
+    }
+
+    #[test]
+    fn writer_lock_parses_from_generated_config() {
+        let cfg = parse(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+writer_lock = "/run/kikimora/leshy-writer.lock"
+
+[[zones]]
+name = "corp"
+route_type = "dev"
+route_target = "/run/vpn/corp.dev"
+domains = ["corp.example.com"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.writer_lock.as_deref(),
+            Some("/run/kikimora/leshy-writer.lock")
+        );
     }
 }

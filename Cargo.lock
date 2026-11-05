@@ -667,6 +667,7 @@ dependencies = [
  "hickory-client",
  "hickory-proto",
  "hickory-server",
+ "libc",
  "netlink-packet-core",
  "netlink-packet-route",
  "netlink-sys",
