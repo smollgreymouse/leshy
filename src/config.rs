@@ -82,6 +82,12 @@ pub struct ServerConfig {
     /// The file content is never authority.
     #[serde(default)]
     pub writer_lock: Option<String>,
+
+    /// Path to the Kikimora privileged-auth credential file (08D1 §31.6).
+    /// Loaded once at managed-backend construction; a configured but
+    /// unreadable or malformed file fails managed startup closed.
+    #[serde(default)]
+    pub kikimora_auth_file: Option<String>,
 }
 
 /// Route-writer selection for the server (plan section 12).

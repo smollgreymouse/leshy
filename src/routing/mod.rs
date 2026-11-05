@@ -85,8 +85,10 @@ impl RouteManager {
                     .ok_or_else(|| {
                         anyhow::anyhow!("routing_backend = \"kikimora\" requires kikimora_socket")
                     })?;
-                let backend: Arc<dyn RouteBackend> =
-                    Arc::new(kikimora::KikimoraRouteBackend::new(socket)?);
+                let backend: Arc<dyn RouteBackend> = Arc::new(kikimora::KikimoraRouteBackend::new(
+                    socket,
+                    server.kikimora_auth_file.as_deref(),
+                )?);
                 Ok(Self::from_backend(
                     backend,
                     server.route_aggregation_prefix,

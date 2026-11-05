@@ -762,6 +762,7 @@ mod tests {
             routing_backend: crate::config::RoutingBackend::Local,
             kikimora_socket: None,
             writer_lock: None,
+            kikimora_auth_file: None,
         }
     }
 

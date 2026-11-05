@@ -180,6 +180,7 @@ async fn dns_server_binds_and_answers_over_udp() -> anyhow::Result<()> {
             routing_backend: Default::default(),
             kikimora_socket: None,
             writer_lock: None,
+            kikimora_auth_file: None,
         },
         zones: vec![],
     };

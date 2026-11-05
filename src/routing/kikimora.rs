@@ -87,6 +87,11 @@ pub(crate) struct ControlRequest {
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     leshy_route: Option<LeshyRouteIntentWire>,
+    /// Service-to-service bearer credential for privileged methods
+    /// (08D1 §31.6). Absent on the wire when the install carries no
+    /// credential file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    privileged_auth: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,13 +156,15 @@ pub(crate) trait ControlTransport: Send + Sync {
 pub(crate) struct SocketTransport {
     path: String,
     next_id: AtomicU64,
+    credential: Option<String>,
 }
 
 impl SocketTransport {
-    pub(crate) fn new(path: &str) -> Self {
+    pub(crate) fn new(path: &str, credential: Option<String>) -> Self {
         Self {
             path: path.to_string(),
             next_id: AtomicU64::new(1),
+            credential,
         }
     }
 
@@ -178,6 +185,7 @@ impl ControlTransport for SocketTransport {
             id: self.next_id(),
             method: method.to_string(),
             leshy_route: intent.cloned(),
+            privileged_auth: self.credential.clone(),
         };
 
         let io = async {
@@ -257,18 +265,43 @@ pub(crate) struct KikimoraRouteBackend {
     _pump: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Loads the privileged bearer credential (08D1 §31.6): the file holds
+/// exactly 64 lowercase hex characters plus one trailing newline. A
+/// configured but unreadable/malformed file fails managed startup closed —
+/// there is no local-writer fallback.
+pub(crate) fn load_auth_credential(path: Option<&str>) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read kikimora auth file {path}: {e}"))?;
+    let text = raw
+        .strip_suffix(char::from(0x0a))
+        .ok_or_else(|| anyhow::anyhow!("kikimora auth file {path} must end with one newline"))?;
+    if text.len() != 64
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        bail!("kikimora auth file {path} must hold 64 lowercase hex characters");
+    }
+    Ok(Some(text.to_string()))
+}
+
 impl KikimoraRouteBackend {
     /// Production constructor: real socket transport plus the subscription
     /// pump that invalidates registry entries on controller generation
-    /// changes and marks authority unknown on socket loss.
-    pub(crate) fn new(socket_path: &str) -> Result<Self> {
+    /// changes and marks authority unknown on socket loss. A configured
+    /// auth file is loaded before any route call; failure is fatal.
+    pub(crate) fn new(socket_path: &str, auth_file: Option<&str>) -> Result<Self> {
+        let credential = load_auth_credential(auth_file)?;
         let (tx, rx) = mpsc::unbounded_channel();
         let pump_socket = socket_path.to_string();
         let pump = tokio::spawn(async move {
             subscription_pump(pump_socket, tx).await;
         });
         Ok(Self::with_parts(
-            Box::new(SocketTransport::new(socket_path)),
+            Box::new(SocketTransport::new(socket_path, credential)),
             Mutex::new(Some(rx)),
             Some(pump),
         ))
@@ -433,6 +466,7 @@ async fn subscription_session(
             id: "leshy-sub-handshake".to_string(),
             method: "Handshake".to_string(),
             leshy_route: None,
+            privileged_auth: None,
         },
     )
     .await?;
@@ -459,6 +493,7 @@ async fn subscription_session(
             id: "leshy-sub".to_string(),
             method: "Subscribe".to_string(),
             leshy_route: None,
+            privileged_auth: None,
         },
     )
     .await?;
@@ -526,6 +561,9 @@ pub(crate) mod fake {
         /// Per-family overrides: a real controller denies one family while
         /// applying the other.
         by_family: Mutex<std::collections::HashMap<u8, ControlResponse>>,
+        /// Credential the fake records into every request, mirroring what a
+        /// real SocketTransport loads from the auth file.
+        credential: Mutex<Option<String>>,
     }
 
     impl FakeTransport {
@@ -534,7 +572,14 @@ pub(crate) mod fake {
                 requests: Mutex::new(Vec::new()),
                 response: Mutex::new(None),
                 by_family: Mutex::new(std::collections::HashMap::new()),
+                credential: Mutex::new(None),
             }
+        }
+
+        /// Point the fake at a credential so request recording exercises the
+        /// privileged_auth field.
+        pub(crate) fn set_credential(&self, credential: Option<String>) {
+            *self.credential.lock().unwrap() = credential;
         }
 
         /// Script the verdict for one address family only.
@@ -573,6 +618,11 @@ pub(crate) mod fake {
             self.requests.lock().unwrap().clone()
         }
 
+        /// Snapshot of the recorded requests for wire-shape assertions.
+        pub(crate) fn recorded_requests(&self) -> Vec<ControlRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+
         pub(crate) fn call_count(&self) -> usize {
             self.requests.lock().unwrap().len()
         }
@@ -596,6 +646,7 @@ pub(crate) mod fake {
                 id: "test".to_string(),
                 method: method.to_string(),
                 leshy_route: intent.cloned(),
+                privileged_auth: self.credential.lock().unwrap().clone(),
             });
             // Family-scoped scripts win: a real controller answers per family.
             if let Some(intent) = intent {
@@ -988,5 +1039,118 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("invalid control frame size 0"));
         });
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn loads_valid_credential_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-route-auth.key");
+        std::fs::write(&path, format!("{}\n", "a".repeat(64))).unwrap();
+        let credential = load_auth_credential(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(credential.as_deref(), Some("a".repeat(64).as_str()));
+    }
+
+    #[test]
+    fn absent_configuration_carries_no_credential() {
+        assert_eq!(load_auth_credential(None).unwrap(), None);
+    }
+
+    #[test]
+    fn missing_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.key");
+        assert!(load_auth_credential(Some(path.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn malformed_files_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "short\n".to_string(),
+            format!("{}\n", "A".repeat(64)), // uppercase is not the on-disk form
+            "a".repeat(64),                  // missing trailing newline
+            format!("{}x\n", "a".repeat(63)), // not hex
+        ] {
+            let path = dir.path().join("bad.key");
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                load_auth_credential(Some(path.to_str().unwrap())).is_err(),
+                "malformed credential must fail managed startup closed"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_carries_the_token_only_when_present() {
+        let with = serde_json::to_string(&ControlRequest {
+            version: API_VERSION,
+            id: "t1".into(),
+            method: "EnsureLeshyRoute".into(),
+            leshy_route: None,
+            privileged_auth: Some("a".repeat(64)),
+        })
+        .unwrap();
+        assert!(
+            with.contains("privileged_auth"),
+            "token must travel: {with}"
+        );
+
+        let without = serde_json::to_string(&ControlRequest {
+            version: API_VERSION,
+            id: "t2".into(),
+            method: "Handshake".into(),
+            leshy_route: None,
+            privileged_auth: None,
+        })
+        .unwrap();
+        assert!(
+            !without.contains("privileged_auth"),
+            "unconfigured installs keep the legacy wire shape: {without}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod auth_wire_tests {
+    use super::fake::{applied_result, FakeTransport};
+    use super::KikimoraRouteBackend;
+    use crate::routing::backend::{fake::host_intent_v4, RouteBackend};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn ensure_request_records_the_bearer_credential() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        transport.set_credential(Some("a".repeat(64)));
+        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+
+        let intent = host_intent_v4(10, 0, 0, 1, "corp");
+        backend.ensure_route(&intent).await.unwrap();
+
+        let requests = transport.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].privileged_auth.as_deref(),
+            Some("a".repeat(64).as_str()),
+            "privileged requests must carry the service credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_request_without_credential_keeps_legacy_shape() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+
+        let intent = host_intent_v4(10, 0, 0, 1, "corp");
+        backend.ensure_route(&intent).await.unwrap();
+
+        let requests = transport.recorded_requests();
+        assert_eq!(requests[0].privileged_auth, None);
     }
 }
