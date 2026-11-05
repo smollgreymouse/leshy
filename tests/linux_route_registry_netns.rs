@@ -334,3 +334,13 @@ async fn real_kernel_dual_stack_through_one_device() {
 {table}"
     );
 }
+
+// 08D1 stage skeleton (packet §32 Stage 0 item 4): remove #[ignore] at the
+// start of stage L11 and drive it green there.
+#[test]
+#[ignore = "stage L11: external /128 delete must be restored by the IPv6 route event in <5s (packet §16.5/§16.6)"]
+fn ipv6_route_event_restores_externally_deleted_128() {
+    // Owner stage L11 adds RTNLGRP_IPV6_ROUTE membership to the monitor and
+    // proves an externally deleted /128 selected route is restored by the
+    // event path, not by the 30s periodic audit.
+}
