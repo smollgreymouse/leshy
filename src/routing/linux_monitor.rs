@@ -151,6 +151,8 @@ fn classify(buffer: &[u8]) -> Option<RouteInvalidation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netlink_packet_route::route::RouteAddress;
+    use std::net::IpAddr;
     use std::net::Ipv4Addr;
 
     fn key(a: u8, b: u8, c: u8, d: u8) -> RouteKey {
@@ -239,5 +241,88 @@ mod tests {
     fn garbage_is_ignored() {
         assert_eq!(classify(&[0u8; 4]), None);
         assert_eq!(classify(&[]), None);
+    }
+
+    // --- classify coverage: real serialized netlink messages ---------------
+
+    fn serialize(payload: RouteNetlinkMessage) -> Vec<u8> {
+        let message = NetlinkMessage::from(payload);
+        let mut bytes = Vec::new();
+        message.serialize(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn classify_ignores_non_main_tables() {
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.header.table = 999;
+        msg.header.destination_prefix_length = 32;
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Destination(
+                RouteAddress::Inet(Ipv4Addr::new(10, 0, 0, 1)),
+            ));
+        let bytes = serialize(RouteNetlinkMessage::NewRoute(msg));
+        assert_eq!(classify(&bytes), None, "a non-main table must be ignored");
+    }
+
+    #[test]
+    fn classify_del_route_yields_prefix_invalidation() {
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.header.table = MAIN_TABLE as u8;
+        msg.header.destination_prefix_length = 32;
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Destination(
+                RouteAddress::Inet(Ipv4Addr::new(10, 5, 5, 5)),
+            ));
+        let bytes = serialize(RouteNetlinkMessage::DelRoute(msg));
+        let signal = classify(&bytes).expect("a DelRoute on the main table must classify");
+        match signal {
+            RouteInvalidation::Prefix(key) => {
+                assert_eq!(
+                    key.prefix,
+                    RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(10, 5, 5, 5)))
+                );
+            }
+            other => panic!("expected a prefix invalidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_new_route_yields_prefix_invalidation() {
+        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        msg.header.table = MAIN_TABLE as u8;
+        msg.header.destination_prefix_length = 128;
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Destination(
+                RouteAddress::Inet6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            ));
+        let bytes = serialize(RouteNetlinkMessage::NewRoute(msg));
+        let signal = classify(&bytes).expect("a NewRoute on the main table must classify");
+        match signal {
+            RouteInvalidation::Prefix(key) => {
+                assert_eq!(
+                    key.prefix,
+                    RoutePrefix::host(IpAddr::V6(std::net::Ipv6Addr::new(
+                        0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+                    )))
+                );
+            }
+            other => panic!("expected a prefix invalidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_new_link_yields_interface_invalidation() {
+        let msg = netlink_packet_route::link::LinkMessage::default();
+        let bytes = serialize(RouteNetlinkMessage::NewLink(msg));
+        let signal = classify(&bytes).expect("a link event must classify");
+        assert!(matches!(signal, RouteInvalidation::Interface(_)));
+    }
+
+    #[test]
+    fn classify_ignores_routes_without_a_destination() {
+        let msg = netlink_packet_route::route::RouteMessage::default();
+        let bytes = serialize(RouteNetlinkMessage::NewRoute(msg));
+        assert_eq!(classify(&bytes), None, "no destination -> no key");
     }
 }

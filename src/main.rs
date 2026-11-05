@@ -21,7 +21,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Manage system service installation
     Service {
@@ -30,7 +30,7 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum ServiceAction {
     /// Install as a system service (systemd on Linux, launchd on macOS)
     Install {
@@ -86,4 +86,77 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn default_invocation_has_no_command() {
+        let cli = Cli::try_parse_from(["leshy"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn config_is_a_positional_argument() {
+        let cli = Cli::try_parse_from(["leshy", "/etc/leshy/c.toml"]).unwrap();
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/etc/leshy/c.toml"))
+        );
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn service_install_has_its_own_config_flag() {
+        let cli = Cli::try_parse_from([
+            "leshy",
+            "service",
+            "install",
+            "--config",
+            "/etc/leshy/c.toml",
+            "--name",
+            "leshy-corp",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Service {
+                action: ServiceAction::Install { config, name },
+            }) => {
+                assert_eq!(config, PathBuf::from("/etc/leshy/c.toml"));
+                assert_eq!(name, "leshy-corp");
+            }
+            other => panic!("expected service install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_uninstall_parses_the_name() {
+        let cli =
+            Cli::try_parse_from(["leshy", "service", "uninstall", "--name", "leshy-corp"]).unwrap();
+        match cli.command {
+            Some(Command::Service {
+                action: ServiceAction::Uninstall { name },
+            }) => {
+                assert_eq!(name, "leshy-corp");
+            }
+            other => panic!("expected service uninstall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_word_is_a_config_path_not_a_subcommand() {
+        // The positional config means unknown words never become
+        // subcommands: "frobnicate" is a config path that will then fail to
+        // load, which is the documented behavior.
+        let cli = Cli::try_parse_from(["leshy", "frobnicate"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("frobnicate"))
+        );
+    }
 }

@@ -206,7 +206,8 @@ async fn dns_server_binds_and_answers_over_udp() -> anyhow::Result<()> {
     sock.send_to(&query, known).await?;
     let mut buf = vec![0u8; 512];
     let (len, _from) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), sock.recv_from(&mut buf)).await??;
+        tokio::time::timeout(std::time::Duration::from_secs(10), sock.recv_from(&mut buf))
+            .await??;
     assert!(len > 12, "a DNS response must come back ({} bytes)", len);
     // No zone matched and the upstream is unreachable: NXDOMAIN/SERVFAIL is
     // fine — the point is that the serve loop answered.

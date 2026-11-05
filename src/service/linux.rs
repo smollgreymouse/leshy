@@ -31,11 +31,7 @@ WantedBy=multi-user.target
 }
 
 pub fn install(name: &str, binary: &Path, config: &Path) -> Result<()> {
-    let path = unit_path(name);
-    let unit = generate_unit(name, binary, config);
-
-    std::fs::write(&path, &unit)
-        .with_context(|| format!("failed to write unit file to {}", path.display()))?;
+    let path = write_unit_file(unit_path(name), &generate_unit(name, binary, config))?;
     println!("Wrote {}", path.display());
 
     let status = Command::new("systemctl")
@@ -56,6 +52,14 @@ pub fn install(name: &str, binary: &Path, config: &Path) -> Result<()> {
 
     println!("Service {name} enabled. Start it with: sudo systemctl start {name}");
     Ok(())
+}
+
+/// Write the unit file to an explicit path. Split out of `install` so the
+/// fs-only part stays testable without systemctl.
+fn write_unit_file(path: PathBuf, unit: &str) -> Result<PathBuf> {
+    std::fs::write(&path, unit)
+        .with_context(|| format!("failed to write unit file to {}", path.display()))?;
+    Ok(path)
 }
 
 pub fn uninstall(name: &str) -> Result<()> {
@@ -108,4 +112,28 @@ mod tests {
         );
         assert!(unit.contains("Description=leshy-corp"));
     }
+}
+
+#[test]
+fn write_unit_file_writes_content_to_an_explicit_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leshy-test.service");
+    let written = write_unit_file(
+        path.clone(),
+        "[Unit]
+Description=test
+",
+    )
+    .unwrap();
+    assert_eq!(written, path);
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.contains("Description=test"));
+}
+
+#[test]
+fn unit_path_lands_in_systemd_dir() {
+    assert_eq!(
+        unit_path("leshy-corp"),
+        PathBuf::from("/etc/systemd/system/leshy-corp.service")
+    );
 }
