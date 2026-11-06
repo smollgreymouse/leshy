@@ -26,8 +26,10 @@ pub use model::{
 pub use registry::{ReconcileReport, RouteError};
 
 /// Direct handle on the kernel invalidation stream for the disposable-namespace
-/// monitor probe (`tests/netns_monitor_probe.rs`).
+/// monitor probe (`tests/netns_monitor_probe.rs`). The probe uses the lib
+/// export; the bin's shared module tree never calls it, hence the allow.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn spawn_monitor_probe(
 ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<backend::RouteInvalidation>> {
     linux_monitor::spawn_monitor()
