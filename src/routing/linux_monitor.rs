@@ -255,7 +255,9 @@ mod tests {
     #[test]
     fn classify_ignores_non_main_tables() {
         let mut msg = netlink_packet_route::route::RouteMessage::default();
-        msg.header.table = 999;
+        // A valid non-main table (08D1 §16.5): 999 overflows the u8 header
+        // field and breaks the Linux build.
+        msg.header.table = 253;
         msg.header.destination_prefix_length = 32;
         msg.attributes
             .push(netlink_packet_route::route::RouteAttribute::Destination(
