@@ -19,9 +19,12 @@
 
 use crate::config::ZoneConfig;
 use crate::routing::backend::{
-    ControllerDenied, EnsureOutcome, RouteBackend, RouteConflict, RouteInvalidation,
+    ControllerDenied, EnsureOutcome, EnsureResult, ReconcileMode, RouteBackend, RouteConflict,
+    RouteInvalidation,
 };
-use crate::routing::model::{AddressFamily, ObservedRoute, RouteIntent, RouteSource, RouteTarget};
+use crate::routing::model::{
+    AddressFamily, ObservedRoute, RouteIntent, RouteOwnership, RouteSource, RouteTarget,
+};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -389,7 +392,11 @@ impl RouteBackend for KikimoraRouteBackend {
         })
     }
 
-    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
+    async fn ensure_route(
+        &self,
+        intent: &RouteIntent,
+        _previous: Option<&RouteOwnership>,
+    ) -> Result<EnsureResult> {
         let wire = Self::wire_intent(intent);
         let (_, result) = self.transport.call("EnsureLeshyRoute", Some(&wire)).await?;
         let Some(result) = result else {
@@ -402,21 +409,42 @@ impl RouteBackend for KikimoraRouteBackend {
             state = result.state,
             "Kikimora route verdict"
         );
-        Self::map_result(result)
+        let outcome = Self::map_result(result)?;
+        // §18.2: Leshy does not own the kernel row in managed mode — the
+        // controller does. Ownership is always owned=false + observed=None.
+        Ok(EnsureResult {
+            outcome,
+            ownership: RouteOwnership {
+                owned: false,
+                observed: None,
+            },
+        })
     }
 
-    async fn remove_route(&self, intent: &RouteIntent) -> Result<()> {
+    async fn remove_route(
+        &self,
+        intent: &RouteIntent,
+        _ownership: Option<&RouteOwnership>,
+    ) -> Result<()> {
+        // §18.2: explicit registry retirement reaches the controller through
+        // ForgetLeshyRoute regardless of the local ownership flag — the flag
+        // governs local kernel deletion only.
         let wire = Self::wire_intent(intent);
         self.transport.call("ForgetLeshyRoute", Some(&wire)).await?;
         Ok(())
     }
 
+    fn reconcile_mode(&self) -> ReconcileMode {
+        ReconcileMode::AuthorityOnDemand
+    }
+
     async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
-        // The controller is the writer and verifies its own rows; its verdict
-        // on every Ensure/Forget is the observation. A reconcile therefore
-        // re-asks the controller per dirty entry, which answers
-        // idempotently.
-        Ok(Vec::new())
+        // §18.3: the managed backend has no local kernel snapshot — an empty
+        // vector would be misread as "every route missing". Authority is
+        // demand-driven (L14 implements the dispatch).
+        anyhow::bail!(
+            "managed Kikimora backend has no local kernel snapshot; authority is demand-driven"
+        );
     }
 
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
@@ -745,8 +773,11 @@ mod tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
-        let outcome = backend.ensure_route(&intent).await.unwrap();
-        assert_eq!(outcome, EnsureOutcome::Added);
+        let result = backend.ensure_route(&intent, None).await.unwrap();
+        assert_eq!(result.outcome, EnsureOutcome::Added);
+        // §18.2: managed ownership is always controller-held.
+        assert!(!result.ownership.owned);
+        assert!(result.ownership.observed.is_none());
     }
 
     #[tokio::test]
@@ -758,8 +789,9 @@ mod tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
-        let outcome = backend.ensure_route(&intent).await.unwrap();
-        assert_eq!(outcome, EnsureOutcome::AlreadyMatching);
+        let result = backend.ensure_route(&intent, None).await.unwrap();
+        assert_eq!(result.outcome, EnsureOutcome::AlreadyMatching);
+        assert!(!result.ownership.owned);
     }
 
     #[tokio::test]
@@ -771,7 +803,7 @@ mod tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
-        let err = backend.ensure_route(&intent).await.unwrap_err();
+        let err = backend.ensure_route(&intent, None).await.unwrap_err();
         assert!(err.downcast_ref::<ControllerDenied>().is_some());
     }
 
@@ -784,7 +816,7 @@ mod tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
-        let err = backend.ensure_route(&intent).await.unwrap_err();
+        let err = backend.ensure_route(&intent, None).await.unwrap_err();
         assert!(err.downcast_ref::<RouteConflict>().is_some());
     }
 
@@ -795,7 +827,7 @@ mod tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
-        let err = backend.ensure_route(&intent).await.unwrap_err();
+        let err = backend.ensure_route(&intent, None).await.unwrap_err();
         // Not a safety denial: the legacy failure mode may apply.
         assert!(err.downcast_ref::<ControllerDenied>().is_none());
         assert!(err.downcast_ref::<RouteConflict>().is_none());
@@ -808,7 +840,7 @@ mod tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
-        backend.ensure_route(&intent).await.unwrap();
+        backend.ensure_route(&intent, None).await.unwrap();
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
@@ -849,7 +881,7 @@ mod tests {
         intent.key.prefix =
             crate::routing::RoutePrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8).unwrap();
         intent.source = RouteSource::Static;
-        backend.ensure_route(&intent).await.unwrap();
+        backend.ensure_route(&intent, None).await.unwrap();
 
         let requests = transport.requests();
         let encoded = serde_json::to_value(requests[0].leshy_route.as_ref().unwrap()).unwrap();
@@ -878,7 +910,7 @@ mod tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
-        backend.remove_route(&intent).await.unwrap();
+        backend.remove_route(&intent, None).await.unwrap();
         let requests = transport.requests();
         assert_eq!(requests[0].method, "ForgetLeshyRoute");
     }
@@ -1130,7 +1162,7 @@ mod auth_wire_tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent_v4(10, 0, 0, 1, "corp");
-        backend.ensure_route(&intent).await.unwrap();
+        backend.ensure_route(&intent, None).await.unwrap();
 
         let requests = transport.recorded_requests();
         assert_eq!(requests.len(), 1);
@@ -1148,7 +1180,7 @@ mod auth_wire_tests {
         let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
 
         let intent = host_intent_v4(10, 0, 0, 1, "corp");
-        backend.ensure_route(&intent).await.unwrap();
+        backend.ensure_route(&intent, None).await.unwrap();
 
         let requests = transport.recorded_requests();
         assert_eq!(requests[0].privileged_auth, None);

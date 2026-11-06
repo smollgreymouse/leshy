@@ -8,6 +8,7 @@
 use super::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
 use super::model::{AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget};
 use crate::config::{RouteType, ZoneConfig};
+use crate::routing::model::RouteKernelIdentity;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -117,8 +118,7 @@ impl LinuxRouteBackend {
                     table: MAIN_TABLE,
                 },
                 target,
-                protocol: msg.header.protocol.into(),
-                metric: 0,
+                identity: linux_identity_of(&msg),
             });
         }
         Ok(out)
@@ -307,6 +307,38 @@ fn destination_of(msg: &netlink_packet_route::route::RouteMessage) -> Option<IpA
 }
 
 /// Extract the forwarding target from a route message.
+/// Captures the exact kernel identity of one route message (08D1 §16.4):
+/// the OIF even for gateway routes, the gateway as next hop, protocol, the
+/// metric/priority (default 0 only when the kernel attribute is absent) and
+/// the scope.
+fn linux_identity_of(msg: &netlink_packet_route::route::RouteMessage) -> RouteKernelIdentity {
+    let mut oif = None;
+    let mut gateway = None;
+    let mut metric = 0;
+    for attr in msg.attributes.iter() {
+        match attr {
+            netlink_packet_route::route::RouteAttribute::Oif(index) => oif = Some(*index),
+            netlink_packet_route::route::RouteAttribute::Gateway(gw) => match gw {
+                RouteAddress::Inet(v4) => gateway = Some(IpAddr::V4(*v4)),
+                RouteAddress::Inet6(v6) => gateway = Some(IpAddr::V6(*v6)),
+                _ => {}
+            },
+            netlink_packet_route::route::RouteAttribute::Priority(priority) => {
+                metric = *priority;
+            }
+            _ => {}
+        }
+    }
+    RouteKernelIdentity {
+        ifindex: oif,
+        next_hop: gateway,
+        protocol: msg.header.protocol.into(),
+        metric,
+        scope: u8::from(msg.header.scope),
+        interface_luid: None,
+    }
+}
+
 fn target_of(
     msg: &netlink_packet_route::route::RouteMessage,
     names: &HashMap<u32, String>,
@@ -369,12 +401,29 @@ impl RouteBackend for LinuxRouteBackend {
         }
     }
 
-    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
-        // A row already occupying this prefix decides the outcome: an exact
-        // match is a no-op, anything else is a conflict we must not clobber.
+    async fn ensure_route(
+        &self,
+        intent: &RouteIntent,
+        previous: Option<&RouteOwnership>,
+    ) -> Result<EnsureResult> {
+        // A row already occupying this prefix decides the outcome: the
+        // previous exact Owned observation is the only row this backend may
+        // treat as its own; a compatible pre-existing row may satisfy
+        // forwarding but is owned=false; anything else is a foreign row we
+        // must not clobber (08D1 §14.4, §31.24 trust boundary).
         if let Some(existing) = self.find_row(intent).await? {
             if existing.target == intent.target {
-                return Ok(EnsureOutcome::AlreadyMatching);
+                let owned = previous
+                    .and_then(|o| o.observed.as_ref())
+                    .map(|o| o.identity == existing.identity)
+                    .unwrap_or(false);
+                return Ok(EnsureResult {
+                    outcome: EnsureOutcome::AlreadyMatching,
+                    ownership: RouteOwnership {
+                        owned,
+                        observed: Some(existing),
+                    },
+                });
             }
             return Err(self.conflict_error(intent, &existing.target));
         }
@@ -388,7 +437,17 @@ impl RouteBackend for LinuxRouteBackend {
             if Self::is_busy_class(&e) {
                 match self.find_row(intent).await? {
                     Some(row) if row.target == intent.target => {
-                        return Ok(EnsureOutcome::AlreadyMatching);
+                        let owned = previous
+                            .and_then(|o| o.observed.as_ref())
+                            .map(|o| o.identity == row.identity)
+                            .unwrap_or(false);
+                        return Ok(EnsureResult {
+                            outcome: EnsureOutcome::AlreadyMatching,
+                            ownership: RouteOwnership {
+                                owned,
+                                observed: Some(row),
+                            },
+                        });
                     }
                     Some(row) => return Err(self.conflict_error(intent, &row.target)),
                     None => {
@@ -402,9 +461,16 @@ impl RouteBackend for LinuxRouteBackend {
             return Err(e);
         }
 
-        // Read back: the kernel is the only proof the route exists.
+        // Read back: the kernel is the only proof the route exists — and the
+        // returned ownership carries the exact identity this process created.
         match self.find_row(intent).await? {
-            Some(row) if row.target == intent.target => Ok(EnsureOutcome::Added),
+            Some(row) if row.target == intent.target => Ok(EnsureResult {
+                outcome: EnsureOutcome::Added,
+                ownership: RouteOwnership {
+                    owned: true,
+                    observed: Some(row),
+                },
+            }),
             // Something else took the destination between our add and the
             // read-back; treat it as a foreign route, not ours to fix.
             Some(row) => Err(self.conflict_error(intent, &row.target)),
@@ -415,20 +481,42 @@ impl RouteBackend for LinuxRouteBackend {
         }
     }
 
-    async fn remove_route(&self, intent: &RouteIntent) -> Result<()> {
+    async fn remove_route(
+        &self,
+        intent: &RouteIntent,
+        ownership: Option<&RouteOwnership>,
+    ) -> Result<()> {
+        // §14.5: no ownership or owned=false performs no kernel deletion; a
+        // local owned=true row must carry its exact observation (invariant).
+        let Some(ownership) = ownership else {
+            return Ok(());
+        };
+        if !ownership.owned {
+            return Ok(());
+        }
+        let Some(observed) = &ownership.observed else {
+            anyhow::bail!(
+                "owned route {} lost its exact observation: cleanup invariant violated",
+                intent.key.prefix.network
+            );
+        };
         match self.find_row(intent).await? {
-            // Only delete a row Leshy owns; a foreign row on the same prefix
-            // belongs to someone else.
-            Some(row) if row.target == intent.target => self.delete_row(intent).await,
+            // Delete only the exact owned identity; a foreign row on the
+            // same prefix belongs to someone else.
+            Some(row) if row.identity == observed.identity && row.target == intent.target => {
+                self.delete_row(intent).await
+            }
             Some(row) => {
                 tracing::debug!(
                     prefix = %intent.key.prefix.network,
                     prefix_len = intent.key.prefix.prefix_len,
                     owner = ?row.target,
-                    "Leaving a foreign route in place"
+                    identity = ?row.identity,
+                    "Leaving a non-owned row in place"
                 );
                 Ok(())
             }
+            // The exact owned row is already gone: absence is success.
             None => Ok(()),
         }
     }

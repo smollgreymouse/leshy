@@ -319,7 +319,10 @@ impl RouteManager {
                 };
                 self.ensure_intent(intent).await.map(|_| ())
             }
-            RouteAction::Remove(intent) => self.backend.remove_route(intent).await,
+            // §14.4: the aggregated Remove bypasses the registry, so the
+            // exact owned identity is unknown here; the L11 registry path
+            // (remove_all_owned/retire) owns the authoritative cleanup.
+            RouteAction::Remove(intent) => self.backend.remove_route(intent, None).await,
         }
     }
 
@@ -686,8 +689,14 @@ mod tests {
         backend.push_observed(ObservedRoute {
             key: ensured[0].key.clone(),
             target: ensured[0].target.clone(),
-            protocol: 3,
-            metric: 0,
+            identity: crate::routing::model::RouteKernelIdentity {
+                ifindex: None,
+                next_hop: None,
+                protocol: 3,
+                metric: 0,
+                scope: 0,
+                interface_luid: None,
+            },
         });
 
         let report = mgr.reconcile_all().await.unwrap();
@@ -812,8 +821,14 @@ mod tests {
         backend.push_observed(ObservedRoute {
             key: intent.key,
             target: intent.target,
-            protocol: 0,
-            metric: 0,
+            identity: crate::routing::model::RouteKernelIdentity {
+                ifindex: None,
+                next_hop: None,
+                protocol: 0,
+                metric: 0,
+                scope: 0,
+                interface_luid: None,
+            },
         });
 
         // Reload replay: re-applying the identical state mutates nothing.
@@ -838,8 +853,14 @@ mod tests {
                 backend.push_observed(ObservedRoute {
                     key: intent.key,
                     target: intent.target,
-                    protocol: 0,
-                    metric: 0,
+                    identity: crate::routing::model::RouteKernelIdentity {
+                        ifindex: None,
+                        next_hop: None,
+                        protocol: 0,
+                        metric: 0,
+                        scope: 0,
+                        interface_luid: None,
+                    },
                 });
             }
         }

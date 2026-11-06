@@ -6,9 +6,10 @@
 //! `ensure_route` therefore compares the full row identity before reporting a
 //! match, and replaces a stale row the way the Kikimora Go route owner does.
 
-use super::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
+use super::backend::{EnsureOutcome, EnsureResult, RouteBackend, RouteInvalidation};
 use super::model::{
-    family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget,
+    family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKernelIdentity, RouteKey,
+    RouteOwnership, RoutePrefix, RouteTarget,
 };
 use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
@@ -384,8 +385,16 @@ fn dump_family(family: ADDRESS_FAMILY) -> Result<Vec<ObservedRoute>> {
                     table: MAIN_TABLE,
                 },
                 target,
-                protocol: row.Protocol.0 as u8,
-                metric: row.Metric,
+                identity: RouteKernelIdentity {
+                    ifindex: Some(row.InterfaceIndex),
+                    next_hop: next_hop.filter(|hop| !hop.is_unspecified()),
+                    protocol: row.Protocol.0 as u8,
+                    metric: row.Metric,
+                    scope: 0,
+                    // §31.19: the LUID is part of the exact Windows
+                    // identity; the union's Value field carries the u64.
+                    interface_luid: Some(row.InterfaceLuid.Value),
+                },
             });
         }
     }
@@ -540,7 +549,11 @@ impl RouteBackend for WindowsRouteBackend {
         }
     }
 
-    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
+    async fn ensure_route(
+        &self,
+        intent: &RouteIntent,
+        previous: Option<&RouteOwnership>,
+    ) -> Result<EnsureResult> {
         let prefix = &intent.key.prefix;
         let family = if prefix.family() == AddressFamily::V6 {
             AF_INET6
@@ -551,7 +564,8 @@ impl RouteBackend for WindowsRouteBackend {
         let mut row = row_for_intent(intent)?;
 
         // An exact row already present is a no-op; anything else is replaced by
-        // `create_route`, which keeps the historical Windows behaviour.
+        // `create_route`, which keeps the historical Windows behaviour until
+        // L12 replaces it with the exact-identity writer (08D1 §41.3).
         let existing = find_route_rows(family, prefix.network, prefix.prefix_len)?;
         let already_matching = existing.iter().any(|candidate| {
             candidate.InterfaceIndex == row.InterfaceIndex
@@ -559,21 +573,65 @@ impl RouteBackend for WindowsRouteBackend {
                 && sockaddr_to_ip(&candidate.NextHop) == sockaddr_to_ip(&row.NextHop)
         });
         if already_matching {
-            return Ok(EnsureOutcome::AlreadyMatching);
+            let observed = existing
+                .iter()
+                .find(|candidate| {
+                    candidate.InterfaceIndex == row.InterfaceIndex && candidate.Metric == row.Metric
+                })
+                .map(|candidate| ObservedRoute {
+                    key: intent.key.clone(),
+                    target: intent.target.clone(),
+                    identity: RouteKernelIdentity {
+                        ifindex: Some(candidate.InterfaceIndex),
+                        next_hop: sockaddr_to_ip(&candidate.NextHop)
+                            .filter(|hop| !hop.is_unspecified()),
+                        protocol: candidate.Protocol.0 as u8,
+                        metric: candidate.Metric,
+                        scope: 0,
+                        interface_luid: Some(unsafe { candidate.InterfaceLuid.Value }),
+                    },
+                });
+            let owned = previous
+                .and_then(|o| o.observed.as_ref())
+                .zip(observed.as_ref())
+                .map(|(prev, now)| prev.identity == now.identity)
+                .unwrap_or(false);
+            return Ok(EnsureResult {
+                outcome: EnsureOutcome::AlreadyMatching,
+                ownership: RouteOwnership { owned, observed },
+            });
         }
 
         create_route(&mut row, prefix.network, "leshy")?;
-        Ok(EnsureOutcome::Added)
+        Ok(EnsureResult {
+            outcome: EnsureOutcome::Added,
+            ownership: RouteOwnership {
+                owned: true,
+                observed: None,
+            },
+        })
     }
 
-    async fn remove_route(&self, intent: &RouteIntent) -> Result<()> {
-        let prefix = &intent.key.prefix;
-        let family = if prefix.family() == AddressFamily::V6 {
-            AF_INET6
-        } else {
-            AF_INET
-        };
-        delete_routes(family, prefix.network, prefix.prefix_len)
+    async fn remove_route(
+        &self,
+        intent: &RouteIntent,
+        ownership: Option<&RouteOwnership>,
+    ) -> Result<()> {
+        // §14.5: no ownership or owned=false performs no kernel deletion.
+        // The broad same-prefix delete remains the Windows stopgap until L12
+        // replaces it with the exact-identity writer.
+        match ownership {
+            Some(RouteOwnership { owned: true, .. }) => {
+                let prefix = &intent.key.prefix;
+                let family = if prefix.family() == AddressFamily::V6 {
+                    AF_INET6
+                } else {
+                    AF_INET
+                };
+                delete_routes(family, prefix.network, prefix.prefix_len)
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {

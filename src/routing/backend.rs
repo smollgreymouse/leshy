@@ -15,7 +15,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use super::model::{AddressFamily, ObservedRoute, RouteIntent, RouteKey, RouteTarget};
+use super::model::{
+    AddressFamily, ObservedRoute, RouteIntent, RouteKey, RouteOwnership, RouteTarget,
+};
 
 /// Outcome of a successful `ensure_route`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,17 +96,59 @@ pub(crate) trait RouteBackend: Send + Sync {
         -> Result<RouteTarget>;
 
     /// Install the route unless the kernel already has exactly this route.
-    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome>;
+    /// `previous` carries the ownership recorded by the caller: a previous
+    /// exact owned observation is the only row a backend may replace or
+    /// delete, and any other same-key row is foreign (08D1 §14.2).
+    async fn ensure_route(
+        &self,
+        intent: &RouteIntent,
+        previous: Option<&RouteOwnership>,
+    ) -> Result<EnsureResult>;
 
     /// Remove a route owned by Leshy. A foreign route on the same destination
-    /// must never be deleted.
-    async fn remove_route(&self, intent: &RouteIntent) -> Result<()>;
+    /// must never be deleted; `ownership: None` or `owned: false` performs
+    /// no kernel deletion (08D1 §14.5).
+    async fn remove_route(
+        &self,
+        intent: &RouteIntent,
+        ownership: Option<&RouteOwnership>,
+    ) -> Result<()>;
 
     /// Read the kernel routing table.
     async fn snapshot(&self) -> Result<Vec<ObservedRoute>>;
 
     /// Kernel invalidation stream, when the platform can observe changes.
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>>;
+
+    /// How this backend reconciles against the kernel (08D1 §14.2). The
+    /// default is the local KernelSnapshot contract.
+    fn reconcile_mode(&self) -> ReconcileMode {
+        ReconcileMode::KernelSnapshot
+    }
+}
+
+/// The result of one ensure: the outcome plus the exact ownership the
+/// backend holds after the call (08D1 §14.2). `ownership.owned == true`
+/// means this process created the row and may delete it; a pre-existing
+/// compatible row returns `owned: false` with the exact observation.
+#[derive(Debug, Clone)]
+pub(crate) struct EnsureResult {
+    pub outcome: EnsureOutcome,
+    pub ownership: RouteOwnership,
+}
+
+/// How a backend reconciles its rows against the kernel (08D1 §14.2):
+/// - KernelSnapshot: local platforms with a real kernel snapshot and
+///   invalidation stream (Linux/Windows local);
+/// - AuthorityOnDemand: the Kikimora managed backend — the controller owns
+///   the kernel rows, dirty entries revalidate on demand, never a bulk RPC;
+/// - RegistryOnly: the macOS shell backend — no kernel snapshot is
+///   attempted, so registry cleanup uses only what the process created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileMode {
+    KernelSnapshot,
+    AuthorityOnDemand,
+    RegistryOnly,
 }
 
 /// Test backend with mutation counters and scripted outcomes.
@@ -260,20 +304,41 @@ pub(crate) mod fake {
             }
         }
 
-        async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
+        async fn ensure_route(
+            &self,
+            intent: &RouteIntent,
+            _previous: Option<&RouteOwnership>,
+        ) -> Result<EnsureResult> {
             self.state.ensures.fetch_add(1, Ordering::SeqCst);
             self.state.ensured.lock().unwrap().push(intent.clone());
             if let Some((prefix, owner)) = self.state.conflict.lock().unwrap().clone() {
                 return Err(anyhow::anyhow!(super::RouteConflict { prefix, owner }));
             }
-            match self.state.outcome.lock().unwrap().as_ref() {
-                Some(Ok(outcome)) => Ok(*outcome),
-                Some(Err(e)) => Err(anyhow::anyhow!("{e}")),
-                None => Ok(EnsureOutcome::Added),
-            }
+            let outcome = match self.state.outcome.lock().unwrap().as_ref() {
+                Some(Ok(outcome)) => *outcome,
+                Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
+                None => EnsureOutcome::Added,
+            };
+            // The fake reports ownership without a kernel: Added rows are
+            // this process's, AlreadyMatching rows are pre-existing.
+            let ownership = match outcome {
+                EnsureOutcome::Added => RouteOwnership {
+                    owned: true,
+                    observed: None,
+                },
+                EnsureOutcome::AlreadyMatching => RouteOwnership {
+                    owned: false,
+                    observed: None,
+                },
+            };
+            Ok(EnsureResult { outcome, ownership })
         }
 
-        async fn remove_route(&self, intent: &RouteIntent) -> Result<()> {
+        async fn remove_route(
+            &self,
+            intent: &RouteIntent,
+            _ownership: Option<&RouteOwnership>,
+        ) -> Result<()> {
             self.state.removes.fetch_add(1, Ordering::SeqCst);
             self.state.removed.lock().unwrap().push(intent.clone());
             Ok(())
@@ -332,7 +397,7 @@ pub(crate) mod fake {
             let backend = FakeBackend::new();
             let intent = host_intent_v4(10, 0, 0, 1, "corp");
             assert_eq!(
-                backend.ensure_route(&intent).await.unwrap(),
+                backend.ensure_route(&intent, None).await.unwrap().outcome,
                 EnsureOutcome::Added
             );
             assert_eq!(backend.ensure_count(), 1);
@@ -345,7 +410,7 @@ pub(crate) mod fake {
             backend.set_outcome(Ok(EnsureOutcome::AlreadyMatching));
             let intent = host_intent_v4(10, 0, 0, 1, "corp");
             assert_eq!(
-                backend.ensure_route(&intent).await.unwrap(),
+                backend.ensure_route(&intent, None).await.unwrap().outcome,
                 EnsureOutcome::AlreadyMatching
             );
         }
@@ -355,7 +420,7 @@ pub(crate) mod fake {
             let backend = FakeBackend::new();
             backend.set_outcome(Err(anyhow::anyhow!("netlink said no")));
             let intent = host_intent_v4(10, 0, 0, 1, "corp");
-            assert!(backend.ensure_route(&intent).await.is_err());
+            assert!(backend.ensure_route(&intent, None).await.is_err());
         }
 
         #[tokio::test]
@@ -377,8 +442,8 @@ pub(crate) mod fake {
         async fn counters_are_independent() {
             let backend = FakeBackend::new();
             let intent = host_intent_v4(10, 0, 0, 1, "corp");
-            backend.ensure_route(&intent).await.unwrap();
-            backend.remove_route(&intent).await.unwrap();
+            backend.ensure_route(&intent, None).await.unwrap();
+            backend.remove_route(&intent, None).await.unwrap();
             backend.snapshot().await.unwrap();
             assert_eq!(backend.ensure_count(), 1);
             assert_eq!(backend.remove_count(), 1);

@@ -31,8 +31,10 @@ use tokio::sync::{Mutex, RwLock};
 struct RouteEntry {
     /// The most recent desired intent for this key.
     desired: Option<RouteIntent>,
-    /// The last observed kernel route (from a snapshot).
-    observed: Option<ObservedRoute>,
+    /// The explicit ownership the backend returned (08D1 §14.3): `owned`
+    /// rows may be deleted at cleanup; pre-existing compatible rows are
+    /// owned=false. A successful local Ensure stores the returned ownership.
+    ownership: Option<RouteOwnership>,
     /// Current state of this entry.
     state: RouteState,
     /// Epoch of the last dirty marking.
@@ -100,7 +102,7 @@ impl RouteRegistry {
                     }
                     let entry = Arc::new(Mutex::new(RouteEntry {
                         desired: None,
-                        observed: None,
+                        ownership: None,
                         state: RouteState::Pending,
                         dirty_epoch: 0,
                         verified_epoch: 0,
@@ -129,9 +131,14 @@ impl RouteRegistry {
         // Update desired state.
         locked.desired = Some(intent.clone());
 
-        // Call the backend.
-        let outcome = match backend.ensure_route(&intent).await {
-            Ok(o) => o,
+        // Call the backend with the previously recorded ownership (§14.2):
+        // the backend's exact-previous-Owned observation is the only row it
+        // may replace or delete.
+        let result = match backend
+            .ensure_route(&intent, locked.ownership.as_ref())
+            .await
+        {
+            Ok(r) => r,
             Err(e) => {
                 locked.state = RouteState::Error;
                 locked.last_error = Some(e.to_string());
@@ -147,12 +154,15 @@ impl RouteRegistry {
             }
         };
 
-        // Only mark Verified on success.
+        // Only mark Verified on success, and store the returned ownership:
+        // cleanup deletes only owned rows through the exact observation
+        // (§14.3/§14.5).
         locked.state = RouteState::Verified;
         locked.verified_epoch = kernel_epoch;
+        locked.ownership = Some(result.ownership);
         locked.last_error = None;
 
-        Ok(outcome)
+        Ok(result.outcome)
     }
 
     /// Mark entries dirty based on an invalidation signal.
@@ -241,19 +251,20 @@ impl RouteRegistry {
                 locked.dirty_epoch = epoch;
                 noops += 1;
             } else {
-                // Re-apply the route.
-                match backend.ensure_route(&intent).await {
-                    Ok(EnsureOutcome::Added) => {
+                // Re-apply the route with the recorded ownership (§14.4).
+                match backend
+                    .ensure_route(&intent, locked.ownership.as_ref())
+                    .await
+                {
+                    Ok(result) => {
+                        locked.ownership = Some(result.ownership);
                         locked.state = RouteState::Verified;
                         locked.verified_epoch = epoch;
                         locked.dirty_epoch = epoch;
-                        adds += 1;
-                    }
-                    Ok(EnsureOutcome::AlreadyMatching) => {
-                        locked.state = RouteState::Verified;
-                        locked.verified_epoch = epoch;
-                        locked.dirty_epoch = epoch;
-                        noops += 1;
+                        match result.outcome {
+                            EnsureOutcome::Added => adds += 1,
+                            EnsureOutcome::AlreadyMatching => noops += 1,
+                        }
                     }
                     Err(_) => {
                         locked.state = RouteState::Error;
@@ -289,7 +300,14 @@ impl RouteRegistry {
         let mut removed = 0usize;
         let mut errors = 0usize;
         for (key, intent) in to_remove {
-            match backend.remove_route(&intent).await {
+            let ownership = {
+                let entry = map.get(&key);
+                match entry {
+                    Some(entry) => entry.lock().await.ownership.clone(),
+                    None => None,
+                }
+            };
+            match backend.remove_route(&intent, ownership.as_ref()).await {
                 Ok(()) => {
                     map.remove(&key);
                     removed += 1;
@@ -344,10 +362,11 @@ impl RouteRegistry {
                         // A replacement intent owns this key now.
                         false
                     } else {
-                        match backend.remove_route(intent).await {
+                        let ownership = locked.ownership.clone();
+                        match backend.remove_route(intent, ownership.as_ref()).await {
                             Ok(()) => {
                                 locked.desired = None;
-                                locked.observed = None;
+                                locked.ownership = None;
                                 locked.state = RouteState::Pending;
                                 true
                             }
@@ -648,10 +667,16 @@ mod tests {
 
         // Reconcile with a matching snapshot — no-op.
         let observed = ObservedRoute {
+            identity: crate::routing::model::RouteKernelIdentity {
+                ifindex: None,
+                next_hop: None,
+                protocol: 0,
+                metric: 0,
+                scope: 0,
+                interface_luid: None,
+            },
             key: intent.key.clone(),
             target: intent.target.clone(),
-            protocol: 0,
-            metric: 0,
         };
         let report = reg.reconcile_dirty(&backend, &[observed], 2).await;
         assert_eq!(report.noops, 1);

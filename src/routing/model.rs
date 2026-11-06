@@ -127,13 +127,37 @@ pub struct RouteIntent {
     pub source: RouteSource,
 }
 
-/// A route observed in the kernel routing table.
+/// The exact kernel identity of one observed row (08D1 §14.1): every
+/// writer-controlled field the platform exposes. A previous owned exact
+/// observation is the only row a backend may replace or delete; any other
+/// same-key row is foreign. `interface_luid` is Windows-only (§31.19);
+/// Linux/macOS store `None`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteKernelIdentity {
+    pub ifindex: Option<u32>,
+    pub next_hop: Option<IpAddr>,
+    pub protocol: u8,
+    pub metric: u32,
+    pub scope: u8,
+    pub interface_luid: Option<u64>,
+}
+
+/// A route observed in the kernel routing table with its exact identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedRoute {
     pub key: RouteKey,
     pub target: RouteTarget,
-    pub protocol: u8,
-    pub metric: u32,
+    pub identity: RouteKernelIdentity,
+}
+
+/// Ownership of one installed route (08D1 §14.1): `owned` means this
+/// process created the row and may delete it; a pre-existing compatible row
+/// is `owned: false` with the exact observation attached — it may satisfy
+/// forwarding but must never be deleted as ours.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteOwnership {
+    pub owned: bool,
+    pub observed: Option<ObservedRoute>,
 }
 
 /// State of a registry entry.
