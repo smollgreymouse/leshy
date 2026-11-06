@@ -275,6 +275,7 @@ mod tests {
     fn classify_del_route_yields_prefix_invalidation() {
         let mut msg = netlink_packet_route::route::RouteMessage::default();
         msg.header.table = MAIN_TABLE as u8;
+        msg.header.address_family = netlink_packet_route::AddressFamily::Inet;
         msg.header.destination_prefix_length = 32;
         msg.attributes
             .push(netlink_packet_route::route::RouteAttribute::Destination(
@@ -297,6 +298,7 @@ mod tests {
     fn classify_new_route_yields_prefix_invalidation() {
         let mut msg = netlink_packet_route::route::RouteMessage::default();
         msg.header.table = MAIN_TABLE as u8;
+        msg.header.address_family = netlink_packet_route::AddressFamily::Inet6;
         msg.header.destination_prefix_length = 128;
         msg.attributes
             .push(netlink_packet_route::route::RouteAttribute::Destination(
