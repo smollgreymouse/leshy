@@ -246,8 +246,12 @@ mod tests {
     // --- classify coverage: real serialized netlink messages ---------------
 
     fn serialize(payload: RouteNetlinkMessage) -> Vec<u8> {
-        let message = NetlinkMessage::from(payload);
-        let mut bytes = Vec::new();
+        let mut message = NetlinkMessage::from(payload);
+        // netlink-packet-core writes into the existing buffer: finalize
+        // computes the length field and the buffer must be pre-sized to
+        // buffer_len() before serialize.
+        message.finalize();
+        let mut bytes = vec![0u8; message.buffer_len()];
         message.serialize(&mut bytes);
         bytes
     }
