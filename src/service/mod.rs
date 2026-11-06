@@ -53,6 +53,13 @@ pub fn install(name: Option<&str>, config: Option<&Path>, depend_on: Option<&str
     #[cfg(target_os = "macos")]
     macos::install(name, &binary, config)?;
 
+    // The SCM dependency is a Windows contract (08D1 §31.3); other platforms
+    // gate the flag explicitly so the argument is never silently dropped.
+    #[cfg(not(target_os = "windows"))]
+    if depend_on.is_some() {
+        anyhow::bail!("--depend-on is only supported on windows");
+    }
+
     #[cfg(target_os = "windows")]
     windows::install(name, &binary, config, depend_on)?;
 
