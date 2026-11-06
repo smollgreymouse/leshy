@@ -8,5 +8,5 @@ name = "fallback-zone"
 dns_servers = []
 route_type = "via"
 route_target = "10.255.255.254"
-domains = ["example.com"]
+domains = ["example.org"]
 patterns = []

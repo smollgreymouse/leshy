@@ -79,10 +79,17 @@ def test_fallback_on_route_failure(leshy, dns_query):
     """DNS succeeds despite non-existent gateway (fallback mode)."""
     leshy("fallback.toml")
 
-    # Route to 10.255.255.254 will fail, but DNS should still return an answer
-    answer = dns_query("example.com")
+    # The route target 10.255.255.254 is unreachable, but DNS must still
+    # answer through the upstream (fallback mode). The domain must be unique
+    # across the suite: every test shares one container network namespace and
+    # Leshy routes persist after a process exits, so a domain whose IP an
+    # earlier test already routed (example.com via basic.toml) would conflict
+    # before the fallback could ever engage. example.org resolves to
+    # 93.184.215.14 through the coredns fixture and no other test routes it
+    # before this one.
+    answer = dns_query("example.org")
     ips = [rr.address for rr in answer]
-    assert "93.184.216.34" in ips
+    assert "93.184.215.14" in ips
 
 
 def test_pattern_matching(leshy, dns_query):
