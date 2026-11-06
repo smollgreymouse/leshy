@@ -8,6 +8,7 @@
 //! leftover file never blocks a new holder.
 
 use std::fs::OpenOptions;
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
