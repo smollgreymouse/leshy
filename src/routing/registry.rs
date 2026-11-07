@@ -224,7 +224,6 @@ impl RouteRegistry {
         snapshot: &[ObservedRoute],
         epoch: u64,
     ) -> ReconcileReport {
-        let snapshot_keys: HashSet<&RouteKey> = snapshot.iter().map(|r| &r.key).collect();
         let mut adds = 0usize;
         let removes = 0usize;
         let mut noops = 0usize;
