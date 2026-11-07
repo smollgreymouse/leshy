@@ -32,7 +32,8 @@ pub use registry::{ReconcileReport, RouteError};
 #[allow(dead_code)]
 pub fn spawn_monitor_probe(
 ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<backend::RouteInvalidation>> {
-    linux_monitor::spawn_monitor()
+    let generation = Arc::new(AtomicU64::new(0));
+    linux_monitor::spawn_monitor(generation)
 }
 
 use crate::config::{RoutingBackend, ServerConfig, ZoneConfig};

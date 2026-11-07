@@ -1,12 +1,17 @@
 //! Linux kernel route monitor.
 //!
-//! Subscribes to the `RTNLGRP_ROUTE` and `RTNLGRP_LINK` multicast groups and
+//! Subscribes to the link, IPv4 route and IPv6 route multicast groups and
 //! turns kernel notifications into [`RouteInvalidation`] signals. Bursts are
 //! coalesced with a short debounce so a single `ip route flush` does not turn
 //! into hundreds of reconciles.
 //!
 //! The monitor never reads the routing table itself: it only reports that
 //! something changed. The registry decides what to re-verify.
+//!
+//! Every relevant event bumps the shared monitor generation *before* the
+//! debounced signal is delivered (08D1 §16.2). The backend uses that counter
+//! to refuse to declare a cache current across an event that happened during
+//! its snapshot.
 
 use super::backend::RouteInvalidation;
 use super::model::{RouteKey, RoutePrefix};
@@ -14,13 +19,19 @@ use netlink_packet_core::NetlinkMessage;
 use netlink_packet_route::RouteNetlinkMessage;
 use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// `RTNLGRP_LINK` from `linux/rtnetlink.h`.
 const RTNLGRP_LINK: u32 = 1;
-/// `RTNLGRP_ROUTE` from `linux/rtnetlink.h`.
-const RTNLGRP_ROUTE: u32 = 7;
+/// `RTNLGRP_IPV4_ROUTE` from `linux/rtnetlink.h`.
+const RTNLGRP_IPV4_ROUTE: u32 = 7;
+/// `RTNLGRP_IPV6_ROUTE` from `linux/rtnetlink.h`. The old code used the IPv4
+/// group for both families, so an externally deleted /128 never produced an
+/// event.
+const RTNLGRP_IPV6_ROUTE: u32 = 11;
 
 /// How long to wait for more events before emitting a coalesced signal.
 const DEBOUNCE: Duration = Duration::from_millis(100);
@@ -30,18 +41,24 @@ const MAIN_TABLE: u32 = 254;
 
 /// Spawn the monitor, returning the receiver its signals arrive on.
 ///
+/// `generation` is shared with the backend: every relevant event increments it
+/// before the debounced signal is sent (08D1 §16.2).
+///
 /// The socket is created synchronously so a permission problem surfaces at
 /// startup rather than as a silently dead monitor.
-pub fn spawn_monitor() -> anyhow::Result<mpsc::UnboundedReceiver<RouteInvalidation>> {
+pub fn spawn_monitor(
+    generation: Arc<AtomicU64>,
+) -> anyhow::Result<mpsc::UnboundedReceiver<RouteInvalidation>> {
     let mut socket = Socket::new(NETLINK_ROUTE)?;
     socket.bind(&SocketAddr::new(0, 0))?;
-    socket.add_membership(RTNLGRP_ROUTE)?;
+    socket.add_membership(RTNLGRP_IPV4_ROUTE)?;
+    socket.add_membership(RTNLGRP_IPV6_ROUTE)?;
     socket.add_membership(RTNLGRP_LINK)?;
     socket.set_non_blocking(true)?;
 
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(e) = run(socket, tx).await {
+        if let Err(e) = run(socket, tx, generation).await {
             tracing::warn!(error = %e, "Route monitor stopped");
         }
     });
@@ -49,7 +66,11 @@ pub fn spawn_monitor() -> anyhow::Result<mpsc::UnboundedReceiver<RouteInvalidati
 }
 
 /// Read notifications until the socket fails.
-async fn run(socket: Socket, tx: mpsc::UnboundedSender<RouteInvalidation>) -> anyhow::Result<()> {
+async fn run(
+    socket: Socket,
+    tx: mpsc::UnboundedSender<RouteInvalidation>,
+    generation: Arc<AtomicU64>,
+) -> anyhow::Result<()> {
     let mut pending: Option<RouteInvalidation> = None;
 
     loop {
@@ -62,6 +83,10 @@ async fn run(socket: Socket, tx: mpsc::UnboundedSender<RouteInvalidation>) -> an
             match socket.recv_from_full() {
                 Ok((data, _addr)) => {
                     if let Some(signal) = classify(&data) {
+                        // §16.2: bump the generation before the signal can be
+                        // delivered, so a snapshot taken concurrently can tell
+                        // it raced with this event.
+                        generation.fetch_add(1, Ordering::SeqCst);
                         pending = Some(merge(pending.take(), signal));
                     }
                 }

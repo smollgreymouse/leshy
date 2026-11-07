@@ -2,21 +2,31 @@
 //!
 //! `ensure_route` never treats EEXIST as unconditional success: a row for the
 //! same destination that points at another interface or gateway is a conflict,
-//! not a match. The kernel is the source of truth, so every mutation is
-//! followed by a read-back of the affected prefix.
+//! not a match. The kernel is the source of truth, but the DNS request path
+//! never dumps a whole address family (08D1 §16): a lazy cache is filled by
+//! one monitor-coherent snapshot, mutations re-read only the affected prefix,
+//! and a generation mismatch triggers one targeted read instead of a full
+//! dump.
+//!
+//! The only rows this backend may replace or delete are exact previous Owned
+//! observations (08D1 §16.4/§49.7); anything else on the same key is foreign.
 
 use super::backend::{EnsureOutcome, EnsureResult, RouteBackend, RouteInvalidation};
-use super::model::{AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget};
+use super::model::{
+    AddressFamily, ObservedRoute, RouteIntent, RouteKernelIdentity, RouteKey, RouteOwnership,
+    RoutePrefix, RouteTarget,
+};
 use crate::config::{RouteType, ZoneConfig};
-use crate::routing::model::{RouteKernelIdentity, RouteOwnership};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use netlink_packet_route::route::{RouteAddress, RouteProtocol, RouteScope};
+use netlink_packet_route::route::{RouteAddress, RouteMessage, RouteProtocol, RouteScope};
 use rtnetlink::{new_connection, Handle, IpVersion};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
 /// Protocol stamped on every row Leshy creates.
 ///
@@ -31,49 +41,37 @@ const MAIN_TABLE: u32 = 254;
 /// that width.
 const MAIN_TABLE_U8: u8 = MAIN_TABLE as u8;
 
-pub struct LinuxRouteBackend {
-    handle: Handle,
-    invalidation_rx: Mutex<Option<mpsc::UnboundedReceiver<RouteInvalidation>>>,
+/// Seam over the kernel calls the backend needs.
+///
+/// Production uses [`NetlinkIo`]; unit tests use a fake so the cache,
+/// generation and replacement logic can be exercised without a kernel.
+#[async_trait]
+#[allow(clippy::double_must_use)]
+trait KernelIo: Send + Sync {
+    async fn link_names(&self) -> Result<HashMap<u32, String>>;
+    async fn ifindex_of(&self, device: &str) -> Result<u32>;
+    async fn dump_family(
+        &self,
+        family: AddressFamily,
+        names: &HashMap<u32, String>,
+    ) -> Result<Vec<ObservedRoute>>;
+    async fn read_prefix(
+        &self,
+        key: &RouteKey,
+        names: &HashMap<u32, String>,
+    ) -> Result<Vec<ObservedRoute>>;
+    async fn add(&self, intent: &RouteIntent) -> Result<()>;
+    async fn replace(&self, intent: &RouteIntent) -> Result<()>;
+    async fn delete(&self, intent: &RouteIntent) -> Result<()>;
 }
 
-impl LinuxRouteBackend {
-    pub fn new() -> Result<Self> {
-        let (connection, handle, _) = new_connection()?;
-        tokio::spawn(connection);
+/// rtnetlink-backed kernel I/O.
+struct NetlinkIo {
+    handle: Handle,
+}
 
-        // A monitor that cannot start is not fatal: the periodic audit still
-        // catches drift, just later.
-        let invalidation_rx = match super::linux_monitor::spawn_monitor() {
-            Ok(rx) => Some(rx),
-            Err(e) => {
-                tracing::warn!(error = %e, "Kernel route monitor unavailable, relying on the periodic audit");
-                None
-            }
-        };
-
-        Ok(Self {
-            handle,
-            invalidation_rx: Mutex::new(invalidation_rx),
-        })
-    }
-
-    /// Resolve an interface name to its current index.
-    async fn ifindex_of(&self, device: &str) -> Result<u32> {
-        let mut links = self
-            .handle
-            .link()
-            .get()
-            .match_name(device.to_string())
-            .execute();
-        let link = links
-            .try_next()
-            .await?
-            .with_context(|| format!("Device '{device}' not found"))?;
-        Ok(link.header.index)
-    }
-
-    /// Map every interface index to its name, so a snapshot can report device
-    /// targets with the same identity the intents carry.
+#[async_trait]
+impl KernelIo for NetlinkIo {
     async fn link_names(&self) -> Result<HashMap<u32, String>> {
         let mut links = self.handle.link().get().execute();
         let mut names = HashMap::new();
@@ -91,48 +89,366 @@ impl LinuxRouteBackend {
         Ok(names)
     }
 
-    /// Read the main table for one address family.
+    async fn ifindex_of(&self, device: &str) -> Result<u32> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(device.to_string())
+            .execute();
+        let link = links
+            .try_next()
+            .await?
+            .with_context(|| format!("Device '{device}' not found"))?;
+        Ok(link.header.index)
+    }
+
     async fn dump_family(
         &self,
-        version: IpVersion,
+        family: AddressFamily,
         names: &HashMap<u32, String>,
     ) -> Result<Vec<ObservedRoute>> {
+        let version = match family {
+            AddressFamily::V4 => IpVersion::V4,
+            AddressFamily::V6 => IpVersion::V6,
+        };
         let mut routes = self.handle.route().get(version).execute();
         let mut out = Vec::new();
         while let Some(msg) = routes.try_next().await? {
-            if msg.header.table != MAIN_TABLE_U8 {
-                continue;
+            if let Some(row) = observed_of(&msg, names) {
+                out.push(row);
             }
-            let Some(network) = destination_of(&msg) else {
-                continue;
-            };
-            let Ok(prefix) = RoutePrefix::new(network, msg.header.destination_prefix_length) else {
-                continue;
-            };
-            let Some(target) = target_of(&msg, names) else {
-                continue;
-            };
-            out.push(ObservedRoute {
-                key: RouteKey {
-                    prefix,
-                    table: MAIN_TABLE,
-                },
-                target,
-                identity: linux_identity_of(&msg),
-            });
         }
         Ok(out)
     }
 
-    /// Find the row that currently occupies `intent.key`, if any.
-    async fn find_row(&self, intent: &RouteIntent) -> Result<Option<ObservedRoute>> {
-        let version = match intent.key.prefix.family() {
+    async fn read_prefix(
+        &self,
+        key: &RouteKey,
+        names: &HashMap<u32, String>,
+    ) -> Result<Vec<ObservedRoute>> {
+        // §16.3: one filtered RouteGetRequest for the requested key, never a
+        // whole-family dump. rtnetlink 0.14 is pinned; the filter is applied
+        // by mutating the request message.
+        let version = match key.prefix.family() {
             AddressFamily::V4 => IpVersion::V4,
             AddressFamily::V6 => IpVersion::V6,
         };
-        let names = self.link_names().await?;
-        let rows = self.dump_family(version, &names).await?;
-        Ok(rows.into_iter().find(|row| row.key == intent.key))
+        let mut request = self.handle.route().get(version);
+        {
+            let msg = request.message_mut();
+            msg.header.table = MAIN_TABLE_U8;
+            msg.header.destination_prefix_length = key.prefix.prefix_len;
+            match key.prefix.network {
+                IpAddr::V4(addr) => {
+                    msg.attributes
+                        .push(netlink_packet_route::route::RouteAttribute::Destination(
+                            RouteAddress::Inet(addr),
+                        ))
+                }
+                IpAddr::V6(addr) => {
+                    msg.attributes
+                        .push(netlink_packet_route::route::RouteAttribute::Destination(
+                            RouteAddress::Inet6(addr),
+                        ))
+                }
+            }
+        }
+        let mut routes = request.execute();
+        let mut out = Vec::new();
+        while let Some(msg) = routes.try_next().await? {
+            if let Some(row) = observed_of(&msg, names) {
+                if row.key == *key {
+                    out.push(row);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn add(&self, intent: &RouteIntent) -> Result<()> {
+        match intent.key.prefix.network {
+            IpAddr::V4(_) => {
+                let mut request = self.handle.route().add().v4();
+                apply_intent(request.message_mut(), intent)?;
+                match request.execute().await {
+                    Ok(()) => Ok(()),
+                    // EEXIST: the caller decides whether the existing row matches.
+                    Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -17) => {
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            IpAddr::V6(_) => {
+                let mut request = self.handle.route().add().v6();
+                apply_intent(request.message_mut(), intent)?;
+                match request.execute().await {
+                    Ok(()) => Ok(()),
+                    Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -17) => {
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+        }
+    }
+
+    async fn replace(&self, intent: &RouteIntent) -> Result<()> {
+        // §49.7: NLM_F_REPLACE swaps the matching row atomically; a broad
+        // delete-by-prefix is never used.
+        match intent.key.prefix.network {
+            IpAddr::V4(_) => {
+                let mut request = self.handle.route().add().v4().replace();
+                apply_intent(request.message_mut(), intent)?;
+                request.execute().await?;
+                Ok(())
+            }
+            IpAddr::V6(_) => {
+                let mut request = self.handle.route().add().v6().replace();
+                apply_intent(request.message_mut(), intent)?;
+                request.execute().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn delete(&self, intent: &RouteIntent) -> Result<()> {
+        let prefix = &intent.key.prefix;
+        let mut msg = RouteMessage::default();
+        // The doit handler is registered per family: a DEL with an unspecified
+        // family is rejected by the kernel before the prefix is even looked at.
+        msg.header.address_family = match prefix.network {
+            IpAddr::V4(_) => netlink_packet_route::AddressFamily::Inet,
+            IpAddr::V6(_) => netlink_packet_route::AddressFamily::Inet6,
+        };
+        msg.header.destination_prefix_length = prefix.prefix_len;
+        msg.header.table = MAIN_TABLE_U8;
+        // Ownership was already proven by the exact read-back before this
+        // delete runs, so the DEL must match the row whatever its scope,
+        // protocol or metric are: the kernel compares all three and an
+        // assumed Boot/link delete silently misses the row (ESRCH), leaving
+        // it in the table. NOWHERE scope and UNSPEC protocol mean "match
+        // any"; an absent priority matches any metric.
+        msg.header.scope = RouteScope::NoWhere;
+        msg.header.protocol = RouteProtocol::Unspec;
+        match prefix.network {
+            IpAddr::V4(addr) => {
+                msg.attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Destination(
+                        RouteAddress::Inet(addr),
+                    ));
+            }
+            IpAddr::V6(addr) => {
+                msg.attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Destination(
+                        RouteAddress::Inet6(addr),
+                    ));
+            }
+        }
+
+        match self.handle.route().del(msg).execute().await {
+            Ok(()) => Ok(()),
+            // ESRCH: nothing to delete.
+            Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -3) => {
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Fill an add/replace request from an intent.
+fn apply_intent(msg: &mut RouteMessage, intent: &RouteIntent) -> Result<()> {
+    let prefix = &intent.key.prefix;
+    msg.header.destination_prefix_length = prefix.prefix_len;
+    msg.header.protocol = LESHY_PROTOCOL;
+    match prefix.network {
+        IpAddr::V4(addr) => {
+            msg.attributes
+                .push(netlink_packet_route::route::RouteAttribute::Destination(
+                    RouteAddress::Inet(addr),
+                ))
+        }
+        IpAddr::V6(addr) => {
+            msg.attributes
+                .push(netlink_packet_route::route::RouteAttribute::Destination(
+                    RouteAddress::Inet6(addr),
+                ))
+        }
+    }
+    match &intent.target {
+        RouteTarget::Gateway(gw) if gw.is_ipv4() == prefix.network.is_ipv4() => match gw {
+            IpAddr::V4(v4) => {
+                msg.attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Gateway(
+                        RouteAddress::Inet(*v4),
+                    ))
+            }
+            IpAddr::V6(v6) => {
+                msg.attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Gateway(
+                        RouteAddress::Inet6(*v6),
+                    ))
+            }
+        },
+        RouteTarget::Device {
+            ifindex: Some(index),
+            ..
+        } => {
+            msg.attributes
+                .push(netlink_packet_route::route::RouteAttribute::Oif(*index));
+        }
+        other => anyhow::bail!(
+            "route {} cannot be installed with target {other:?}",
+            prefix.network
+        ),
+    }
+    msg.header.scope = match prefix.family() {
+        // The IPv6 kernel carries no route scope attribute; read-back truth is
+        // 0, so write the same value we will observe.
+        AddressFamily::V6 => RouteScope::Universe,
+        AddressFamily::V4 => match &intent.target {
+            RouteTarget::Device { .. } => RouteScope::Link,
+            _ => RouteScope::Universe,
+        },
+    };
+    Ok(())
+}
+
+/// Per-call kernel counters (08D1 §16.1). Kept in every build so the code has
+/// one shape; only tests read them.
+#[allow(dead_code)]
+#[derive(Default)]
+struct Counters {
+    full_snapshots: AtomicU64,
+    targeted_reads: AtomicU64,
+    adds: AtomicU64,
+    deletes: AtomicU64,
+    replaces: AtomicU64,
+}
+
+pub struct LinuxRouteBackend {
+    io: Arc<dyn KernelIo>,
+    /// One entry per key; a prefix may temporarily hold several rows.
+    cache: RwLock<HashMap<RouteKey, Vec<ObservedRoute>>>,
+    link_names: RwLock<HashMap<u32, String>>,
+    /// Filled exactly once by the lazy, monitor-coherent initial snapshot.
+    cache_init: OnceCell<()>,
+    /// Shared with the monitor; every relevant kernel event bumps it.
+    monitor_generation: Arc<AtomicU64>,
+    /// Generation the cache was last proven current against.
+    cache_generation: AtomicU64,
+    invalidation_rx: Mutex<Option<mpsc::UnboundedReceiver<RouteInvalidation>>>,
+    counters: Counters,
+}
+
+impl LinuxRouteBackend {
+    pub fn new() -> Result<Self> {
+        let (connection, handle, _) = new_connection()?;
+        tokio::spawn(connection);
+
+        let monitor_generation = Arc::new(AtomicU64::new(0));
+
+        // A monitor that cannot start is not fatal: the periodic audit still
+        // catches drift, just later.
+        let invalidation_rx = match super::linux_monitor::spawn_monitor(Arc::clone(
+            &monitor_generation,
+        )) {
+            Ok(rx) => Some(rx),
+            Err(e) => {
+                tracing::warn!(error = %e, "Kernel route monitor unavailable, relying on the periodic audit");
+                None
+            }
+        };
+
+        Ok(Self::with_io(
+            Arc::new(NetlinkIo { handle }),
+            monitor_generation,
+            invalidation_rx,
+        ))
+    }
+
+    fn with_io(
+        io: Arc<dyn KernelIo>,
+        monitor_generation: Arc<AtomicU64>,
+        invalidation_rx: Option<mpsc::UnboundedReceiver<RouteInvalidation>>,
+    ) -> Self {
+        Self {
+            io,
+            cache: RwLock::new(HashMap::new()),
+            link_names: RwLock::new(HashMap::new()),
+            cache_init: OnceCell::new(),
+            monitor_generation,
+            cache_generation: AtomicU64::new(0),
+            invalidation_rx: Mutex::new(invalidation_rx),
+            counters: Counters::default(),
+        }
+    }
+
+    /// Read the whole main table (both families) plus the link names and
+    /// publish it as the cache, retrying if a kernel event landed mid-read
+    /// (08D1 §16.2). Returns the generation the cache is current against.
+    async fn full_snapshot(&self) -> Result<()> {
+        loop {
+            let before = self.monitor_generation.load(Ordering::SeqCst);
+            let names = self.io.link_names().await?;
+            let mut cache: HashMap<RouteKey, Vec<ObservedRoute>> = HashMap::new();
+            for family in [AddressFamily::V4, AddressFamily::V6] {
+                for row in self.io.dump_family(family, &names).await? {
+                    cache.entry(row.key.clone()).or_default().push(row);
+                }
+            }
+            self.counters.full_snapshots.fetch_add(1, Ordering::SeqCst);
+            let after = self.monitor_generation.load(Ordering::SeqCst);
+            if before != after {
+                // An event happened while we were reading: the snapshot is
+                // not current, so read again instead of declaring it valid.
+                continue;
+            }
+            *self.cache.write().await = cache;
+            *self.link_names.write().await = names;
+            self.cache_generation.store(after, Ordering::SeqCst);
+            return Ok(());
+        }
+    }
+
+    /// Lazy one-time cache initialization (08D1 §16.1).
+    async fn ensure_cache_initialized(&self) -> Result<()> {
+        self.cache_init
+            .get_or_try_init(|| async { self.full_snapshot().await })
+            .await?;
+        Ok(())
+    }
+
+    /// Targeted read-back of one key; updates that cache entry only.
+    async fn refresh_key(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+        let names = self.link_names.read().await.clone();
+        let rows = self.io.read_prefix(key, &names).await?;
+        self.counters.targeted_reads.fetch_add(1, Ordering::SeqCst);
+        let mut cache = self.cache.write().await;
+        if rows.is_empty() {
+            cache.remove(key);
+        } else {
+            cache.insert(key.clone(), rows.clone());
+        }
+        Ok(rows)
+    }
+
+    /// Rows currently known for one key.
+    ///
+    /// A cache hit is trusted only while `cache_generation` matches the
+    /// monitor generation; otherwise the requested key is read back once
+    /// instead of dumping a family (08D1 §16.2).
+    async fn rows_for(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+        self.ensure_cache_initialized().await?;
+        if self.cache_generation.load(Ordering::SeqCst)
+            == self.monitor_generation.load(Ordering::SeqCst)
+        {
+            let cache = self.cache.read().await;
+            return Ok(cache.get(key).cloned().unwrap_or_default());
+        }
+        self.refresh_key(key).await
     }
 
     /// Whether a refused add means "a row for this destination already
@@ -159,142 +475,104 @@ impl LinuxRouteBackend {
         })
     }
 
-    /// Build the netlink add request for an intent.
     async fn add_row(&self, intent: &RouteIntent) -> Result<()> {
-        let prefix = &intent.key.prefix;
-        let result = match prefix.network {
-            IpAddr::V4(addr) => {
-                let mut route = self.handle.route().add().v4();
-                route.message_mut().header.destination_prefix_length = prefix.prefix_len;
-                route.message_mut().header.protocol = LESHY_PROTOCOL;
-                route.message_mut().attributes.push(
-                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet(
-                        addr,
-                    )),
-                );
-                match &intent.target {
-                    RouteTarget::Gateway(IpAddr::V4(gw)) => {
-                        route.message_mut().attributes.push(
-                            netlink_packet_route::route::RouteAttribute::Gateway(
-                                RouteAddress::Inet(*gw),
-                            ),
-                        );
-                        route.message_mut().header.scope = RouteScope::Universe;
-                    }
-                    RouteTarget::Device {
-                        ifindex: Some(index),
-                        ..
-                    } => {
-                        route
-                            .message_mut()
-                            .attributes
-                            .push(netlink_packet_route::route::RouteAttribute::Oif(*index));
-                        route.message_mut().header.scope = RouteScope::Link;
-                    }
-                    other => anyhow::bail!(
-                        "route {} cannot be installed with target {other:?}",
-                        intent.key.prefix.network
-                    ),
-                }
-                route.execute().await
-            }
-            IpAddr::V6(addr) => {
-                let mut route = self.handle.route().add().v6();
-                route.message_mut().header.destination_prefix_length = prefix.prefix_len;
-                route.message_mut().header.protocol = LESHY_PROTOCOL;
-                route.message_mut().attributes.push(
-                    netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet6(
-                        addr,
-                    )),
-                );
-                match &intent.target {
-                    RouteTarget::Gateway(IpAddr::V6(gw)) => {
-                        route.message_mut().attributes.push(
-                            netlink_packet_route::route::RouteAttribute::Gateway(
-                                RouteAddress::Inet6(*gw),
-                            ),
-                        );
-                        route.message_mut().header.scope = RouteScope::Universe;
-                    }
-                    RouteTarget::Device {
-                        ifindex: Some(index),
-                        ..
-                    } => {
-                        route
-                            .message_mut()
-                            .attributes
-                            .push(netlink_packet_route::route::RouteAttribute::Oif(*index));
-                        route.message_mut().header.scope = RouteScope::Link;
-                    }
-                    other => anyhow::bail!(
-                        "route {} cannot be installed with target {other:?}",
-                        intent.key.prefix.network
-                    ),
-                }
-                route.execute().await
-            }
-        };
+        self.io.add(intent).await?;
+        self.counters.adds.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -17) =>
-            {
-                // EEXIST: the caller decides whether the existing row matches.
-                Ok(())
-            }
-            Err(e) => Err(e.into()),
+    async fn replace_row(&self, intent: &RouteIntent) -> Result<()> {
+        self.io.replace(intent).await?;
+        self.counters.replaces.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn delete_row(&self, intent: &RouteIntent) -> Result<()> {
+        self.io.delete(intent).await?;
+        self.counters.deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Read the affected key back after an add/replace and prove Desired is
+    /// exactly what the kernel now holds (08D1 §16.3).
+    async fn prove_added(&self, intent: &RouteIntent) -> Result<EnsureResult> {
+        let rows = self.refresh_key(&intent.key).await?;
+        match rows.as_slice() {
+            [row] if observed_matches(row, intent) => Ok(EnsureResult {
+                outcome: EnsureOutcome::Added,
+                ownership: RouteOwnership {
+                    owned: true,
+                    observed: Some(row.clone()),
+                },
+            }),
+            [row] => Err(self.conflict_error(intent, &row.target)),
+            [] => anyhow::bail!(
+                "route {} is missing right after it was added",
+                intent.key.prefix.network
+            ),
+            rows => Err(self.conflict_error(intent, &rows[0].target)),
         }
     }
 
-    /// Delete the row occupying `intent.key`.
-    async fn delete_row(&self, intent: &RouteIntent) -> Result<()> {
-        let prefix = &intent.key.prefix;
-        let mut msg = netlink_packet_route::route::RouteMessage::default();
-        // The doit handler is registered per family: a DEL with an unspecified
-        // family is rejected by the kernel before the prefix is even looked at.
-        msg.header.address_family = match prefix.network {
-            IpAddr::V4(_) => netlink_packet_route::AddressFamily::Inet,
-            IpAddr::V6(_) => netlink_packet_route::AddressFamily::Inet6,
+    /// Decide an ensure against the rows currently occupying the key.
+    async fn classify_rows(
+        &self,
+        intent: &RouteIntent,
+        previous: Option<&RouteOwnership>,
+        rows: Vec<ObservedRoute>,
+    ) -> Result<EnsureResult> {
+        let [row] = rows.as_slice() else {
+            // No row is handled by the caller; more than one same-key row is
+            // ambiguous and therefore foreign.
+            let owner = rows
+                .first()
+                .map(|r| &r.target)
+                .cloned()
+                .unwrap_or(RouteTarget::Unreachable);
+            return Err(self.conflict_error(intent, &owner));
         };
-        msg.header.destination_prefix_length = prefix.prefix_len;
-        msg.header.table = MAIN_TABLE_U8;
-        // Ownership was already proven by the exact read-back before this
-        // delete runs, so the DEL must match the row whatever its scope,
-        // protocol or metric are: the kernel compares all three and an
-        // assumed Boot/link delete silently misses the row (ESRCH), leaving
-        // it in the table. NOWHERE scope and UNSPEC protocol mean "match
-        // any"; an absent priority matches any metric.
-        msg.header.scope = RouteScope::NoWhere;
-        msg.header.protocol = RouteProtocol::Unspec;
-        match prefix.network {
-            IpAddr::V4(addr) => {
-                msg.attributes
-                    .push(netlink_packet_route::route::RouteAttribute::Destination(
-                        RouteAddress::Inet(addr),
-                    ));
-            }
-            IpAddr::V6(addr) => {
-                msg.header.address_family = netlink_packet_route::AddressFamily::Inet6;
-                msg.attributes
-                    .push(netlink_packet_route::route::RouteAttribute::Destination(
-                        RouteAddress::Inet6(addr),
-                    ));
-            }
+
+        if observed_matches(row, intent) {
+            // Only an exact recorded identity keeps ownership; a compatible
+            // pre-existing row satisfies forwarding but is not ours.
+            let owned = matches!(
+                previous,
+                Some(RouteOwnership {
+                    owned: true,
+                    observed: Some(prev),
+                }) if prev.identity == row.identity
+            );
+            return Ok(EnsureResult {
+                outcome: EnsureOutcome::AlreadyMatching,
+                ownership: RouteOwnership {
+                    owned,
+                    observed: Some(row.clone()),
+                },
+            });
         }
 
-        match self.handle.route().del(msg).execute().await {
-            Ok(()) => Ok(()),
-            // ESRCH: nothing to delete.
-            Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -3) => {
-                Ok(())
-            }
-            Err(e) => Err(e.into()),
+        // §49.7: an exact previous Owned row may be replaced with Desired.
+        if Self::is_exact_previous_owned(previous, row) {
+            self.replace_row(intent).await?;
+            return self.prove_added(intent).await;
         }
+
+        Err(self.conflict_error(intent, &row.target))
+    }
+
+    fn is_exact_previous_owned(previous: Option<&RouteOwnership>, row: &ObservedRoute) -> bool {
+        matches!(
+            previous,
+            Some(RouteOwnership {
+                owned: true,
+                observed: Some(prev),
+            }) if prev.key == row.key && prev.target == row.target && prev.identity == row.identity
+        )
     }
 }
 
 /// Extract the destination address from a route message.
-fn destination_of(msg: &netlink_packet_route::route::RouteMessage) -> Option<IpAddr> {
+fn destination_of(msg: &RouteMessage) -> Option<IpAddr> {
     msg.attributes.iter().find_map(|attr| match attr {
         netlink_packet_route::route::RouteAttribute::Destination(RouteAddress::Inet(addr)) => {
             Some(IpAddr::V4(*addr))
@@ -306,12 +584,11 @@ fn destination_of(msg: &netlink_packet_route::route::RouteMessage) -> Option<IpA
     })
 }
 
-/// Extract the forwarding target from a route message.
 /// Captures the exact kernel identity of one route message (08D1 §16.4):
 /// the OIF even for gateway routes, the gateway as next hop, protocol, the
 /// metric/priority (default 0 only when the kernel attribute is absent) and
 /// the scope.
-fn linux_identity_of(msg: &netlink_packet_route::route::RouteMessage) -> RouteKernelIdentity {
+fn linux_identity_of(msg: &RouteMessage) -> RouteKernelIdentity {
     let mut oif = None;
     let mut gateway = None;
     let mut metric = 0;
@@ -339,10 +616,7 @@ fn linux_identity_of(msg: &netlink_packet_route::route::RouteMessage) -> RouteKe
     }
 }
 
-fn target_of(
-    msg: &netlink_packet_route::route::RouteMessage,
-    names: &HashMap<u32, String>,
-) -> Option<RouteTarget> {
+fn target_of(msg: &RouteMessage, names: &HashMap<u32, String>) -> Option<RouteTarget> {
     let mut oif = None;
     let mut gateway = None;
     for attr in msg.attributes.iter() {
@@ -363,6 +637,59 @@ fn target_of(
         name: names.get(&index).cloned().unwrap_or_default(),
         ifindex: Some(index),
     })
+}
+
+/// Build one observed row from a kernel message, or `None` when it is not a
+/// main-table row Leshy can represent.
+fn observed_of(msg: &RouteMessage, names: &HashMap<u32, String>) -> Option<ObservedRoute> {
+    if msg.header.table != MAIN_TABLE_U8 {
+        return None;
+    }
+    let network = destination_of(msg)?;
+    let prefix = RoutePrefix::new(network, msg.header.destination_prefix_length).ok()?;
+    let target = target_of(msg, names)?;
+    Some(ObservedRoute {
+        key: RouteKey {
+            prefix,
+            table: MAIN_TABLE,
+        },
+        target,
+        identity: linux_identity_of(msg),
+    })
+}
+
+/// Scope the kernel reports for a row Leshy wrote (08D1 §16.4).
+///
+/// The IPv6 kernel carries no route scope attribute, so read-back truth is 0
+/// (recorded by the Linux netns run); IPv4 device routes are link scope and
+/// IPv4 gateway routes universe.
+fn expected_scope(prefix: &RoutePrefix, target: &RouteTarget) -> u8 {
+    match prefix.family() {
+        AddressFamily::V6 => u8::from(RouteScope::Universe),
+        AddressFamily::V4 => match target {
+            RouteTarget::Device { .. } => u8::from(RouteScope::Link),
+            _ => u8::from(RouteScope::Universe),
+        },
+    }
+}
+
+/// Metric/priority the kernel reports when Leshy sends none (08D1 §16.4):
+/// IPv4 defaults to 0, IPv6 to `IP6_RT_PRIO_USER` (1024).
+fn expected_metric(prefix: &RoutePrefix) -> u32 {
+    match prefix.family() {
+        AddressFamily::V4 => 0,
+        AddressFamily::V6 => 1024,
+    }
+}
+
+/// The exact-match contract for a row Leshy considers already correct:
+/// same key, same logical target, and the writer's protocol/metric/scope.
+fn observed_matches(row: &ObservedRoute, intent: &RouteIntent) -> bool {
+    row.key == intent.key
+        && row.target == intent.target
+        && row.identity.protocol == u8::from(LESHY_PROTOCOL)
+        && row.identity.metric == expected_metric(&intent.key.prefix)
+        && row.identity.scope == expected_scope(&intent.key.prefix, &intent.target)
 }
 
 #[async_trait]
@@ -386,7 +713,7 @@ impl RouteBackend for LinuxRouteBackend {
                 if device.is_empty() {
                     anyhow::bail!("Device file '{}' is empty", zone.route_target);
                 }
-                let ifindex = self.ifindex_of(&device).await?;
+                let ifindex = self.io.ifindex_of(&device).await?;
                 Ok(RouteTarget::Device {
                     name: device,
                     ifindex: Some(ifindex),
@@ -410,75 +737,22 @@ impl RouteBackend for LinuxRouteBackend {
         // previous exact Owned observation is the only row this backend may
         // treat as its own; a compatible pre-existing row may satisfy
         // forwarding but is owned=false; anything else is a foreign row we
-        // must not clobber (08D1 §14.4, §31.24 trust boundary).
-        if let Some(existing) = self.find_row(intent).await? {
-            if existing.target == intent.target {
-                let owned = previous
-                    .and_then(|o| o.observed.as_ref())
-                    .map(|o| o.identity == existing.identity)
-                    .unwrap_or(false);
-                return Ok(EnsureResult {
-                    outcome: EnsureOutcome::AlreadyMatching,
-                    ownership: RouteOwnership {
-                        owned,
-                        observed: Some(existing),
-                    },
-                });
-            }
-            return Err(self.conflict_error(intent, &existing.target));
-        }
-
-        if let Err(e) = self.add_row(intent).await {
-            // A concurrent writer may have installed the exact row between
-            // our lookup and the add; the kernel then refuses the add with
-            // EEXIST — or EBUSY, which is what IPv6 answers for an identical
-            // existing route. Only an exact read-back turns that into a
-            // verified no-op; anything else keeps the error.
-            if Self::is_busy_class(&e) {
-                match self.find_row(intent).await? {
-                    Some(row) if row.target == intent.target => {
-                        let owned = previous
-                            .and_then(|o| o.observed.as_ref())
-                            .map(|o| o.identity == row.identity)
-                            .unwrap_or(false);
-                        return Ok(EnsureResult {
-                            outcome: EnsureOutcome::AlreadyMatching,
-                            ownership: RouteOwnership {
-                                owned,
-                                observed: Some(row),
-                            },
-                        });
-                    }
-                    Some(row) => return Err(self.conflict_error(intent, &row.target)),
-                    None => {
-                        return Err(e).context(format!(
-                            "route {} add was refused and the row is absent",
-                            intent.key.prefix.network
-                        ))
-                    }
+        // must not clobber (08D1 §16.4, §31.24 trust boundary).
+        let rows = self.rows_for(&intent.key).await?;
+        if rows.is_empty() {
+            match self.add_row(intent).await {
+                Ok(()) => return self.prove_added(intent).await,
+                Err(e) if Self::is_busy_class(&e) => {
+                    // A concurrent writer may have installed a row between our
+                    // lookup and the add; only an exact read-back can classify
+                    // it.
+                    let rows = self.refresh_key(&intent.key).await?;
+                    return self.classify_rows(intent, previous, rows).await;
                 }
+                Err(e) => return Err(e),
             }
-            return Err(e);
         }
-
-        // Read back: the kernel is the only proof the route exists — and the
-        // returned ownership carries the exact identity this process created.
-        match self.find_row(intent).await? {
-            Some(row) if row.target == intent.target => Ok(EnsureResult {
-                outcome: EnsureOutcome::Added,
-                ownership: RouteOwnership {
-                    owned: true,
-                    observed: Some(row),
-                },
-            }),
-            // Something else took the destination between our add and the
-            // read-back; treat it as a foreign route, not ours to fix.
-            Some(row) => Err(self.conflict_error(intent, &row.target)),
-            None => anyhow::bail!(
-                "route {} is missing right after it was added",
-                intent.key.prefix.network
-            ),
-        }
+        self.classify_rows(intent, previous, rows).await
     }
 
     async fn remove_route(
@@ -500,13 +774,16 @@ impl RouteBackend for LinuxRouteBackend {
                 intent.key.prefix.network
             );
         };
-        match self.find_row(intent).await? {
+        let rows = self.rows_for(&intent.key).await?;
+        match rows.as_slice() {
             // Delete only the exact owned identity; a foreign row on the
             // same prefix belongs to someone else.
-            Some(row) if row.identity == observed.identity && row.target == intent.target => {
-                self.delete_row(intent).await
+            [row] if row.identity == observed.identity && row.target == intent.target => {
+                self.delete_row(intent).await?;
+                self.refresh_key(&intent.key).await?;
+                Ok(())
             }
-            Some(row) => {
+            [row] => {
                 tracing::debug!(
                     prefix = %intent.key.prefix.network,
                     prefix_len = intent.key.prefix.prefix_len,
@@ -517,15 +794,24 @@ impl RouteBackend for LinuxRouteBackend {
                 Ok(())
             }
             // The exact owned row is already gone: absence is success.
-            None => Ok(()),
+            [] => Ok(()),
+            rows => {
+                tracing::debug!(
+                    prefix = %intent.key.prefix.network,
+                    rows = rows.len(),
+                    "Leaving an ambiguous multi-row prefix in place"
+                );
+                Ok(())
+            }
         }
     }
 
     async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
-        let names = self.link_names().await?;
-        let mut out = self.dump_family(IpVersion::V4, &names).await?;
-        out.extend(self.dump_family(IpVersion::V6, &names).await?);
-        Ok(out)
+        // Explicit snapshot/audit (08D1 §16.3): the only full dump outside
+        // lazy initialization.
+        self.full_snapshot().await?;
+        let cache = self.cache.read().await;
+        Ok(cache.values().flatten().cloned().collect())
     }
 
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
@@ -540,6 +826,7 @@ impl RouteBackend for LinuxRouteBackend {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn leshy_protocol_is_boot() {
@@ -555,7 +842,7 @@ mod tests {
 
     #[test]
     fn destination_extraction_v4() {
-        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        let mut msg = RouteMessage::default();
         msg.attributes
             .push(netlink_packet_route::route::RouteAttribute::Destination(
                 RouteAddress::Inet(Ipv4Addr::new(10, 1, 2, 3)),
@@ -568,7 +855,7 @@ mod tests {
 
     #[test]
     fn destination_extraction_v6() {
-        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        let mut msg = RouteMessage::default();
         msg.attributes
             .push(netlink_packet_route::route::RouteAttribute::Destination(
                 RouteAddress::Inet6(Ipv6Addr::LOCALHOST),
@@ -578,13 +865,13 @@ mod tests {
 
     #[test]
     fn destination_missing_is_none() {
-        let msg = netlink_packet_route::route::RouteMessage::default();
+        let msg = RouteMessage::default();
         assert_eq!(destination_of(&msg), None);
     }
 
     #[test]
     fn gateway_wins_over_oif() {
-        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        let mut msg = RouteMessage::default();
         msg.attributes
             .push(netlink_packet_route::route::RouteAttribute::Oif(7));
         msg.attributes
@@ -602,7 +889,7 @@ mod tests {
 
     #[test]
     fn oif_becomes_device_target_with_name() {
-        let mut msg = netlink_packet_route::route::RouteMessage::default();
+        let mut msg = RouteMessage::default();
         msg.attributes
             .push(netlink_packet_route::route::RouteAttribute::Oif(7));
         let mut names = HashMap::new();
@@ -618,7 +905,445 @@ mod tests {
 
     #[test]
     fn no_target_attributes_is_none() {
-        let msg = netlink_packet_route::route::RouteMessage::default();
+        let msg = RouteMessage::default();
         assert_eq!(target_of(&msg, &HashMap::new()), None);
+    }
+
+    // --- cache/generation/replacement seam --------------------------------
+
+    struct FakeState {
+        rows: Vec<ObservedRoute>,
+        names: HashMap<u32, String>,
+        dumps: u64,
+        reads: Vec<RouteKey>,
+        adds: Vec<RouteIntent>,
+        replaces: Vec<RouteIntent>,
+        deletes: Vec<RouteIntent>,
+        bump_generation: Option<Arc<AtomicU64>>,
+        bump_after_first_dump: bool,
+        force_read: Option<Vec<ObservedRoute>>,
+    }
+
+    struct FakeIo {
+        state: StdMutex<FakeState>,
+    }
+
+    impl FakeIo {
+        fn new(rows: Vec<ObservedRoute>) -> Self {
+            let mut names = HashMap::new();
+            names.insert(7u32, "tun0".to_string());
+            Self {
+                state: StdMutex::new(FakeState {
+                    rows,
+                    names,
+                    dumps: 0,
+                    reads: Vec::new(),
+                    adds: Vec::new(),
+                    replaces: Vec::new(),
+                    deletes: Vec::new(),
+                    bump_generation: None,
+                    bump_after_first_dump: false,
+                    force_read: None,
+                }),
+            }
+        }
+
+        fn bump_during_first_dump(mut self, generation: Arc<AtomicU64>) -> Self {
+            let state = self.state.get_mut().unwrap();
+            state.bump_generation = Some(generation);
+            state.bump_after_first_dump = true;
+            self
+        }
+
+        fn force_read(mut self, rows: Vec<ObservedRoute>) -> Self {
+            self.state.get_mut().unwrap().force_read = Some(rows);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl KernelIo for FakeIo {
+        async fn link_names(&self) -> Result<HashMap<u32, String>> {
+            Ok(self.state.lock().unwrap().names.clone())
+        }
+
+        async fn ifindex_of(&self, device: &str) -> Result<u32> {
+            let state = self.state.lock().unwrap();
+            state
+                .names
+                .iter()
+                .find_map(|(index, name)| (name == device).then_some(*index))
+                .ok_or_else(|| anyhow::anyhow!("Device '{device}' not found"))
+        }
+
+        async fn dump_family(
+            &self,
+            family: AddressFamily,
+            _names: &HashMap<u32, String>,
+        ) -> Result<Vec<ObservedRoute>> {
+            let mut state = self.state.lock().unwrap();
+            state.dumps += 1;
+            if state.bump_after_first_dump && state.dumps == 1 {
+                if let Some(generation) = &state.bump_generation {
+                    generation.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Ok(state
+                .rows
+                .iter()
+                .filter(|row| row.key.prefix.family() == family)
+                .cloned()
+                .collect())
+        }
+
+        async fn read_prefix(
+            &self,
+            key: &RouteKey,
+            _names: &HashMap<u32, String>,
+        ) -> Result<Vec<ObservedRoute>> {
+            let mut state = self.state.lock().unwrap();
+            state.reads.push(key.clone());
+            if let Some(rows) = &state.force_read {
+                return Ok(rows.clone());
+            }
+            Ok(state
+                .rows
+                .iter()
+                .filter(|row| row.key == *key)
+                .cloned()
+                .collect())
+        }
+
+        async fn add(&self, intent: &RouteIntent) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.adds.push(intent.clone());
+            if !state.rows.iter().any(|row| row.key == intent.key) {
+                state.rows.push(synthesize(intent));
+            }
+            Ok(())
+        }
+
+        async fn replace(&self, intent: &RouteIntent) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.replaces.push(intent.clone());
+            state.rows.retain(|row| row.key != intent.key);
+            state.rows.push(synthesize(intent));
+            Ok(())
+        }
+
+        async fn delete(&self, intent: &RouteIntent) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.deletes.push(intent.clone());
+            state.rows.retain(|row| row.key != intent.key);
+            Ok(())
+        }
+    }
+
+    fn synthesize(intent: &RouteIntent) -> ObservedRoute {
+        ObservedRoute {
+            key: intent.key.clone(),
+            target: intent.target.clone(),
+            identity: RouteKernelIdentity {
+                ifindex: match &intent.target {
+                    RouteTarget::Device { ifindex, .. } => *ifindex,
+                    _ => None,
+                },
+                next_hop: match &intent.target {
+                    RouteTarget::Gateway(gateway) => Some(*gateway),
+                    _ => None,
+                },
+                protocol: u8::from(LESHY_PROTOCOL),
+                metric: expected_metric(&intent.key.prefix),
+                scope: expected_scope(&intent.key.prefix, &intent.target),
+                interface_luid: None,
+            },
+        }
+    }
+
+    fn host_v4(a: u8, b: u8, c: u8, d: u8, ifindex: u32) -> RouteIntent {
+        RouteIntent {
+            key: RouteKey {
+                prefix: RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(a, b, c, d))),
+                table: MAIN_TABLE,
+            },
+            zone: "netns".to_string(),
+            target: RouteTarget::Device {
+                name: "tun0".to_string(),
+                ifindex: Some(ifindex),
+            },
+            source: super::super::model::RouteSource::Dns,
+        }
+    }
+
+    fn host_v6(a: u16, ifindex: u32) -> RouteIntent {
+        RouteIntent {
+            key: RouteKey {
+                prefix: RoutePrefix::host(IpAddr::V6(Ipv6Addr::new(0xfd00, a, 0, 0, 0, 0, 0, 1))),
+                table: MAIN_TABLE,
+            },
+            zone: "netns".to_string(),
+            target: RouteTarget::Device {
+                name: "tun0".to_string(),
+                ifindex: Some(ifindex),
+            },
+            source: super::super::model::RouteSource::Dns,
+        }
+    }
+
+    fn test_backend(io: Arc<FakeIo>, generation: Arc<AtomicU64>) -> LinuxRouteBackend {
+        LinuxRouteBackend::with_io(io, generation, None)
+    }
+
+    fn snapshot_counters(backend: &LinuxRouteBackend) -> (u64, u64, u64, u64, u64) {
+        (
+            backend.counters.full_snapshots.load(Ordering::SeqCst),
+            backend.counters.targeted_reads.load(Ordering::SeqCst),
+            backend.counters.adds.load(Ordering::SeqCst),
+            backend.counters.deletes.load(Ordering::SeqCst),
+            backend.counters.replaces.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn lazy_cache_initializes_once() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&intent)]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), Arc::clone(&generation));
+
+        backend.ensure_cache_initialized().await.unwrap();
+        backend.ensure_cache_initialized().await.unwrap();
+
+        let (full, ..) = snapshot_counters(&backend);
+        assert_eq!(full, 1, "the lazy cache must initialize exactly once");
+    }
+
+    #[tokio::test]
+    async fn event_during_initial_snapshot_forces_retry() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let generation = Arc::new(AtomicU64::new(0));
+        let io = Arc::new(
+            FakeIo::new(vec![synthesize(&intent)]).bump_during_first_dump(Arc::clone(&generation)),
+        );
+        let backend = test_backend(io, Arc::clone(&generation));
+
+        backend.ensure_cache_initialized().await.unwrap();
+
+        let (full, ..) = snapshot_counters(&backend);
+        assert_eq!(
+            full, 2,
+            "an event during the snapshot must force a second read"
+        );
+        assert_eq!(
+            backend.cache_generation.load(Ordering::SeqCst),
+            generation.load(Ordering::SeqCst),
+            "the published cache must be current against the monitor"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_mismatch_targets_only_the_requested_key() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let other = host_v4(10, 0, 0, 2, 7);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&intent), synthesize(&other)]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), Arc::clone(&generation));
+        backend.ensure_cache_initialized().await.unwrap();
+
+        // A kernel event lands: the cache is no longer proven current.
+        generation.fetch_add(1, Ordering::SeqCst);
+        let rows = backend.rows_for(&intent.key).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let (full, targeted, ..) = snapshot_counters(&backend);
+        assert_eq!(full, 1, "a mismatch must not trigger a full snapshot");
+        assert_eq!(targeted, 1, "exactly one targeted read for the key");
+        let reads = &io.state.lock().unwrap().reads;
+        assert_eq!(reads.as_slice(), std::slice::from_ref(&intent.key));
+    }
+
+    #[tokio::test]
+    async fn exact_cache_hit_does_no_kernel_io() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&intent)]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(io, Arc::clone(&generation));
+        backend.ensure_cache_initialized().await.unwrap();
+
+        backend.rows_for(&intent.key).await.unwrap();
+        backend.rows_for(&intent.key).await.unwrap();
+
+        let (full, targeted, ..) = snapshot_counters(&backend);
+        assert_eq!(full, 1);
+        assert_eq!(targeted, 0, "a current cache hit must not touch the kernel");
+    }
+
+    #[tokio::test]
+    async fn targeted_read_back_v4_and_v6() {
+        let io = Arc::new(FakeIo::new(Vec::new()));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        let v4 = host_v4(10, 0, 0, 1, 7);
+        let v6 = host_v6(0x55, 7);
+        backend.ensure_route(&v4, None).await.unwrap();
+        backend.ensure_route(&v6, None).await.unwrap();
+
+        let (_, targeted, adds, _, _) = snapshot_counters(&backend);
+        assert_eq!(adds, 2);
+        assert_eq!(targeted, 2, "each mutation reads back only its own key");
+        let reads = &io.state.lock().unwrap().reads;
+        assert_eq!(reads, &[v4.key.clone(), v6.key.clone()]);
+    }
+
+    #[tokio::test]
+    async fn protocol_metric_scope_or_target_mismatch_conflicts() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let mut foreign = synthesize(&intent);
+        foreign.identity.protocol = u8::from(RouteProtocol::Static);
+        let io = Arc::new(FakeIo::new(vec![foreign]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(io, generation);
+
+        assert!(
+            backend.ensure_route(&intent, None).await.is_err(),
+            "a same-key row without Leshy's exact identity is a conflict"
+        );
+
+        // Wrong OIF (and therefore a different Device target) is a conflict too.
+        let other_ifindex = host_v4(10, 0, 0, 1, 9);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&intent)]));
+        let backend = test_backend(io, Arc::new(AtomicU64::new(0)));
+        assert!(backend.ensure_route(&other_ifindex, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_previous_owned_target_is_replaced() {
+        let old = host_v4(10, 0, 0, 1, 7);
+        let new = host_v4(10, 0, 0, 1, 9);
+        let observed = synthesize(&old);
+        let previous = RouteOwnership {
+            owned: true,
+            observed: Some(observed.clone()),
+        };
+        let io = Arc::new(FakeIo::new(vec![observed]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        let result = backend.ensure_route(&new, Some(&previous)).await.unwrap();
+        assert_eq!(result.outcome, EnsureOutcome::Added);
+        assert!(result.ownership.owned);
+        assert_eq!(
+            result.ownership.observed.as_ref().unwrap().target,
+            new.target
+        );
+
+        let state = io.state.lock().unwrap();
+        assert_eq!(state.replaces.len(), 1, "the owned row is replaced");
+        assert!(
+            state.deletes.is_empty(),
+            "replacement never deletes by prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_target_change_conflicts_without_deleting() {
+        let old = host_v4(10, 0, 0, 1, 7);
+        let new = host_v4(10, 0, 0, 1, 9);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&old)]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        // No recorded ownership: the existing row is foreign.
+        assert!(backend.ensure_route(&new, None).await.is_err());
+        let state = io.state.lock().unwrap();
+        assert!(state.replaces.is_empty());
+        assert!(state.deletes.is_empty());
+        assert_eq!(state.rows.len(), 1);
+        assert_eq!(state.rows[0].target, old.target);
+    }
+
+    #[tokio::test]
+    async fn race_changed_identity_is_not_treated_as_owned() {
+        let old = host_v4(10, 0, 0, 1, 7);
+        let new = host_v4(10, 0, 0, 1, 9);
+        let observed = synthesize(&old);
+        let previous = RouteOwnership {
+            owned: true,
+            observed: Some(observed.clone()),
+        };
+        // The proof read sees a different row than the recorded observation.
+        let mut changed = observed.clone();
+        changed.identity.metric = 5;
+        let io = Arc::new(FakeIo::new(vec![changed]).force_read(vec![synthesize(&old)]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        // The cached row differs from the recorded identity, so the replace
+        // path is not entered; the mutation is refused.
+        assert!(backend.ensure_route(&new, Some(&previous)).await.is_err());
+        assert!(io.state.lock().unwrap().replaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_only_the_exact_owned_identity() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let observed = synthesize(&intent);
+        let io = Arc::new(FakeIo::new(vec![observed.clone()]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        let owned = RouteOwnership {
+            owned: true,
+            observed: Some(observed),
+        };
+        backend.remove_route(&intent, Some(&owned)).await.unwrap();
+        assert_eq!(io.state.lock().unwrap().deletes.len(), 1);
+
+        let unowned = RouteOwnership {
+            owned: false,
+            observed: None,
+        };
+        backend.remove_route(&intent, Some(&unowned)).await.unwrap();
+        assert_eq!(io.state.lock().unwrap().deletes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thousand_duplicate_hits_after_convergence_stay_flat() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&intent)]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(io, generation);
+
+        for _ in 0..1000 {
+            let result = backend.ensure_route(&intent, None).await.unwrap();
+            assert_eq!(result.outcome, EnsureOutcome::AlreadyMatching);
+        }
+
+        let (full, targeted, adds, deletes, replaces) = snapshot_counters(&backend);
+        assert_eq!(full, 1);
+        assert_eq!(targeted, 0);
+        assert_eq!(adds, 0);
+        assert_eq!(deletes, 0);
+        assert_eq!(replaces, 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_resyncs_the_generation_for_the_fast_path() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&intent)]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(io, Arc::clone(&generation));
+        backend.ensure_cache_initialized().await.unwrap();
+
+        generation.fetch_add(3, Ordering::SeqCst);
+        backend.snapshot().await.unwrap();
+        assert_eq!(
+            backend.cache_generation.load(Ordering::SeqCst),
+            generation.load(Ordering::SeqCst)
+        );
+
+        backend.rows_for(&intent.key).await.unwrap();
+        assert_eq!(snapshot_counters(&backend).1, 0, "cache hit after resync");
     }
 }

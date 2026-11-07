@@ -41,6 +41,33 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+  netns-linux:
+    name: Privileged netns (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      # 08D1 §16.6: real /32 and /128 add/read-back, <5s event restore,
+      # 1000-duplicate flatness and foreign-row safety in a disposable
+      # network namespace.
+      - name: Run privileged netns acceptance
+        run: sudo -E ./tests/linux-route-registry-netns.sh
+
   integration-linux:
     name: Integration Tests (Linux)
     runs-on: ubuntu-latest

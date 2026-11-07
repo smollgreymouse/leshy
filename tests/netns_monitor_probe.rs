@@ -22,7 +22,8 @@ async fn raw_monitor_sees_route_churn() {
     let mut socket = Socket::new(NETLINK_ROUTE).expect("socket");
     socket.bind(&SocketAddr::new(0, 0)).expect("bind");
     socket.add_membership(1).expect("link membership");
-    socket.add_membership(7).expect("route membership");
+    socket.add_membership(7).expect("ipv4 route membership");
+    socket.add_membership(11).expect("ipv6 route membership");
     socket.set_non_blocking(true).expect("non-blocking");
 
     Command::new("ip")

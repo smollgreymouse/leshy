@@ -154,7 +154,7 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
 
     // --- stable state: repeated classifications write nothing ------------
     let stable_before = kernel_table();
-    for _ in 0..50 {
+    for _ in 0..1000 {
         manager
             .add_route(IpAddr::V4(V4_HOST), &zone)
             .await
@@ -185,8 +185,9 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         !kernel_table().contains(&format!("{V4_HOST} dev")),
         "the request path must not restore the row: kernel drift is the monitor's job"
     );
+    // §16.6: <5s proves the event path, not the 30s periodic audit.
     let restored = wait_for(
-        Duration::from_secs(10),
+        Duration::from_secs(5),
         || kernel_table().contains(&format!("{V4_HOST} dev")),
         "the monitor must restore the externally deleted row",
     )
@@ -195,7 +196,7 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
     let after_restore = kernel_table();
 
     // Repeated classifications after the restore stay flat.
-    for _ in 0..50 {
+    for _ in 0..1000 {
         manager.add_route(IpAddr::V4(V4_HOST), &zone).await.unwrap();
     }
     assert_eq!(kernel_table(), after_restore);
@@ -210,7 +211,7 @@ async fn real_kernel_add_readback_delete_and_conflict_safety() {
         table.contains(&format!("{V6_HOST} dev")),
         "the /128 row must exist after the add:\n{table}"
     );
-    for _ in 0..50 {
+    for _ in 0..1000 {
         manager.add_route(IpAddr::V6(V6_HOST), &zone).await.unwrap();
     }
     assert!(kernel_table().contains(&format!("{V6_HOST} dev")));
@@ -335,12 +336,57 @@ async fn real_kernel_dual_stack_through_one_device() {
     );
 }
 
-// 08D1 stage skeleton (packet §32 Stage 0 item 4): remove #[ignore] at the
-// start of stage L11 and drive it green there.
-#[test]
-#[ignore = "stage L11: external /128 delete must be restored by the IPv6 route event in <5s (packet §16.5/§16.6)"]
-fn ipv6_route_event_restores_externally_deleted_128() {
-    // Owner stage L11 adds RTNLGRP_IPV6_ROUTE membership to the monitor and
-    // proves an externally deleted /128 selected route is restored by the
-    // event path, not by the 30s periodic audit.
+/// §16.5/§16.6: an externally deleted /128 is restored by the IPv6 route
+/// event, not by the 30s periodic audit. The wait is <5s so the audit cannot
+/// be the mechanism.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn ipv6_route_event_restores_externally_deleted_128() {
+    let Some(_dev) = netns_dev() else {
+        eprintln!("skipping: not inside the netns harness (LESHY_NETNS_DEV unset)");
+        return;
+    };
+    assert!(running_as_root(), "the netns harness runs as root");
+    init_tracing();
+    clear_test_prefixes();
+
+    let (manager, config) = manager_with_dev_zone().await;
+    let zone = config.zones[0].clone();
+    const V6_HOST: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x55, 0, 0, 0, 0, 0, 7);
+
+    manager
+        .add_route(IpAddr::V6(V6_HOST), &zone)
+        .await
+        .expect("v6 /128 add");
+    assert!(
+        kernel_table().contains(&format!("{V6_HOST} dev")),
+        "the /128 row must exist before the external delete"
+    );
+
+    Command::new("ip")
+        .args([
+            "-6",
+            "route",
+            "del",
+            &format!("{V6_HOST}/128"),
+            "table",
+            "main",
+        ])
+        .output()
+        .expect("delete the /128 row externally");
+    assert!(
+        !kernel_table().contains(&format!("{V6_HOST} dev")),
+        "the /128 row must be gone after the external delete"
+    );
+
+    let restored = wait_for(
+        Duration::from_secs(5),
+        || kernel_table().contains(&format!("{V6_HOST} dev")),
+        "the IPv6 route event must restore the /128 row",
+    )
+    .await;
+    assert!(
+        restored,
+        "the /128 row must be restored by the IPv6 event in <5s"
+    );
 }
