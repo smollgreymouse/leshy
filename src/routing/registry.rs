@@ -18,7 +18,7 @@ use crate::routing::backend::{
 };
 use crate::routing::model::*;
 use anyhow::{bail, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
