@@ -341,6 +341,76 @@ impl RouteRegistry {
 
     /// Retire exactly one owned intent (old-zone state during a reload).
     ///
+    /// Remove every route this process actually owns (08D1 §14.5/§19.5):
+    /// snapshots the keys in deterministic order, locks each entry through
+    /// the existing per-key serialization, and calls the backend only for
+    /// entries whose recorded ownership says owned=true. A deletion error
+    /// keeps the entry/evidence and is returned; the entry is not erased
+    /// from memory first.
+    pub(crate) async fn remove_all_owned(
+        &self,
+        backend: &dyn RouteBackend,
+    ) -> anyhow::Result<usize> {
+        let ordered = {
+            let map = self.entries.read().await;
+            let mut keys: Vec<RouteKey> = map.keys().cloned().collect();
+            keys.sort_by(|a, b| {
+                a.prefix
+                    .network
+                    .to_string()
+                    .cmp(&b.prefix.network.to_string())
+                    .then(a.prefix.prefix_len.cmp(&b.prefix.prefix_len))
+                    .then(a.table.cmp(&b.table))
+            });
+            keys
+        };
+
+        let mut removed = 0usize;
+        let mut last_error = None;
+        for key in ordered {
+            let entry = {
+                let map = self.entries.read().await;
+                map.get(&key).cloned()
+            };
+            let Some(entry) = entry else {
+                continue;
+            };
+            let (intent, ownership) = {
+                let locked = entry.lock().await;
+                match locked.desired.clone() {
+                    Some(intent) => (intent, locked.ownership.clone()),
+                    None => continue,
+                }
+            };
+            match backend.remove_route(&intent, ownership.as_ref()).await {
+                Ok(()) => {
+                    let mut locked = entry.lock().await;
+                    // Only erase the entry when the ownership was ours to
+                    // delete; a None/owned=false call was a no-op.
+                    let was_owned =
+                        matches!(ownership.as_ref(), Some(RouteOwnership { owned: true, .. }));
+                    if was_owned {
+                        locked.desired = None;
+                        locked.ownership = None;
+                        locked.state = RouteState::Pending;
+                        if intent.source == RouteSource::Dns {
+                            self.dynamic_count.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        removed += 1;
+                    }
+                }
+                Err(e) => {
+                    // Keep the entry/evidence; do not erase from memory first.
+                    last_error.get_or_insert(e);
+                }
+            }
+        }
+        match last_error {
+            Some(e) => Err(e),
+            None => Ok(removed),
+        }
+    }
+
     /// The kernel row is deleted and the registry entry dropped only when the
     /// entry's desired intent is still `intent` — a replacement intent that
     /// was verified in the meantime keeps the entry and its kernel row. The
@@ -752,5 +822,185 @@ mod tests {
         assert_eq!(e1.state, RouteState::Dirty);
         let e2 = map.get(&i2.key).unwrap().lock().await;
         assert_eq!(e2.state, RouteState::Verified);
+    }
+}
+
+#[cfg(test)]
+mod targeted_epoch_tests {
+    use super::*;
+    use crate::config::ZoneConfig;
+    use crate::routing::backend::EnsureResult;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    struct CountingBackend {
+        inner: crate::routing::backend::fake::FakeBackend,
+        ensures: AtomicU64,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: crate::routing::backend::fake::FakeBackend::new(),
+                ensures: AtomicU64::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RouteBackend for CountingBackend {
+        async fn resolve_target(
+            &self,
+            zone: &ZoneConfig,
+            family: AddressFamily,
+        ) -> Result<crate::routing::model::RouteTarget> {
+            self.inner.resolve_target(zone, family).await
+        }
+
+        async fn ensure_route(
+            &self,
+            intent: &RouteIntent,
+            previous: Option<&RouteOwnership>,
+        ) -> Result<EnsureResult> {
+            self.ensures.fetch_add(1, Ordering::SeqCst);
+            self.inner.ensure_route(intent, previous).await
+        }
+
+        async fn remove_route(
+            &self,
+            intent: &RouteIntent,
+            ownership: Option<&RouteOwnership>,
+        ) -> Result<()> {
+            self.inner.remove_route(intent, ownership).await
+        }
+
+        async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
+            self.inner.snapshot().await
+        }
+
+        fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
+            None
+        }
+    }
+
+    // §15: a targeted Prefix invalidation marks only the matching entry
+    // Dirty and re-verifies it against the CURRENT epoch — the unaffected
+    // Verified entry keeps its fast path without an extra ensure call.
+    #[tokio::test]
+    async fn targeted_invalidation_leaves_unrelated_entries_fast() {
+        let backend = Arc::new(CountingBackend::new());
+        let reg = RouteRegistry::new(16384);
+
+        let _zone = crate::config::ZoneConfig {
+            name: "corp".into(),
+            mode: crate::config::ZoneMode::Inclusive,
+            dns_servers: vec![],
+            route_type: crate::config::RouteType::Via,
+            route_target: "10.0.0.1".into(),
+            route_target_ipv6: None,
+            domains: vec![],
+            patterns: vec![],
+            static_routes: vec![],
+            dns_protocol: crate::config::DnsProtocol::Udp,
+            cache_min_ttl: None,
+            cache_max_ttl: None,
+            cache_negative_ttl: None,
+            ipv6: false,
+        };
+
+        let a = crate::routing::model::RouteIntent {
+            key: crate::routing::model::RouteKey {
+                prefix: crate::routing::model::RoutePrefix::host(IpAddr::V4(
+                    std::net::Ipv4Addr::new(10, 1, 0, 1),
+                )),
+                table: 254,
+            },
+            zone: "corp".into(),
+            target: crate::routing::model::RouteTarget::Gateway(IpAddr::V4(
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+            )),
+            source: RouteSource::Dns,
+        };
+        let b = crate::routing::model::RouteIntent {
+            key: crate::routing::model::RouteKey {
+                prefix: crate::routing::model::RoutePrefix::host(IpAddr::V4(
+                    std::net::Ipv4Addr::new(10, 1, 0, 2),
+                )),
+                table: 254,
+            },
+            zone: "corp".into(),
+            target: a.target.clone(),
+            source: RouteSource::Dns,
+        };
+
+        reg.ensure(a.clone(), backend.as_ref(), 1).await.unwrap();
+        reg.ensure(b.clone(), backend.as_ref(), 1).await.unwrap();
+        assert_eq!(backend.ensures.load(Ordering::SeqCst), 2);
+
+        // Targeted invalidation of key A only.
+        reg.mark_dirty(
+            crate::routing::backend::RouteInvalidation::Prefix(a.key.clone()),
+            1,
+        )
+        .await;
+
+        // The unaffected entry B is still Verified at epoch 1: an ensure for
+        // B must take the fast path with zero backend calls.
+        let outcome = reg.ensure(b.clone(), backend.as_ref(), 1).await.unwrap();
+        assert_eq!(
+            outcome,
+            crate::routing::backend::EnsureOutcome::AlreadyMatching
+        );
+        assert_eq!(
+            backend.ensures.load(Ordering::SeqCst),
+            2,
+            "the unrelated Verified entry must not re-ensure"
+        );
+
+        // The affected entry A re-ensures against the current epoch.
+        reg.ensure(a.clone(), backend.as_ref(), 1).await.unwrap();
+        assert_eq!(backend.ensures.load(Ordering::SeqCst), 3);
+    }
+
+    // §14.5: remove_all_owned deletes only rows this process created and
+    // preserves foreign rows untouched.
+    #[tokio::test]
+    async fn remove_all_owned_skips_unowned_entries() {
+        let backend = Arc::new(CountingBackend::new());
+        let reg = RouteRegistry::new(16384);
+
+        let intent = crate::routing::model::RouteIntent {
+            key: crate::routing::model::RouteKey {
+                prefix: crate::routing::model::RoutePrefix::host(IpAddr::V4(
+                    std::net::Ipv4Addr::new(10, 2, 0, 1),
+                )),
+                table: 254,
+            },
+            zone: "corp".into(),
+            target: crate::routing::model::RouteTarget::Gateway(IpAddr::V4(
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+            )),
+            source: RouteSource::Dns,
+        };
+        reg.ensure(intent.clone(), backend.as_ref(), 1)
+            .await
+            .unwrap();
+
+        // The Added ownership is owned=true: cleanup deletes it.
+        let removed = reg.remove_all_owned(backend.as_ref()).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            backend.inner.removed().len(),
+            1,
+            "the owned row must be deleted"
+        );
+
+        // A second pass: the entry no longer carries a desired intent, so
+        // nothing is deleted again.
+        let removed = reg.remove_all_owned(backend.as_ref()).await.unwrap();
+        assert_eq!(removed, 0);
     }
 }

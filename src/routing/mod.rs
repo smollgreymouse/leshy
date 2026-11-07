@@ -38,7 +38,7 @@ pub fn spawn_monitor_probe(
 use crate::config::{RoutingBackend, ServerConfig, ZoneConfig};
 use aggregator::{RouteAction, RouteAggregator};
 use anyhow::{Context, Result};
-use backend::{EnsureOutcome, RouteBackend};
+use backend::{EnsureOutcome, ReconcileMode, RouteBackend};
 use registry::RouteRegistry;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -442,15 +442,32 @@ async fn reconcile_after_invalidation(
     kernel_epoch: &AtomicU64,
     invalidation: backend::RouteInvalidation,
 ) -> ReconcileReport {
-    kernel_epoch.fetch_add(1, Ordering::SeqCst);
+    // §15 targeted-epoch semantics: only a Full invalidation advances the
+    // epoch (it is the full-kernel-snapshot proof). Targeted Prefix /
+    // Interface / Zone invalidations mark the matching entries Dirty and
+    // re-verify them against the CURRENT full_epoch — unrelated Verified
+    // entries keep their fast path without any kernel I/O.
+    if matches!(invalidation, backend::RouteInvalidation::Full) {
+        kernel_epoch.fetch_add(1, Ordering::SeqCst);
+    }
     let epoch = kernel_epoch.load(Ordering::SeqCst);
     registry.mark_dirty(invalidation, epoch).await;
-    match backend.snapshot().await {
-        Ok(snapshot) => registry.reconcile_dirty(backend, &snapshot, epoch).await,
-        Err(e) => {
-            // The epoch already advanced, so no entry can claim Verified
-            // against stale kernel state until the next reconcile succeeds.
-            tracing::debug!(error = %e, "Route snapshot failed after an invalidation");
+    // §14.2: the dispatch branches on the backend's reconcile mode.
+    match backend.reconcile_mode() {
+        ReconcileMode::KernelSnapshot => match backend.snapshot().await {
+            Ok(snapshot) => registry.reconcile_dirty(backend, &snapshot, epoch).await,
+            Err(e) => {
+                // A Full invalidation already advanced the epoch, so no entry
+                // can claim Verified against stale kernel state until the
+                // next reconcile succeeds.
+                tracing::debug!(error = %e, "Route snapshot failed after an invalidation");
+                ReconcileReport::default()
+            }
+        },
+        // AuthorityOnDemand and RegistryOnly never snapshot here: the
+        // demand-driven path (L14) and the shell backend own their own
+        // revalidation.
+        ReconcileMode::AuthorityOnDemand | ReconcileMode::RegistryOnly => {
             ReconcileReport::default()
         }
     }

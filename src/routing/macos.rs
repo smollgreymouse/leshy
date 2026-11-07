@@ -5,8 +5,8 @@
 //! intents, which is what keeps repeated DNS classifications from shelling out
 //! to `route` on every query.
 
-use super::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
-use super::model::{AddressFamily, ObservedRoute, RouteIntent, RouteTarget};
+use super::backend::{EnsureOutcome, EnsureResult, ReconcileMode, RouteBackend, RouteInvalidation};
+use super::model::{AddressFamily, ObservedRoute, RouteIntent, RouteOwnership, RouteTarget};
 use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -24,6 +24,22 @@ impl MacosRouteBackend {
 
 /// Run `/sbin/route` and translate the "already there" / "not there" cases
 /// into success.
+/// Runs `/sbin/route` and reports whether the operation was tolerated as
+/// "already there" (§14.1: create-tolerated must be distinguishable from
+/// create-success so cleanup never deletes rows this process did not
+/// create).
+async fn run_route_exists(args: &[&str]) -> Result<bool> {
+    let output = Command::new("/sbin/route").args(args).output().await?;
+    if output.status.success() {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("File exists") {
+        return Ok(true);
+    }
+    anyhow::bail!("route {} failed: {stderr}", args.join(" "))
+}
+
 async fn run_route(args: &[&str], tolerate: &[&str]) -> Result<()> {
     let output = Command::new("/sbin/route").args(args).output().await?;
     if output.status.success() {
@@ -81,7 +97,18 @@ impl RouteBackend for MacosRouteBackend {
         }
     }
 
-    async fn ensure_route(&self, intent: &RouteIntent) -> Result<EnsureOutcome> {
+    fn reconcile_mode(&self) -> ReconcileMode {
+        // §14.2: the shell backend has no kernel snapshot or read-back — the
+        // registry keeps its own state without pretending an empty snapshot
+        // is kernel truth.
+        ReconcileMode::RegistryOnly
+    }
+
+    async fn ensure_route(
+        &self,
+        intent: &RouteIntent,
+        _previous: Option<&RouteOwnership>,
+    ) -> Result<EnsureResult> {
         let prefix = &intent.key.prefix;
         let dest = destination(prefix.network, prefix.prefix_len);
         let is_host = prefix.prefix_len == if prefix.network.is_ipv6() { 128 } else { 32 };
@@ -110,13 +137,47 @@ impl RouteBackend for MacosRouteBackend {
             ),
         }
 
-        // "File exists" means the row is already there. macOS has no read-back
-        // here, so the registry's dedupe is what prevents repeated calls.
-        run_route(&args, &["File exists"]).await?;
-        Ok(EnsureOutcome::Added)
+        // §14.1: "File exists" must return owned=false — the row was not
+        // created by this process. A successful create returns owned=true
+        // with observed=None (the explicit macOS platform limitation: no
+        // read-back).
+        let existed = run_route_exists(&args).await?;
+        if existed {
+            return Ok(EnsureResult {
+                outcome: EnsureOutcome::AlreadyMatching,
+                ownership: RouteOwnership {
+                    owned: false,
+                    observed: None,
+                },
+            });
+        }
+        Ok(EnsureResult {
+            outcome: EnsureOutcome::Added,
+            ownership: RouteOwnership {
+                owned: true,
+                observed: None,
+            },
+        })
     }
 
-    async fn remove_route(&self, intent: &RouteIntent) -> Result<()> {
+    async fn remove_route(
+        &self,
+        intent: &RouteIntent,
+        ownership: Option<&RouteOwnership>,
+    ) -> Result<()> {
+        // §14.5: no ownership or owned=false performs no delete — a row this
+        // process did not create is not ours to remove.
+        match ownership {
+            Some(RouteOwnership {
+                owned: true,
+                observed: None,
+            })
+            | Some(RouteOwnership {
+                owned: true,
+                observed: Some(_),
+            }) => {}
+            _ => return Ok(()),
+        }
         let prefix = &intent.key.prefix;
         let dest = destination(prefix.network, prefix.prefix_len);
         let is_host = prefix.prefix_len == if prefix.network.is_ipv6() { 128 } else { 32 };
