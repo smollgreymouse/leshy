@@ -5,10 +5,10 @@
 //! not a match. The kernel is the source of truth, so every mutation is
 //! followed by a read-back of the affected prefix.
 
-use super::backend::{EnsureOutcome, RouteBackend, RouteInvalidation};
+use super::backend::{EnsureOutcome, EnsureResult, RouteBackend, RouteInvalidation};
 use super::model::{AddressFamily, ObservedRoute, RouteIntent, RouteKey, RoutePrefix, RouteTarget};
 use crate::config::{RouteType, ZoneConfig};
-use crate::routing::model::RouteKernelIdentity;
+use crate::routing::model::{RouteKernelIdentity, RouteOwnership};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt;
