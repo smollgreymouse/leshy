@@ -238,14 +238,31 @@ impl RouteRegistry {
 
             let intent = locked.desired.clone().unwrap();
 
-            // Check if the route still exists in the snapshot.
-            let still_exists = snapshot_keys.contains(key);
-            let target_matches = still_exists
-                && snapshot
+            // §49.2: the snapshot no-op proof is the EXACT identity — same
+            // key, same target AND the same kernel identity as the recorded
+            // ownership observation. A changed protocol/metric/OIF/LUID, a
+            // disappeared row, multiple same-key rows or owned-without-
+            // observation all fall through to the backend revalidation.
+            let recorded_identity = locked
+                .ownership
+                .as_ref()
+                .and_then(|o| o.observed.as_ref())
+                .map(|o| o.identity.clone());
+            let acceptable = recorded_identity.as_ref().and_then(|identity| {
+                let same_key: Vec<&ObservedRoute> = snapshot
                     .iter()
-                    .any(|r| r.key == *key && r.target == intent.target);
+                    .filter(|r| r.key == *key && r.target == intent.target)
+                    .collect();
+                // Exactly one acceptable same-key row with the identical
+                // recorded identity.
+                if same_key.len() == 1 && same_key[0].identity == *identity {
+                    Some(())
+                } else {
+                    None
+                }
+            });
 
-            if target_matches {
+            if acceptable.is_some() {
                 locked.state = RouteState::Verified;
                 locked.verified_epoch = epoch;
                 locked.dirty_epoch = epoch;
@@ -341,6 +358,45 @@ impl RouteRegistry {
 
     /// Retire exactly one owned intent (old-zone state during a reload).
     ///
+    /// Retire the route registered under one exact key (08D1 §49.1): the
+    /// per-key entry lock is taken, the CURRENT desired intent and recorded
+    /// ownership are re-read (a key reassigned to another zone/newer owner is
+    /// refused), the backend removes through that actual ownership, and the
+    /// registry entry plus dynamic count are erased only after success.
+    pub(crate) async fn retire_key(
+        &self,
+        key: &RouteKey,
+        expected_zone: &str,
+        backend: &dyn RouteBackend,
+    ) -> Result<()> {
+        let entry = {
+            let map = self.entries.read().await;
+            map.get(key).cloned()
+        };
+        let Some(entry) = entry else {
+            // Nothing registered: absence is success.
+            return Ok(());
+        };
+        let mut locked = entry.lock().await;
+        let Some(intent) = locked.desired.clone() else {
+            return Ok(());
+        };
+        // §49.1: refuse retirement when the key has been reassigned to
+        // another zone or a newer logical owner.
+        if intent.zone != expected_zone {
+            bail!(RouteError::Conflict);
+        }
+        let ownership = locked.ownership.clone();
+        backend.remove_route(&intent, ownership.as_ref()).await?;
+        locked.desired = None;
+        locked.ownership = None;
+        locked.state = RouteState::Pending;
+        if intent.source == RouteSource::Dns {
+            self.dynamic_count.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     /// Remove every route this process actually owns (08D1 §14.5/§19.5):
     /// snapshots the keys in deterministic order, locks each entry through
     /// the existing per-key serialization, and calls the backend only for
@@ -738,9 +794,9 @@ mod tests {
         // Reconcile with a matching snapshot — no-op.
         let observed = ObservedRoute {
             identity: crate::routing::model::RouteKernelIdentity {
-                ifindex: None,
+                ifindex: Some(1),
                 next_hop: None,
-                protocol: 0,
+                protocol: 3,
                 metric: 0,
                 scope: 0,
                 interface_luid: None,

@@ -107,7 +107,7 @@ impl RouteBackend for MacosRouteBackend {
     async fn ensure_route(
         &self,
         intent: &RouteIntent,
-        _previous: Option<&RouteOwnership>,
+        previous: Option<&RouteOwnership>,
     ) -> Result<EnsureResult> {
         let prefix = &intent.key.prefix;
         let dest = destination(prefix.network, prefix.prefix_len);
@@ -137,16 +137,22 @@ impl RouteBackend for MacosRouteBackend {
             ),
         }
 
-        // §14.1: "File exists" must return owned=false — the row was not
-        // created by this process. A successful create returns owned=true
-        // with observed=None (the explicit macOS platform limitation: no
-        // read-back).
+        // §49.4: "File exists" with durable in-memory creation evidence
+        // (previous owned=true for the same desired intent) PRESERVES
+        // owned=true — no macOS path may convert an owned route to foreign
+        // merely because a duplicate create reported File exists. A fresh
+        // process (no previous ownership) reports owned=false.
         let existed = run_route_exists(&args).await?;
         if existed {
+            let previous_owned = previous.map(|o| o.owned).unwrap_or(false);
+            let same_desired = previous
+                .and_then(|o| o.observed.as_ref())
+                .map(|o| o.key == intent.key)
+                .unwrap_or(true);
             return Ok(EnsureResult {
                 outcome: EnsureOutcome::AlreadyMatching,
                 ownership: RouteOwnership {
-                    owned: false,
+                    owned: previous_owned && same_desired,
                     observed: None,
                 },
             });

@@ -320,11 +320,24 @@ pub(crate) mod fake {
                 None => EnsureOutcome::Added,
             };
             // The fake reports ownership without a kernel: Added rows are
-            // this process's, AlreadyMatching rows are pre-existing.
+            // this process's with a deterministic observed identity (so
+            // §49.2 exact-identity snapshot proofs hold), AlreadyMatching
+            // rows are pre-existing with no observation.
             let ownership = match outcome {
                 EnsureOutcome::Added => RouteOwnership {
                     owned: true,
-                    observed: None,
+                    observed: Some(ObservedRoute {
+                        key: intent.key.clone(),
+                        target: intent.target.clone(),
+                        identity: crate::routing::model::RouteKernelIdentity {
+                            ifindex: Some(1),
+                            next_hop: None,
+                            protocol: 3,
+                            metric: 0,
+                            scope: 0,
+                            interface_luid: None,
+                        },
+                    }),
                 },
                 EnsureOutcome::AlreadyMatching => RouteOwnership {
                     owned: false,

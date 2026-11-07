@@ -119,6 +119,15 @@ impl RouteManager {
     /// Both are best-effort: a platform without an invalidation stream simply
     /// keeps the audit, and a failed audit is logged rather than fatal.
     fn start_kernel_watch(&self) {
+        // §49.3: the scheduler follows the backend's reconcile mode.
+        // AuthorityOnDemand: the controller owns its own kernel audit and
+        // publishes targeted invalidations — no synthetic 30s Full here.
+        // RegistryOnly: no kernel observer and no periodic Full — registry
+        // state stays stable until an explicit lifecycle event, so a
+        // tolerated re-create never flips owned=true back to owned=false.
+        if self.backend.reconcile_mode() != ReconcileMode::KernelSnapshot {
+            return;
+        }
         if let Some(mut rx) = self.backend.take_invalidation_receiver() {
             let epoch = Arc::clone(&self.kernel_epoch);
             let registry = Arc::clone(&self.registry);
@@ -319,10 +328,14 @@ impl RouteManager {
                 };
                 self.ensure_intent(intent).await.map(|_| ())
             }
-            // §14.4: the aggregated Remove bypasses the registry, so the
-            // exact owned identity is unknown here; the L11 registry path
-            // (remove_all_owned/retire) owns the authoritative cleanup.
-            RouteAction::Remove(intent) => self.backend.remove_route(intent, None).await,
+            // §49.1: the aggregated Remove retires through the registry —
+            // the recorded actual intent/ownership decides, never a planner
+            // guess with None ownership.
+            RouteAction::Remove(intent) => {
+                self.registry
+                    .retire_key(&intent.key, &intent.zone, self.backend.as_ref())
+                    .await
+            }
         }
     }
 
@@ -382,6 +395,17 @@ impl RouteManager {
             errors = report.errors,
             "Zone routes retired"
         );
+        // §49.6: an exact-delete failure must surface — a caller (reload or
+        // operator cleanup) must not claim successful retirement while old
+        // owned rows remain.
+        if report.errors > 0 {
+            anyhow::bail!(
+                "zone '{}' cleanup retired {} route(s) but {} deletion(s) failed; ownership evidence kept",
+                zone_name,
+                report.removed,
+                report.errors
+            );
+        }
         Ok(())
     }
 
@@ -707,7 +731,7 @@ mod tests {
             key: ensured[0].key.clone(),
             target: ensured[0].target.clone(),
             identity: crate::routing::model::RouteKernelIdentity {
-                ifindex: None,
+                ifindex: Some(1),
                 next_hop: None,
                 protocol: 3,
                 metric: 0,
@@ -839,9 +863,9 @@ mod tests {
             key: intent.key,
             target: intent.target,
             identity: crate::routing::model::RouteKernelIdentity {
-                ifindex: None,
+                ifindex: Some(1),
                 next_hop: None,
-                protocol: 0,
+                protocol: 3,
                 metric: 0,
                 scope: 0,
                 interface_luid: None,
@@ -871,9 +895,9 @@ mod tests {
                     key: intent.key,
                     target: intent.target,
                     identity: crate::routing::model::RouteKernelIdentity {
-                        ifindex: None,
+                        ifindex: Some(1),
                         next_hop: None,
-                        protocol: 0,
+                        protocol: 3,
                         metric: 0,
                         scope: 0,
                         interface_luid: None,
