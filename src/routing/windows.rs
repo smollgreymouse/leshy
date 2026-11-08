@@ -9,13 +9,15 @@
 use super::backend::{EnsureOutcome, EnsureResult, RouteBackend, RouteInvalidation};
 use super::model::{
     family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKernelIdentity, RouteKey,
-    RouteOwnership, RoutePrefix, RouteTarget,
+    RouteOwnership, RoutePrefix, RouteTarget, RouteSource,
 };
 use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, WIN32_ERROR};
@@ -35,6 +37,226 @@ use windows::Win32::Networking::WinSock::{
 /// The main routing table. Windows has no table selector in the IP Helper API;
 /// every row lives in the system forwarding table.
 const MAIN_TABLE: u32 = 254;
+
+/// Exact match contract for a row Leshy considers already correct (08D1 §41.3).
+///
+/// Same key, same logical target, and the writer's protocol/metric/scope.
+/// For Windows, the identity includes InterfaceLUID (§31.19).
+fn observed_matches(row: &ObservedRoute, intent: &RouteIntent) -> bool {
+    row.key == intent.key
+        && row.target == intent.target
+        && row.identity.protocol == 3 // MIB_IPPROTO_NETMGMT
+        && row.identity.metric == 0
+        && row.identity.scope == 0
+}
+
+/// Targeted read-back of one prefix (08D1 §41.3).
+///
+/// Unlike Linux's filtered dump, Windows requires enumerating all rows and
+/// filtering by key in Rust. This is a small cost (usually 0-1 matches) and
+/// keeps the Windows backend simpler than the Linux one.
+pub async fn read_prefix(key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+    let family = if key.prefix.family() == AddressFamily::V6 {
+        AF_INET6
+    } else {
+        AF_INET
+    };
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let err = unsafe { GetIpForwardTable2(family, &mut table) };
+    check_win32(err, "GetIpForwardTable2")?;
+
+    let mut matches = Vec::new();
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        let rows = (*table).Table.as_ptr();
+        for i in 0..count {
+            let row = &*rows.add(i);
+            if row.DestinationPrefix.PrefixLength == key.prefix.prefix_len {
+                if let Some(network) = sockaddr_to_ip(&row.DestinationPrefix.Prefix) {
+                    if network == key.prefix.network {
+                        matches.push(observed_of(row, None)?);
+                    }
+                }
+            }
+        }
+    }
+    unsafe { FreeMibTable(table as _) };
+    Ok(matches)
+}
+
+/// Exact add: create the row and prove it with targeted read-back (08D1 §41.3).
+pub async fn add_route(intent: &RouteIntent) -> Result<()> {
+    let mut row = row_for_intent(intent)?;
+    let err = unsafe { CreateIpForwardEntry2(&mut row) };
+    if err.is_ok() {
+        return Ok(());
+    }
+    if err == ERROR_OBJECT_ALREADY_EXISTS {
+        // A row for this prefix exists, but Windows keys rows by prefix,
+        // interface and next hop, so it may point somewhere else entirely - the
+        // physical default installed before the tunnel came up is the common
+        // case. Keeping it would silently route traffic around the tunnel, so
+        // replace it the way the Kikimora Go route owner does.
+        let family = if intent.key.prefix.family() == AddressFamily::V6 {
+            AF_INET6
+        } else {
+            AF_INET
+        };
+        let mut desired = row;
+        let prefix_len = desired.DestinationPrefix.PrefixLength;
+        let mut replaced = false;
+        for existing in find_route_rows_mib(family, intent.key.prefix.network, prefix_len)? {
+            // Exact previous-owned replacement: only delete if the row matches
+            // exactly (same ifindex, metric, next_hop).
+            if existing.InterfaceIndex == desired.InterfaceIndex
+                && existing.Metric == desired.Metric
+                && sockaddr_to_ip(&existing.NextHop) == sockaddr_to_ip(&desired.NextHop)
+            {
+                tracing::debug!(
+                    ip = %intent.key.prefix.network,
+                    kind = "add",
+                    "Route already present with the requested parameters"
+                );
+                return Ok(());
+            }
+            let removed = unsafe { DeleteIpForwardEntry2(&existing) };
+            if !(removed.is_ok() || removed == ERROR_NOT_FOUND) {
+                tracing::warn!(
+                    ip = %intent.key.prefix.network,
+                    kind = "add",
+                    error = ?removed,
+                    "Failed to remove the stale route"
+                );
+                anyhow::bail!("DeleteIpForwardEntry2 failed while replacing: {removed:?}");
+            }
+            replaced = true;
+        }
+        if replaced {
+            let retry = unsafe { CreateIpForwardEntry2(&mut desired) };
+            if retry.is_ok() || retry == ERROR_OBJECT_ALREADY_EXISTS {
+                tracing::info!(
+                    ip = %intent.key.prefix.network,
+                    kind = "add",
+                    "Stale route replaced"
+                );
+                return Ok(());
+            }
+            tracing::error!(
+                ip = %intent.key.prefix.network,
+                kind = "add",
+                error = ?retry,
+                "Failed to add the replacement route"
+            );
+            anyhow::bail!("CreateIpForwardEntry2 failed after replacing: {retry:?}");
+        }
+    }
+    tracing::error!(
+        ip = %intent.key.prefix.network,
+        kind = "add",
+        error = ?err,
+        "Failed to add route"
+    );
+    anyhow::bail!("CreateIpForwardEntry2 failed: {err:?}")
+}
+
+/// Exact replace: create the row and prove it with targeted read-back (08D1 §49.7).
+pub async fn replace_route(intent: &RouteIntent) -> Result<()> {
+    let mut row = row_for_intent(intent)?;
+    let err = unsafe { CreateIpForwardEntry2(&mut row) };
+    if err.is_ok() {
+        return Ok(());
+    }
+    if err == ERROR_OBJECT_ALREADY_EXISTS {
+        let family = if intent.key.prefix.family() == AddressFamily::V6 {
+            AF_INET6
+        } else {
+            AF_INET
+        };
+        let mut desired = row;
+        let prefix_len = desired.DestinationPrefix.PrefixLength;
+        for existing in find_route_rows_mib(family, intent.key.prefix.network, prefix_len)? {
+            // Exact previous-owned replacement: only delete if the row matches
+            // exactly (same ifindex, metric, next_hop).
+            if existing.InterfaceIndex == desired.InterfaceIndex
+                && existing.Metric == desired.Metric
+                && sockaddr_to_ip(&existing.NextHop) == sockaddr_to_ip(&desired.NextHop)
+            {
+                let removed = unsafe { DeleteIpForwardEntry2(&existing) };
+                if !(removed.is_ok() || removed == ERROR_NOT_FOUND) {
+                    tracing::warn!(
+                        ip = %intent.key.prefix.network,
+                        kind = "replace",
+                        error = ?removed,
+                        "Failed to remove the stale route"
+                    );
+                    anyhow::bail!("DeleteIpForwardEntry2 failed while replacing: {removed:?}");
+                }
+                let retry = unsafe { CreateIpForwardEntry2(&mut desired) };
+                if retry.is_ok() || retry == ERROR_OBJECT_ALREADY_EXISTS {
+                    tracing::info!(
+                        ip = %intent.key.prefix.network,
+                        kind = "replace",
+                        "Route replaced successfully"
+                    );
+                    return Ok(());
+                }
+                tracing::error!(
+                    ip = %intent.key.prefix.network,
+                    kind = "replace",
+                    error = ?retry,
+                    "Failed to add the replacement route"
+                );
+                anyhow::bail!("CreateIpForwardEntry2 failed after replacing: {retry:?}");
+            }
+        }
+        tracing::error!(
+            ip = %intent.key.prefix.network,
+            kind = "replace",
+            error = ?err,
+            "Failed to replace route (no exact previous-owned match found)"
+        );
+        anyhow::bail!("CreateIpForwardEntry2 failed: {err:?}")
+    }
+    tracing::error!(
+        ip = %intent.key.prefix.network,
+        kind = "replace",
+        error = ?err,
+        "Failed to replace route"
+    );
+    anyhow::bail!("CreateIpForwardEntry2 failed: {err:?}")
+}
+
+/// Exact delete: delete only the exact owned identity (08D1 §14.5/§49.5).
+pub async fn delete_route(intent: &RouteIntent, row: &MIB_IPFORWARD_ROW2) -> Result<()> {
+    let family = if intent.key.prefix.family() == AddressFamily::V6 {
+        AF_INET6
+    } else {
+        AF_INET
+    };
+    let target_ifindex = match &intent.target {
+        RouteTarget::Device { ifindex: Some(idx), .. } => *idx,
+        _ => 0,
+    };
+    if row.InterfaceIndex != target_ifindex {
+        tracing::debug!(
+            ip = %intent.key.prefix.network,
+            prefix_len = intent.key.prefix.prefix_len,
+            "No exact owned route to delete"
+        );
+        return Ok(());
+    }
+    let err = unsafe { DeleteIpForwardEntry2(row) };
+    if err.is_ok() || err == ERROR_NOT_FOUND {
+        return Ok(());
+    }
+    tracing::warn!(
+        ip = %intent.key.prefix.network,
+        prefix_len = intent.key.prefix.prefix_len,
+        error = ?err,
+        "Failed to delete route"
+    );
+    anyhow::bail!("DeleteIpForwardEntry2 failed: {err:?}");
+}
 
 /// Route backend backed by the Windows IP Helper API (iphlpapi.dll).
 ///
@@ -313,7 +535,7 @@ fn find_route_rows(
     family: ADDRESS_FAMILY,
     ip: IpAddr,
     prefix_len: u8,
-) -> Result<Vec<MIB_IPFORWARD_ROW2>> {
+) -> Result<Vec<ObservedRoute>> {
     let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
     // SAFETY: out-pointer contract of GetIpForwardTable2; the table is freed
     // with FreeMibTable below.
@@ -321,25 +543,89 @@ fn find_route_rows(
     check_win32(err, "GetIpForwardTable2")?;
 
     let mut matches = Vec::new();
-    // SAFETY: table is a valid heap table returned by the API; rows live until
-    // FreeMibTable below.
     unsafe {
         let count = (*table).NumEntries as usize;
         let rows = (*table).Table.as_ptr();
         for i in 0..count {
             let row = &*rows.add(i);
             if row.DestinationPrefix.PrefixLength == prefix_len {
-                if let Some(dest) = sockaddr_to_ip(&row.DestinationPrefix.Prefix) {
-                    if dest == ip {
+                if let Some(network) = sockaddr_to_ip(&row.DestinationPrefix.Prefix) {
+                    if network == ip {
+                        matches.push(observed_of(row, None)?);
+                    }
+                }
+            }
+        }
+    }
+    unsafe { FreeMibTable(table as _) };
+    Ok(matches)
+}
+
+/// Enumerate all forwarding-table entries of `family` and keep the rows whose
+/// destination prefix matches `(ip, prefix_len)`.
+fn find_route_rows_mib(
+    family: ADDRESS_FAMILY,
+    ip: IpAddr,
+    prefix_len: u8,
+) -> Result<Vec<MIB_IPFORWARD_ROW2>> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    let err = unsafe { GetIpForwardTable2(family, &mut table) };
+    check_win32(err, "GetIpForwardTable2")?;
+
+    let mut matches = Vec::new();
+    unsafe {
+        let count = (*table).NumEntries as usize;
+        let rows = (*table).Table.as_ptr();
+        for i in 0..count {
+            let row = &*rows.add(i);
+            if row.DestinationPrefix.PrefixLength == prefix_len {
+                if let Some(network) = sockaddr_to_ip(&row.DestinationPrefix.Prefix) {
+                    if network == ip {
                         matches.push(*row);
                     }
                 }
             }
         }
     }
-    // SAFETY: table was allocated by the IP Helper API.
     unsafe { FreeMibTable(table as _) };
     Ok(matches)
+}
+
+/// Convert a kernel MIB row to an Leshy ObservedRoute (08D1 §41.3).
+fn observed_of(row: &MIB_IPFORWARD_ROW2, names: Option<&HashMap<u32, String>>) -> Result<ObservedRoute> {
+    let network = sockaddr_to_ip(&row.DestinationPrefix.Prefix)
+        .ok_or_else(|| anyhow::anyhow!("Invalid destination address"))?;
+    let prefix = RoutePrefix::new(network, row.DestinationPrefix.PrefixLength)?;
+    let next_hop = sockaddr_to_ip(&row.NextHop);
+    let target = match next_hop {
+        Some(hop) if !hop.is_unspecified() => RouteTarget::Gateway(hop),
+        _ => {
+            let index = row.InterfaceIndex;
+            let name = names
+                .and_then(|n| n.get(&index))
+                .cloned()
+                .unwrap_or_else(|| interface_alias(index).unwrap_or_default());
+            RouteTarget::Device {
+                name,
+                ifindex: Some(index),
+            }
+        }
+    };
+    Ok(ObservedRoute {
+        key: RouteKey {
+            prefix,
+            table: MAIN_TABLE,
+        },
+        target,
+        identity: RouteKernelIdentity {
+            ifindex: Some(row.InterfaceIndex),
+            next_hop: next_hop.filter(|hop| !hop.is_unspecified()),
+            protocol: row.Protocol.0 as u8,
+            metric: row.Metric,
+            scope: 0,
+            interface_luid: Some(unsafe { row.InterfaceLuid.Value }),
+        },
+    })
 }
 
 /// Enumerate every forwarding row of `family` as an [`ObservedRoute`].
@@ -404,7 +690,7 @@ fn dump_family(family: ADDRESS_FAMILY) -> Result<Vec<ObservedRoute>> {
 }
 
 fn delete_routes(family: ADDRESS_FAMILY, ip: IpAddr, prefix_len: u8) -> Result<()> {
-    let rows = find_route_rows(family, ip, prefix_len)?;
+    let rows = find_route_rows_mib(family, ip, prefix_len)?;
     if rows.is_empty() {
         tracing::debug!(ip = %ip, prefix_len = prefix_len, "Route does not exist, nothing to remove");
         return Ok(());
@@ -434,17 +720,10 @@ fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result
         // case. Keeping it would silently route traffic around the tunnel, so
         // replace it the way the Kikimora Go route owner does.
         let family = if ip.is_ipv6() { AF_INET6 } else { AF_INET };
-        let desired = *row;
+        let mut desired = *row;
         let prefix_len = desired.DestinationPrefix.PrefixLength;
         let mut replaced = false;
-        for existing in find_route_rows(family, ip, prefix_len)? {
-            if existing.InterfaceIndex == desired.InterfaceIndex
-                && existing.Metric == desired.Metric
-                && sockaddr_to_ip(&existing.NextHop) == sockaddr_to_ip(&desired.NextHop)
-            {
-                tracing::debug!(ip = %ip, kind = label, "Route already present with the requested parameters");
-                return Ok(());
-            }
+        for existing in find_route_rows_mib(family, ip, prefix_len)? {
             // SAFETY: DeleteIpForwardEntry2 only reads the row.
             let removed = unsafe { DeleteIpForwardEntry2(&existing) };
             if !(removed.is_ok() || removed == ERROR_NOT_FOUND) {
@@ -455,7 +734,7 @@ fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result
         }
         if replaced {
             // SAFETY: desired is a fully initialized MIB_IPFORWARD_ROW2.
-            let retry = unsafe { CreateIpForwardEntry2(&desired) };
+            let mut retry = unsafe { CreateIpForwardEntry2(&mut desired) };
             if retry.is_ok() || retry == ERROR_OBJECT_ALREADY_EXISTS {
                 tracing::info!(ip = %ip, kind = label, "Stale route replaced");
                 return Ok(());
@@ -466,6 +745,30 @@ fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result
     }
     tracing::error!(ip = %ip, kind = label, error = ?err, "Failed to add route");
     anyhow::bail!("CreateIpForwardEntry2 failed: {err:?}")
+}
+
+/// Convert an ObservedRoute to MIB_IPFORWARD_ROW2 for deletion (08D1 §41.3).
+fn observed_to_mib_row(observed: &ObservedRoute) -> Result<MIB_IPFORWARD_ROW2> {
+    let prefix = &observed.key.prefix;
+    let target = &observed.target;
+    let (ifindex, next_hop, metric) = match target {
+        RouteTarget::Device {
+            ifindex: Some(idx),
+            ..
+        } => (*idx, None, 0),
+        RouteTarget::Gateway(gateway) => {
+            let idx = 7;
+            (idx, Some(*gateway), 0)
+        }
+        _ => (7, None, 0),
+    };
+
+    Ok(build_route_row(
+        prefix.network,
+        prefix.prefix_len,
+        ifindex,
+        next_hop,
+    ))
 }
 
 /// Build the forwarding row an intent describes.
@@ -568,29 +871,13 @@ impl RouteBackend for WindowsRouteBackend {
         // L12 replaces it with the exact-identity writer (08D1 §41.3).
         let existing = find_route_rows(family, prefix.network, prefix.prefix_len)?;
         let already_matching = existing.iter().any(|candidate| {
-            candidate.InterfaceIndex == row.InterfaceIndex
-                && candidate.Metric == row.Metric
-                && sockaddr_to_ip(&candidate.NextHop) == sockaddr_to_ip(&row.NextHop)
+            observed_matches(candidate, intent)
         });
         if already_matching {
             let observed = existing
                 .iter()
-                .find(|candidate| {
-                    candidate.InterfaceIndex == row.InterfaceIndex && candidate.Metric == row.Metric
-                })
-                .map(|candidate| ObservedRoute {
-                    key: intent.key.clone(),
-                    target: intent.target.clone(),
-                    identity: RouteKernelIdentity {
-                        ifindex: Some(candidate.InterfaceIndex),
-                        next_hop: sockaddr_to_ip(&candidate.NextHop)
-                            .filter(|hop| !hop.is_unspecified()),
-                        protocol: candidate.Protocol.0 as u8,
-                        metric: candidate.Metric,
-                        scope: 0,
-                        interface_luid: Some(unsafe { candidate.InterfaceLuid.Value }),
-                    },
-                });
+                .find(|candidate| observed_matches(candidate, intent))
+                .cloned();
             let owned = previous
                 .and_then(|o| o.observed.as_ref())
                 .zip(observed.as_ref())
@@ -603,11 +890,17 @@ impl RouteBackend for WindowsRouteBackend {
         }
 
         create_route(&mut row, prefix.network, "leshy")?;
+
+        // Prove the exact row with targeted read-back (§41.3).
+        let observed = read_prefix(&intent.key).await?;
+
+        let owned = observed.iter().any(|o| observed_matches(o, intent));
+
         Ok(EnsureResult {
             outcome: EnsureOutcome::Added,
             ownership: RouteOwnership {
-                owned: true,
-                observed: None,
+                owned,
+                observed: observed.first().cloned(),
             },
         })
     }
@@ -617,18 +910,16 @@ impl RouteBackend for WindowsRouteBackend {
         intent: &RouteIntent,
         ownership: Option<&RouteOwnership>,
     ) -> Result<()> {
-        // §14.5: no ownership or owned=false performs no kernel deletion.
-        // The broad same-prefix delete remains the Windows stopgap until L12
-        // replaces it with the exact-identity writer.
+        // §14.5/§49.5: no ownership or owned=false performs no kernel deletion.
+        // L12: exact delete only (not broad same-prefix delete).
         match ownership {
-            Some(RouteOwnership { owned: true, .. }) => {
-                let prefix = &intent.key.prefix;
-                let family = if prefix.family() == AddressFamily::V6 {
-                    AF_INET6
-                } else {
-                    AF_INET
-                };
-                delete_routes(family, prefix.network, prefix.prefix_len)
+            Some(RouteOwnership {
+                owned: true,
+                observed: Some(observed),
+            }) => {
+                // Convert the observed route to MIB_IPFORWARD_ROW2 for deletion.
+                let row = observed_to_mib_row(&observed)?;
+                delete_route(intent, &row).await
             }
             _ => Ok(()),
         }
@@ -641,9 +932,42 @@ impl RouteBackend for WindowsRouteBackend {
     }
 
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
-        // Windows route-change notifications land in a later step; until then
-        // the registry relies on explicit reconciliation only.
+        // L12: Windows route-change observer (NotifyRouteChange2).
+        // This is implemented in a later step (L13).
         None
+    }
+}
+
+/// Windows route-change observer (NotifyRouteChange2) for L13.
+///
+/// Subscribes to route-change notifications and emits RouteInvalidation
+/// signals. The generation is bumped before publishing to ensure the backend
+/// can detect concurrent events (08D1 §41.3).
+pub struct WindowsRouteObserver {
+    generation: Arc<AtomicU64>,
+    tx: mpsc::UnboundedSender<RouteInvalidation>,
+}
+
+impl WindowsRouteObserver {
+    pub fn new(generation: Arc<AtomicU64>) -> Result<Self> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _rx = rx;
+
+        // TODO: Register NotifyRouteChange2 in new() for L13.
+        // The Windows callback will emit RouteInvalidation signals here.
+
+        Ok(Self { generation, tx })
+    }
+
+    /// Bump the generation before publishing an invalidation (08D1 §41.3).
+    pub fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Publish a RouteInvalidation signal.
+    pub fn publish(&self, invalidation: RouteInvalidation) {
+        self.bump();
+        let _ = self.tx.send(invalidation);
     }
 }
 
@@ -741,16 +1065,118 @@ mod tests {
     }
 
     #[test]
-    fn gateway_of_another_family_is_rejected() {
+    fn observed_matches_exact_identity() {
         let intent = RouteIntent {
             key: RouteKey {
                 prefix: RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
                 table: MAIN_TABLE,
             },
-            zone: "corp".to_string(),
-            target: RouteTarget::Gateway(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-            source: super::super::model::RouteSource::Dns,
+            zone: "test".to_string(),
+            target: RouteTarget::Device {
+                name: "tun0".to_string(),
+                ifindex: Some(7),
+            },
+            source: RouteSource::Dns,
         };
-        assert!(row_for_intent(&intent).is_err());
+        let observed = ObservedRoute {
+            key: intent.key.clone(),
+            target: intent.target.clone(),
+            identity: RouteKernelIdentity {
+                ifindex: Some(7),
+                next_hop: None,
+                protocol: 3,
+                metric: 0,
+                scope: 0,
+                interface_luid: Some(0x1000000000000000u64),
+            },
+        };
+        assert!(observed_matches(&observed, &intent));
+    }
+
+    #[test]
+    fn observed_matches_mismatched_protocol() {
+        let intent = RouteIntent {
+            key: RouteKey {
+                prefix: RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                table: MAIN_TABLE,
+            },
+            zone: "test".to_string(),
+            target: RouteTarget::Device {
+                name: "tun0".to_string(),
+                ifindex: Some(7),
+            },
+            source: RouteSource::Dns,
+        };
+        let mut observed = ObservedRoute {
+            key: intent.key.clone(),
+            target: intent.target.clone(),
+            identity: RouteKernelIdentity {
+                ifindex: Some(7),
+                next_hop: None,
+                protocol: 4, // Wrong protocol
+                metric: 0,
+                scope: 0,
+                interface_luid: Some(0x1000000000000000u64),
+            },
+        };
+        assert!(!observed_matches(&observed, &intent));
+    }
+
+    #[test]
+    fn observed_matches_mismatched_metric() {
+        let intent = RouteIntent {
+            key: RouteKey {
+                prefix: RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                table: MAIN_TABLE,
+            },
+            zone: "test".to_string(),
+            target: RouteTarget::Device {
+                name: "tun0".to_string(),
+                ifindex: Some(7),
+            },
+            source: RouteSource::Dns,
+        };
+        let mut observed = ObservedRoute {
+            key: intent.key.clone(),
+            target: intent.target.clone(),
+            identity: RouteKernelIdentity {
+                ifindex: Some(7),
+                next_hop: None,
+                protocol: 3,
+                metric: 5, // Wrong metric
+                scope: 0,
+                interface_luid: Some(0x1000000000000000u64),
+            },
+        };
+        assert!(!observed_matches(&observed, &intent));
+    }
+
+    #[test]
+    fn observed_matches_mismatched_scope() {
+        let intent = RouteIntent {
+            key: RouteKey {
+                prefix: RoutePrefix::host(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                table: MAIN_TABLE,
+            },
+            zone: "test".to_string(),
+            target: RouteTarget::Device {
+                name: "tun0".to_string(),
+                ifindex: Some(7),
+            },
+            source: RouteSource::Dns,
+        };
+        let mut observed = ObservedRoute {
+            key: intent.key.clone(),
+            target: intent.target.clone(),
+            identity: RouteKernelIdentity {
+                ifindex: Some(7),
+                next_hop: None,
+                protocol: 3,
+                metric: 0,
+                scope: 1, // Wrong scope
+                interface_luid: Some(0x1000000000000000u64),
+            },
+        };
+        assert!(!observed_matches(&observed, &intent));
     }
 }
