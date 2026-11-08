@@ -437,22 +437,26 @@ impl RouteRegistry {
                     None => continue,
                 }
             };
+            // §49.5: never call the backend for an entry this process does
+            // not own. The managed backend's remove ignores the local flag
+            // and sends ForgetLeshyRoute, so a normal shutdown must not even
+            // reach it for an unowned (controller-owned) row.
+            let owned = matches!(ownership.as_ref(), Some(RouteOwnership { owned: true, .. }));
+            if !owned {
+                continue;
+            }
             match backend.remove_route(&intent, ownership.as_ref()).await {
                 Ok(()) => {
                     let mut locked = entry.lock().await;
-                    // Only erase the entry when the ownership was ours to
-                    // delete; a None/owned=false call was a no-op.
-                    let was_owned =
-                        matches!(ownership.as_ref(), Some(RouteOwnership { owned: true, .. }));
-                    if was_owned {
-                        locked.desired = None;
-                        locked.ownership = None;
-                        locked.state = RouteState::Pending;
-                        if intent.source == RouteSource::Dns {
-                            self.dynamic_count.fetch_sub(1, Ordering::SeqCst);
-                        }
-                        removed += 1;
+                    // The entry was owned, so the backend removed our exact
+                    // row: erase the entry and release the dynamic quota.
+                    locked.desired = None;
+                    locked.ownership = None;
+                    locked.state = RouteState::Pending;
+                    if intent.source == RouteSource::Dns {
+                        self.dynamic_count.fetch_sub(1, Ordering::SeqCst);
                     }
+                    removed += 1;
                 }
                 Err(e) => {
                     // Keep the entry/evidence; do not erase from memory first.
@@ -1020,17 +1024,74 @@ mod targeted_epoch_tests {
         assert_eq!(backend.ensures.load(Ordering::SeqCst), 3);
     }
 
-    // §14.5: remove_all_owned deletes only rows this process created and
-    // preserves foreign rows untouched.
+    // §16.6: an interface event names the OLD ifindex. Only entries whose
+    // recorded device ifindex matches are invalidated; a route on another
+    // ifindex keeps its Verified fast path, and the matching one re-ensures.
+    #[tokio::test]
+    async fn interface_invalidation_targets_only_the_old_ifindex() {
+        let backend = Arc::new(CountingBackend::new());
+        let reg = RouteRegistry::new(16384);
+
+        let device_intent = |last: u8, ifindex: u32| crate::routing::model::RouteIntent {
+            key: crate::routing::model::RouteKey {
+                prefix: crate::routing::model::RoutePrefix::host(IpAddr::V4(
+                    std::net::Ipv4Addr::new(10, 3, 0, last),
+                )),
+                table: 254,
+            },
+            zone: "corp".into(),
+            target: crate::routing::model::RouteTarget::Device {
+                name: "tun0".into(),
+                ifindex: Some(ifindex),
+            },
+            source: RouteSource::Dns,
+        };
+
+        let old = device_intent(1, 7);
+        let other = device_intent(2, 8);
+        reg.ensure(old.clone(), backend.as_ref(), 1).await.unwrap();
+        reg.ensure(other.clone(), backend.as_ref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(backend.ensures.load(Ordering::SeqCst), 2);
+
+        // The deleted interface had ifindex 7.
+        reg.mark_dirty(crate::routing::backend::RouteInvalidation::Interface(7), 1)
+            .await;
+
+        // The entry on ifindex 8 is unrelated: still Verified, zero backend.
+        let outcome = reg
+            .ensure(other.clone(), backend.as_ref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::routing::backend::EnsureOutcome::AlreadyMatching
+        );
+        assert_eq!(
+            backend.ensures.load(Ordering::SeqCst),
+            2,
+            "an entry on another ifindex must not be invalidated"
+        );
+
+        // The entry that recorded the old ifindex re-ensures.
+        reg.ensure(old.clone(), backend.as_ref(), 1).await.unwrap();
+        assert_eq!(backend.ensures.load(Ordering::SeqCst), 3);
+    }
+
+    // §14.5/§49.5: remove_all_owned never calls the backend for an entry
+    // this process does not own. That is load-bearing for managed mode: the
+    // managed backend's remove sends ForgetLeshyRoute regardless of the local
+    // ownership flag, so a normal shutdown must not even reach it.
     #[tokio::test]
     async fn remove_all_owned_skips_unowned_entries() {
         let backend = Arc::new(CountingBackend::new());
         let reg = RouteRegistry::new(16384);
 
-        let intent = crate::routing::model::RouteIntent {
+        let intent = |last: u8| crate::routing::model::RouteIntent {
             key: crate::routing::model::RouteKey {
                 prefix: crate::routing::model::RoutePrefix::host(IpAddr::V4(
-                    std::net::Ipv4Addr::new(10, 2, 0, 1),
+                    std::net::Ipv4Addr::new(10, 2, 0, last),
                 )),
                 table: 254,
             },
@@ -1040,22 +1101,56 @@ mod targeted_epoch_tests {
             )),
             source: RouteSource::Dns,
         };
-        reg.ensure(intent.clone(), backend.as_ref(), 1)
+
+        // A compatible pre-existing row: owned=false, no observation.
+        let unowned = intent(1);
+        backend
+            .inner
+            .set_outcome(Ok(crate::routing::backend::EnsureOutcome::AlreadyMatching));
+        reg.ensure(unowned.clone(), backend.as_ref(), 1)
             .await
             .unwrap();
 
-        // The Added ownership is owned=true: cleanup deletes it.
+        // The backend must not be called at all for the unowned entry.
+        let removed = reg.remove_all_owned(backend.as_ref()).await.unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(
+            backend.inner.remove_count(),
+            0,
+            "an unowned entry must never reach the backend"
+        );
+        assert_eq!(
+            reg.zone_intents("corp").await.len(),
+            1,
+            "the unowned registry entry must be preserved"
+        );
+
+        // An owned entry is deleted exactly once, and only it.
+        let owned = intent(2);
+        backend
+            .inner
+            .set_outcome(Ok(crate::routing::backend::EnsureOutcome::Added));
+        reg.ensure(owned.clone(), backend.as_ref(), 1)
+            .await
+            .unwrap();
+
         let removed = reg.remove_all_owned(backend.as_ref()).await.unwrap();
         assert_eq!(removed, 1);
         assert_eq!(
             backend.inner.removed().len(),
             1,
-            "the owned row must be deleted"
+            "only the owned row must be deleted"
+        );
+        assert_eq!(backend.inner.removed()[0].key, owned.key);
+        assert_eq!(
+            reg.zone_intents("corp").await.len(),
+            1,
+            "the unowned entry survives the owned cleanup"
         );
 
-        // A second pass: the entry no longer carries a desired intent, so
-        // nothing is deleted again.
+        // A second pass: no owned entry remains, so nothing is deleted.
         let removed = reg.remove_all_owned(backend.as_ref()).await.unwrap();
         assert_eq!(removed, 0);
+        assert_eq!(backend.inner.remove_count(), 1);
     }
 }

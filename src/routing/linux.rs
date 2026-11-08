@@ -68,11 +68,19 @@ trait KernelIo: Send + Sync {
 /// rtnetlink-backed kernel I/O.
 struct NetlinkIo {
     handle: Handle,
+    /// Serializes kernel requests on the shared connection.
+    ///
+    /// `netlink_dump_start` refuses a second dump while one is running on the
+    /// same socket with `-EBUSY`, and the monitor reconcile and the DNS request
+    /// path can issue dumps concurrently (08D1 §16.2). Holding this across the
+    /// whole request/response keeps dumps and mutations from colliding.
+    io_lock: Mutex<()>,
 }
 
 #[async_trait]
 impl KernelIo for NetlinkIo {
     async fn link_names(&self) -> Result<HashMap<u32, String>> {
+        let _guard = self.io_lock.lock().await;
         let mut links = self.handle.link().get().execute();
         let mut names = HashMap::new();
         while let Some(link) = links.try_next().await? {
@@ -90,6 +98,7 @@ impl KernelIo for NetlinkIo {
     }
 
     async fn ifindex_of(&self, device: &str) -> Result<u32> {
+        let _guard = self.io_lock.lock().await;
         let mut links = self
             .handle
             .link()
@@ -108,6 +117,7 @@ impl KernelIo for NetlinkIo {
         family: AddressFamily,
         names: &HashMap<u32, String>,
     ) -> Result<Vec<ObservedRoute>> {
+        let _guard = self.io_lock.lock().await;
         let version = match family {
             AddressFamily::V4 => IpVersion::V4,
             AddressFamily::V6 => IpVersion::V6,
@@ -130,6 +140,7 @@ impl KernelIo for NetlinkIo {
         // §16.3: one filtered RouteGetRequest for the requested key, never a
         // whole-family dump. rtnetlink 0.14 is pinned; the filter is applied
         // by mutating the request message.
+        let _guard = self.io_lock.lock().await;
         let version = match key.prefix.family() {
             AddressFamily::V4 => IpVersion::V4,
             AddressFamily::V6 => IpVersion::V6,
@@ -167,6 +178,7 @@ impl KernelIo for NetlinkIo {
     }
 
     async fn add(&self, intent: &RouteIntent) -> Result<()> {
+        let _guard = self.io_lock.lock().await;
         match intent.key.prefix.network {
             IpAddr::V4(_) => {
                 let mut request = self.handle.route().add().v4();
@@ -197,6 +209,7 @@ impl KernelIo for NetlinkIo {
     async fn replace(&self, intent: &RouteIntent) -> Result<()> {
         // §49.7: NLM_F_REPLACE swaps the matching row atomically; a broad
         // delete-by-prefix is never used.
+        let _guard = self.io_lock.lock().await;
         match intent.key.prefix.network {
             IpAddr::V4(_) => {
                 let mut request = self.handle.route().add().v4().replace();
@@ -214,6 +227,7 @@ impl KernelIo for NetlinkIo {
     }
 
     async fn delete(&self, intent: &RouteIntent) -> Result<()> {
+        let _guard = self.io_lock.lock().await;
         let prefix = &intent.key.prefix;
         let mut msg = RouteMessage::default();
         // The doit handler is registered per family: a DEL with an unspecified
@@ -332,7 +346,6 @@ pub struct LinuxRouteBackend {
     io: Arc<dyn KernelIo>,
     /// One entry per key; a prefix may temporarily hold several rows.
     cache: RwLock<HashMap<RouteKey, Vec<ObservedRoute>>>,
-    link_names: RwLock<HashMap<u32, String>>,
     /// Filled exactly once by the lazy, monitor-coherent initial snapshot.
     cache_init: OnceCell<()>,
     /// Shared with the monitor; every relevant kernel event bumps it.
@@ -363,7 +376,10 @@ impl LinuxRouteBackend {
         };
 
         Ok(Self::with_io(
-            Arc::new(NetlinkIo { handle }),
+            Arc::new(NetlinkIo {
+                handle,
+                io_lock: Mutex::new(()),
+            }),
             monitor_generation,
             invalidation_rx,
         ))
@@ -377,7 +393,6 @@ impl LinuxRouteBackend {
         Self {
             io,
             cache: RwLock::new(HashMap::new()),
-            link_names: RwLock::new(HashMap::new()),
             cache_init: OnceCell::new(),
             monitor_generation,
             cache_generation: AtomicU64::new(0),
@@ -407,7 +422,6 @@ impl LinuxRouteBackend {
                 continue;
             }
             *self.cache.write().await = cache;
-            *self.link_names.write().await = names;
             self.cache_generation.store(after, Ordering::SeqCst);
             return Ok(());
         }
@@ -423,7 +437,12 @@ impl LinuxRouteBackend {
 
     /// Targeted read-back of one key; updates that cache entry only.
     async fn refresh_key(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
-        let names = self.link_names.read().await.clone();
+        // A link event may have added, removed or renamed the OIF the row
+        // points at, and the device name is part of the exact target match.
+        // Refresh the (small) link map before the targeted route read so a
+        // recreated interface never reads back as an unnamed foreign target
+        // (08D1 §16.4).
+        let names = self.io.link_names().await?;
         let rows = self.io.read_prefix(key, &names).await?;
         self.counters.targeted_reads.fetch_add(1, Ordering::SeqCst);
         let mut cache = self.cache.write().await;
@@ -922,6 +941,9 @@ mod tests {
         bump_generation: Option<Arc<AtomicU64>>,
         bump_after_first_dump: bool,
         force_read: Option<Vec<ObservedRoute>>,
+        /// Resolve a Device target's name from the `names` map handed to
+        /// `read_prefix`, like the real kernel read-back does.
+        resolve_names: bool,
     }
 
     struct FakeIo {
@@ -944,6 +966,7 @@ mod tests {
                     bump_generation: None,
                     bump_after_first_dump: false,
                     force_read: None,
+                    resolve_names: false,
                 }),
             }
         }
@@ -957,6 +980,11 @@ mod tests {
 
         fn force_read(mut self, rows: Vec<ObservedRoute>) -> Self {
             self.state.get_mut().unwrap().force_read = Some(rows);
+            self
+        }
+
+        fn resolve_names(mut self) -> Self {
+            self.state.get_mut().unwrap().resolve_names = true;
             self
         }
     }
@@ -999,19 +1027,31 @@ mod tests {
         async fn read_prefix(
             &self,
             key: &RouteKey,
-            _names: &HashMap<u32, String>,
+            names: &HashMap<u32, String>,
         ) -> Result<Vec<ObservedRoute>> {
             let mut state = self.state.lock().unwrap();
             state.reads.push(key.clone());
             if let Some(rows) = &state.force_read {
                 return Ok(rows.clone());
             }
-            Ok(state
+            let mut rows: Vec<ObservedRoute> = state
                 .rows
                 .iter()
                 .filter(|row| row.key == *key)
                 .cloned()
-                .collect())
+                .collect();
+            if state.resolve_names {
+                for row in &mut rows {
+                    if let RouteTarget::Device {
+                        ifindex: Some(index),
+                        name,
+                    } = &mut row.target
+                    {
+                        *name = names.get(index).cloned().unwrap_or_default();
+                    }
+                }
+            }
+            Ok(rows)
         }
 
         async fn add(&self, intent: &RouteIntent) -> Result<()> {
@@ -1199,21 +1239,50 @@ mod tests {
     #[tokio::test]
     async fn protocol_metric_scope_or_target_mismatch_conflicts() {
         let intent = host_v4(10, 0, 0, 1, 7);
+        let generation = Arc::new(AtomicU64::new(0));
+
+        // Wrong protocol: a same-prefix row written by someone else.
         let mut foreign = synthesize(&intent);
         foreign.identity.protocol = u8::from(RouteProtocol::Static);
-        let io = Arc::new(FakeIo::new(vec![foreign]));
-        let generation = Arc::new(AtomicU64::new(0));
-        let backend = test_backend(io, generation);
-
+        let backend = test_backend(
+            Arc::new(FakeIo::new(vec![foreign])),
+            Arc::clone(&generation),
+        );
         assert!(
             backend.ensure_route(&intent, None).await.is_err(),
             "a same-key row without Leshy's exact identity is a conflict"
         );
 
+        // Wrong metric.
+        let mut foreign = synthesize(&intent);
+        foreign.identity.metric = 5;
+        let backend = test_backend(
+            Arc::new(FakeIo::new(vec![foreign])),
+            Arc::clone(&generation),
+        );
+        assert!(
+            backend.ensure_route(&intent, None).await.is_err(),
+            "a same-key row with a different metric is a conflict"
+        );
+
+        // Wrong scope (an IPv4 device route is link scope).
+        let mut foreign = synthesize(&intent);
+        foreign.identity.scope = u8::from(RouteScope::Universe);
+        let backend = test_backend(
+            Arc::new(FakeIo::new(vec![foreign])),
+            Arc::clone(&generation),
+        );
+        assert!(
+            backend.ensure_route(&intent, None).await.is_err(),
+            "a same-key row with a different scope is a conflict"
+        );
+
         // Wrong OIF (and therefore a different Device target) is a conflict too.
         let other_ifindex = host_v4(10, 0, 0, 1, 9);
-        let io = Arc::new(FakeIo::new(vec![synthesize(&intent)]));
-        let backend = test_backend(io, Arc::new(AtomicU64::new(0)));
+        let backend = test_backend(
+            Arc::new(FakeIo::new(vec![synthesize(&intent)])),
+            Arc::new(AtomicU64::new(0)),
+        );
         assert!(backend.ensure_route(&other_ifindex, None).await.is_err());
     }
 
@@ -1345,5 +1414,37 @@ mod tests {
 
         backend.rows_for(&intent.key).await.unwrap();
         assert_eq!(snapshot_counters(&backend).1, 0, "cache hit after resync");
+    }
+
+    #[tokio::test]
+    async fn refresh_key_resolves_a_recreated_interface_name() {
+        let old = host_v4(10, 0, 0, 1, 7);
+        let new = host_v4(10, 0, 0, 1, 9);
+        let io = Arc::new(FakeIo::new(vec![synthesize(&old)]).resolve_names());
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), Arc::clone(&generation));
+
+        backend.ensure_cache_initialized().await.unwrap();
+        assert_eq!(
+            backend.ensure_route(&old, None).await.unwrap().outcome,
+            EnsureOutcome::AlreadyMatching
+        );
+
+        // The interface is recreated: the kernel keeps the device name but
+        // assigns a new ifindex, and the old row is gone with the old device.
+        {
+            let mut state = io.state.lock().unwrap();
+            state.names.clear();
+            state.names.insert(9, "tun0".to_string());
+            state.rows = vec![synthesize(&new)];
+        }
+        // A link/route event makes the cached snapshot stale.
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        // The targeted read must resolve the new ifindex's name. A stale link
+        // map reads the row back with an empty device name, which would turn
+        // the repair into a foreign conflict (08D1 §16.4/§16.6).
+        let result = backend.ensure_route(&new, None).await.unwrap();
+        assert_eq!(result.outcome, EnsureOutcome::AlreadyMatching);
     }
 }

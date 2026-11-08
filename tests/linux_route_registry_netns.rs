@@ -48,6 +48,7 @@ fn ip(args: &[&str]) -> String {
 fn clear_test_prefixes() {
     for prefix in [
         "10.55.7.1/32",
+        "10.55.7.3/32",
         "10.55.8.1/32",
         "10.55.9.9/32",
         "fd00:55::7/128",
@@ -66,6 +67,15 @@ fn kernel_table() -> String {
         ip(&["route", "show", "table", "main"]),
         ip(&["-6", "route", "show", "table", "main"])
     )
+}
+
+/// The current kernel ifindex of a device, from `ip -o link show`.
+fn ifindex(dev: &str) -> u32 {
+    let line = ip(&["-o", "link", "show", "dev", dev]);
+    line.split(':')
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("cannot parse the ifindex from {line:?}"))
 }
 
 /// Poll a kernel-truth condition; monitor-driven changes are asynchronous
@@ -388,5 +398,82 @@ async fn ipv6_route_event_restores_externally_deleted_128() {
     assert!(
         restored,
         "the /128 row must be restored by the IPv6 event in <5s"
+    );
+}
+
+/// §16.6: deleting and recreating the interface invalidates the old ifindex.
+/// The kernel drops the route with the device; the monitor observes the
+/// link/route deletion, and the next classification re-resolves the device
+/// and installs the exact row through the NEW ifindex. A stale ownership
+/// record must not turn the repair into a conflict or a fast-path no-op.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn real_kernel_interface_recreate_invalidates_old_ifindex() {
+    let Some(dev) = netns_dev() else {
+        eprintln!("skipping: not inside the netns harness (LESHY_NETNS_DEV unset)");
+        return;
+    };
+    assert!(running_as_root(), "the netns harness runs as root");
+    init_tracing();
+    clear_test_prefixes();
+
+    let (manager, config) = manager_with_dev_zone().await;
+    let zone = config.zones[0].clone();
+    const HOST: Ipv4Addr = Ipv4Addr::new(10, 55, 7, 3);
+
+    manager
+        .add_route(IpAddr::V4(HOST), &zone)
+        .await
+        .expect("add through the original device");
+    assert!(
+        kernel_table().contains(&format!("{HOST} dev")),
+        "the row must exist before the interface is deleted"
+    );
+    let old_ifindex = ifindex(&dev);
+
+    // Deleting the interface makes the kernel drop every route through it.
+    ip(&["link", "del", "dev", &dev]);
+    assert!(
+        !kernel_table().contains(&format!("{HOST} dev")),
+        "the kernel removes the route when the device is deleted"
+    );
+
+    // Let the monitor observe the link/route deletion and fail its reconcile
+    // against the now-stale ifindex.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Recreate the device under the same name; the kernel assigns a new index.
+    ip(&["link", "add", &dev, "type", "dummy"]);
+    ip(&["address", "add", "10.55.0.254/24", "dev", &dev]);
+    ip(&["-6", "address", "add", "fd00:55::254/64", "dev", &dev]);
+    ip(&["link", "set", &dev, "up"]);
+    let new_ifindex = ifindex(&dev);
+    assert_ne!(
+        new_ifindex, old_ifindex,
+        "a recreated device must carry a new ifindex"
+    );
+
+    // The next classification resolves the device afresh and installs the
+    // exact row through the new ifindex.
+    manager
+        .add_route(IpAddr::V4(HOST), &zone)
+        .await
+        .expect("re-add after the interface was recreated");
+    assert!(
+        kernel_table().contains(&format!("{HOST} dev")),
+        "the row must be restored through the recreated device:\n{}",
+        kernel_table()
+    );
+
+    manager.cleanup_zone(&zone.name).await.unwrap();
+    let _ = wait_for(
+        Duration::from_secs(5),
+        || !kernel_table().contains(&format!("{HOST} dev")),
+        "cleanup removes the row installed through the new ifindex",
+    )
+    .await;
+    assert!(
+        !kernel_table().contains(&format!("{HOST} dev")),
+        "the row installed through the new ifindex must be cleaned up"
     );
 }
