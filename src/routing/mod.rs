@@ -91,6 +91,8 @@ impl RouteManager {
                 let backend: Arc<dyn RouteBackend> = Arc::new(kikimora::KikimoraRouteBackend::new(
                     socket,
                     server.kikimora_auth_file.as_deref(),
+                    server.kikimora_activation_id.as_deref(),
+                    server.kikimora_mode_generation,
                 )?);
                 Ok(Self::from_backend(
                     backend,

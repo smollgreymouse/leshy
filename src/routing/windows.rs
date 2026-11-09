@@ -9,15 +9,15 @@
 use super::backend::{EnsureOutcome, EnsureResult, RouteBackend, RouteInvalidation};
 use super::model::{
     family_of, AddressFamily, ObservedRoute, RouteIntent, RouteKernelIdentity, RouteKey,
-    RouteOwnership, RoutePrefix, RouteTarget, RouteSource,
+    RouteOwnership, RoutePrefix, RouteTarget,
 };
 use crate::config::{RouteType, ZoneConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, WIN32_ERROR};
@@ -85,9 +85,13 @@ pub async fn read_prefix(key: &RouteKey) -> Result<Vec<ObservedRoute>> {
 }
 
 /// Exact add: create the row and prove it with targeted read-back (08D1 §41.3).
+///
+/// Kept for the WindowsRouteApi seam; the backend currently installs rows
+/// through `create_route` and proves them with `read_prefix`.
+#[allow(dead_code)]
 pub async fn add_route(intent: &RouteIntent) -> Result<()> {
-    let mut row = row_for_intent(intent)?;
-    let err = unsafe { CreateIpForwardEntry2(&mut row) };
+    let row = row_for_intent(intent)?;
+    let err = unsafe { CreateIpForwardEntry2(&row) };
     if err.is_ok() {
         return Ok(());
     }
@@ -102,7 +106,7 @@ pub async fn add_route(intent: &RouteIntent) -> Result<()> {
         } else {
             AF_INET
         };
-        let mut desired = row;
+        let desired = row;
         let prefix_len = desired.DestinationPrefix.PrefixLength;
         let mut replaced = false;
         for existing in find_route_rows_mib(family, intent.key.prefix.network, prefix_len)? {
@@ -132,7 +136,7 @@ pub async fn add_route(intent: &RouteIntent) -> Result<()> {
             replaced = true;
         }
         if replaced {
-            let retry = unsafe { CreateIpForwardEntry2(&mut desired) };
+            let retry = unsafe { CreateIpForwardEntry2(&desired) };
             if retry.is_ok() || retry == ERROR_OBJECT_ALREADY_EXISTS {
                 tracing::info!(
                     ip = %intent.key.prefix.network,
@@ -160,9 +164,12 @@ pub async fn add_route(intent: &RouteIntent) -> Result<()> {
 }
 
 /// Exact replace: create the row and prove it with targeted read-back (08D1 §49.7).
+///
+/// Kept for the WindowsRouteApi seam; see `add_route`.
+#[allow(dead_code)]
 pub async fn replace_route(intent: &RouteIntent) -> Result<()> {
-    let mut row = row_for_intent(intent)?;
-    let err = unsafe { CreateIpForwardEntry2(&mut row) };
+    let row = row_for_intent(intent)?;
+    let err = unsafe { CreateIpForwardEntry2(&row) };
     if err.is_ok() {
         return Ok(());
     }
@@ -172,7 +179,7 @@ pub async fn replace_route(intent: &RouteIntent) -> Result<()> {
         } else {
             AF_INET
         };
-        let mut desired = row;
+        let desired = row;
         let prefix_len = desired.DestinationPrefix.PrefixLength;
         for existing in find_route_rows_mib(family, intent.key.prefix.network, prefix_len)? {
             // Exact previous-owned replacement: only delete if the row matches
@@ -191,7 +198,7 @@ pub async fn replace_route(intent: &RouteIntent) -> Result<()> {
                     );
                     anyhow::bail!("DeleteIpForwardEntry2 failed while replacing: {removed:?}");
                 }
-                let retry = unsafe { CreateIpForwardEntry2(&mut desired) };
+                let retry = unsafe { CreateIpForwardEntry2(&desired) };
                 if retry.is_ok() || retry == ERROR_OBJECT_ALREADY_EXISTS {
                     tracing::info!(
                         ip = %intent.key.prefix.network,
@@ -228,13 +235,10 @@ pub async fn replace_route(intent: &RouteIntent) -> Result<()> {
 
 /// Exact delete: delete only the exact owned identity (08D1 §14.5/§49.5).
 pub async fn delete_route(intent: &RouteIntent, row: &MIB_IPFORWARD_ROW2) -> Result<()> {
-    let family = if intent.key.prefix.family() == AddressFamily::V6 {
-        AF_INET6
-    } else {
-        AF_INET
-    };
     let target_ifindex = match &intent.target {
-        RouteTarget::Device { ifindex: Some(idx), .. } => *idx,
+        RouteTarget::Device {
+            ifindex: Some(idx), ..
+        } => *idx,
         _ => 0,
     };
     if row.InterfaceIndex != target_ifindex {
@@ -592,7 +596,10 @@ fn find_route_rows_mib(
 }
 
 /// Convert a kernel MIB row to an Leshy ObservedRoute (08D1 §41.3).
-fn observed_of(row: &MIB_IPFORWARD_ROW2, names: Option<&HashMap<u32, String>>) -> Result<ObservedRoute> {
+fn observed_of(
+    row: &MIB_IPFORWARD_ROW2,
+    names: Option<&HashMap<u32, String>>,
+) -> Result<ObservedRoute> {
     let network = sockaddr_to_ip(&row.DestinationPrefix.Prefix)
         .ok_or_else(|| anyhow::anyhow!("Invalid destination address"))?;
     let prefix = RoutePrefix::new(network, row.DestinationPrefix.PrefixLength)?;
@@ -689,23 +696,6 @@ fn dump_family(family: ADDRESS_FAMILY) -> Result<Vec<ObservedRoute>> {
     Ok(out)
 }
 
-fn delete_routes(family: ADDRESS_FAMILY, ip: IpAddr, prefix_len: u8) -> Result<()> {
-    let rows = find_route_rows_mib(family, ip, prefix_len)?;
-    if rows.is_empty() {
-        tracing::debug!(ip = %ip, prefix_len = prefix_len, "Route does not exist, nothing to remove");
-        return Ok(());
-    }
-    for row in rows {
-        // SAFETY: DeleteIpForwardEntry2 only reads the row.
-        let err = unsafe { DeleteIpForwardEntry2(&row) };
-        if err.is_ok() || err == ERROR_NOT_FOUND {
-            continue;
-        }
-        anyhow::bail!("DeleteIpForwardEntry2 failed: {err:?}");
-    }
-    Ok(())
-}
-
 fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result<()> {
     // SAFETY: row is a fully initialized MIB_IPFORWARD_ROW2.
     let err = unsafe { CreateIpForwardEntry2(row) };
@@ -720,7 +710,7 @@ fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result
         // case. Keeping it would silently route traffic around the tunnel, so
         // replace it the way the Kikimora Go route owner does.
         let family = if ip.is_ipv6() { AF_INET6 } else { AF_INET };
-        let mut desired = *row;
+        let desired = *row;
         let prefix_len = desired.DestinationPrefix.PrefixLength;
         let mut replaced = false;
         for existing in find_route_rows_mib(family, ip, prefix_len)? {
@@ -734,7 +724,7 @@ fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result
         }
         if replaced {
             // SAFETY: desired is a fully initialized MIB_IPFORWARD_ROW2.
-            let mut retry = unsafe { CreateIpForwardEntry2(&mut desired) };
+            let retry = unsafe { CreateIpForwardEntry2(&desired) };
             if retry.is_ok() || retry == ERROR_OBJECT_ALREADY_EXISTS {
                 tracing::info!(ip = %ip, kind = label, "Stale route replaced");
                 return Ok(());
@@ -751,10 +741,9 @@ fn create_route(row: &mut MIB_IPFORWARD_ROW2, ip: IpAddr, label: &str) -> Result
 fn observed_to_mib_row(observed: &ObservedRoute) -> Result<MIB_IPFORWARD_ROW2> {
     let prefix = &observed.key.prefix;
     let target = &observed.target;
-    let (ifindex, next_hop, metric) = match target {
+    let (ifindex, next_hop, _metric) = match target {
         RouteTarget::Device {
-            ifindex: Some(idx),
-            ..
+            ifindex: Some(idx), ..
         } => (*idx, None, 0),
         RouteTarget::Gateway(gateway) => {
             let idx = 7;
@@ -866,13 +855,14 @@ impl RouteBackend for WindowsRouteBackend {
 
         let mut row = row_for_intent(intent)?;
 
-        // An exact row already present is a no-op; anything else is replaced by
-        // `create_route`, which keeps the historical Windows behaviour until
-        // L12 replaces it with the exact-identity writer (08D1 §41.3).
+        // An exact row already present is a no-op. Anything else for the
+        // same prefix is replaced by `create_route`, which keeps the historical
+        // Windows replace behaviour; the targeted read-back below then proves
+        // the exact identity (08D1 §41.3).
         let existing = find_route_rows(family, prefix.network, prefix.prefix_len)?;
-        let already_matching = existing.iter().any(|candidate| {
-            observed_matches(candidate, intent)
-        });
+        let already_matching = existing
+            .iter()
+            .any(|candidate| observed_matches(candidate, intent));
         if already_matching {
             let observed = existing
                 .iter()
@@ -918,7 +908,7 @@ impl RouteBackend for WindowsRouteBackend {
                 observed: Some(observed),
             }) => {
                 // Convert the observed route to MIB_IPFORWARD_ROW2 for deletion.
-                let row = observed_to_mib_row(&observed)?;
+                let row = observed_to_mib_row(observed)?;
                 delete_route(intent, &row).await
             }
             _ => Ok(()),
@@ -943,11 +933,13 @@ impl RouteBackend for WindowsRouteBackend {
 /// Subscribes to route-change notifications and emits RouteInvalidation
 /// signals. The generation is bumped before publishing to ensure the backend
 /// can detect concurrent events (08D1 §41.3).
+#[allow(dead_code)]
 pub struct WindowsRouteObserver {
     generation: Arc<AtomicU64>,
     tx: mpsc::UnboundedSender<RouteInvalidation>,
 }
 
+#[allow(dead_code)]
 impl WindowsRouteObserver {
     pub fn new(generation: Arc<AtomicU64>) -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -973,6 +965,7 @@ impl WindowsRouteObserver {
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::RouteSource;
     use super::*;
 
     #[test]
@@ -1107,7 +1100,7 @@ mod tests {
             },
             source: RouteSource::Dns,
         };
-        let mut observed = ObservedRoute {
+        let observed = ObservedRoute {
             key: intent.key.clone(),
             target: intent.target.clone(),
             identity: RouteKernelIdentity {
@@ -1136,7 +1129,7 @@ mod tests {
             },
             source: RouteSource::Dns,
         };
-        let mut observed = ObservedRoute {
+        let observed = ObservedRoute {
             key: intent.key.clone(),
             target: intent.target.clone(),
             identity: RouteKernelIdentity {
@@ -1165,7 +1158,7 @@ mod tests {
             },
             source: RouteSource::Dns,
         };
-        let mut observed = ObservedRoute {
+        let observed = ObservedRoute {
             key: intent.key.clone(),
             target: intent.target.clone(),
             identity: RouteKernelIdentity {

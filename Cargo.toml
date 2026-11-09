@@ -82,6 +82,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Services",
 ] }
 tracing-appender = "0.2"
+uds-compat = "0.1.0"
 
 [dev-dependencies]
 hickory-client = "0.24"

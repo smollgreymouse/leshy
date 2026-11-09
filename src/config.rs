@@ -88,6 +88,20 @@ pub struct ServerConfig {
     /// unreadable or malformed file fails managed startup closed.
     #[serde(default)]
     pub kikimora_auth_file: Option<String>,
+
+    /// Controller-managed activation identity (schema-2 marker, 08D1 §31.4).
+    ///
+    /// When this and `kikimora_mode_generation` are both present, Leshy
+    /// speaks the `managed_selected_routes_v2` protocol: every route intent
+    /// carries this exact ActivationID so a stale Leshy cannot mutate routes
+    /// after Disable/re-Enable. A missing pair keeps the legacy v1 wire shape.
+    #[serde(default)]
+    pub kikimora_activation_id: Option<String>,
+
+    /// Controller's committed Local <-> Managed mode generation (08D1
+    /// §31.4). Required together with `kikimora_activation_id`.
+    #[serde(default)]
+    pub kikimora_mode_generation: Option<u64>,
 }
 
 /// Route-writer selection for the server (plan section 12).
@@ -425,6 +439,58 @@ impl Config {
                 "routing_backend = \"kikimora\" requires kikimora_socket \
                  (e.g. \"/run/kikimora/core.sock\")"
             );
+        }
+
+        // Schema-2 activation identity (08D1 §31.4). The pair is either
+        // entirely absent (legacy v1 managed config) or entirely present
+        // (managed_selected_routes_v2); half a fence is a config error.
+        match (
+            self.server.kikimora_activation_id.as_deref(),
+            self.server.kikimora_mode_generation,
+        ) {
+            (None, None) => {}
+            (Some(activation_id), Some(mode_generation)) => {
+                if self.server.routing_backend != RoutingBackend::Kikimora {
+                    anyhow::bail!(
+                        "kikimora_activation_id/kikimora_mode_generation are only valid with \
+                         routing_backend = \"kikimora\""
+                    );
+                }
+                if activation_id.len() != 32
+                    || !activation_id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    anyhow::bail!(
+                        "kikimora_activation_id must be 32 lowercase hex characters \
+                         (128-bit ActivationID)"
+                    );
+                }
+                if mode_generation == 0 {
+                    anyhow::bail!(
+                        "kikimora_mode_generation must be a positive committed generation"
+                    );
+                }
+                // v2 route methods are privileged: without the service
+                // credential the controller would (correctly) deny every
+                // request, so fail managed startup closed instead.
+                if self
+                    .server
+                    .kikimora_auth_file
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    anyhow::bail!(
+                        "managed_selected_routes_v2 requires kikimora_auth_file \
+                         (privileged_control_auth_v1 service credential)"
+                    );
+                }
+            }
+            _ => anyhow::bail!(
+                "kikimora_activation_id and kikimora_mode_generation must be set together"
+            ),
         }
 
         // Validate default upstream not empty
@@ -851,6 +917,158 @@ domains = ["example.com"]
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.server.routing_backend, RoutingBackend::Kikimora);
+    }
+
+    #[test]
+    fn managed_backend_accepts_a_complete_schema2_identity() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+routing_backend = "kikimora"
+kikimora_socket = "/run/kikimora/core.sock"
+kikimora_auth_file = "/run/kikimora/control-route-auth.key"
+kikimora_activation_id = "0123456789abcdef0123456789abcdef"
+kikimora_mode_generation = 3
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.server.kikimora_activation_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(config.server.kikimora_mode_generation, Some(3));
+    }
+
+    #[test]
+    fn managed_backend_rejects_half_an_activation_fence() {
+        let base = r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+routing_backend = "kikimora"
+kikimora_socket = "/run/kikimora/core.sock"
+kikimora_auth_file = "/run/kikimora/control-route-auth.key"
+{extra}
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#;
+        for extra in [
+            r#"kikimora_activation_id = "0123456789abcdef0123456789abcdef""#,
+            "kikimora_mode_generation = 3",
+        ] {
+            let config: Config = toml::from_str(&base.replace("{extra}", extra)).unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("must be set together"),
+                "half a fence must fail: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_backend_rejects_malformed_activation_identity() {
+        let base = r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+routing_backend = "kikimora"
+kikimora_socket = "/run/kikimora/core.sock"
+kikimora_auth_file = "/run/kikimora/control-route-auth.key"
+kikimora_activation_id = "{id}"
+kikimora_mode_generation = {generation}
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#;
+        for (id, generation, marker) in [
+            ("short", 3, "32 lowercase hex"),
+            ("0123456789ABCDEF0123456789ABCDEF", 3, "32 lowercase hex"),
+            (
+                "0123456789abcdef0123456789abcdef",
+                0,
+                "positive committed generation",
+            ),
+        ] {
+            let config: Config = toml::from_str(
+                &base
+                    .replace("{id}", id)
+                    .replace("{generation}", &generation.to_string()),
+            )
+            .unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(marker),
+                "expected '{marker}' in: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_backend_v2_requires_the_privileged_auth_file() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+routing_backend = "kikimora"
+kikimora_socket = "/run/kikimora/core.sock"
+kikimora_activation_id = "0123456789abcdef0123456789abcdef"
+kikimora_mode_generation = 3
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("kikimora_auth_file"),
+            "v2 without the service credential must fail closed: {err}"
+        );
+    }
+
+    #[test]
+    fn activation_identity_requires_the_managed_backend() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen_address = "127.0.0.1:53"
+default_upstream = ["1.1.1.1:53"]
+kikimora_activation_id = "0123456789abcdef0123456789abcdef"
+kikimora_mode_generation = 3
+
+[[zones]]
+name = "gw"
+route_type = "via"
+route_target = "192.0.2.1"
+domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("only valid with routing_backend"),
+            "identity outside managed mode must fail: {err}"
+        );
     }
 
     #[test]

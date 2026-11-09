@@ -763,6 +763,8 @@ mod tests {
             kikimora_socket: None,
             writer_lock: None,
             kikimora_auth_file: None,
+            kikimora_activation_id: None,
+            kikimora_mode_generation: None,
         }
     }
 

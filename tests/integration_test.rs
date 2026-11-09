@@ -181,6 +181,8 @@ async fn dns_server_binds_and_answers_over_udp() -> anyhow::Result<()> {
             kikimora_socket: None,
             writer_lock: None,
             kikimora_auth_file: None,
+            kikimora_activation_id: None,
+            kikimora_mode_generation: None,
         },
         zones: vec![],
     };

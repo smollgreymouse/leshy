@@ -2,9 +2,19 @@
 //!
 //! In managed mode Kikimora is the single FIB writer for Leshy-selected
 //! routes. This backend never touches the local kernel: it forwards typed
-//! route intents over the framed JSON control socket (API v3,
-//! `managed_selected_routes_v1`) and maps the controller's exact status back
-//! into the registry's outcome/error taxonomy.
+//! route intents over the framed JSON control socket (API v3) and maps the
+//! controller's exact status back into the registry's outcome/error taxonomy.
+//!
+//! Two protocol generations are spoken:
+//!
+//! * legacy `managed_selected_routes_v1` when the generated config carries no
+//!   ActivationID/ModeGeneration pair (the pre-schema2 compatibility window);
+//! * `managed_selected_routes_v2` plus `privileged_control_auth_v1` when the
+//!   config carries the schema-2 activation fence. Every intent then names the
+//!   exact ActivationID/ModeGeneration so a stale Leshy is denied with zero
+//!   mutation after Disable/re-Enable.
+//!
+//! The API framing version stays 3 in both cases (08D1 §31.5).
 //!
 //! Trust boundary (08D §2.2): a request carries only the zone, the canonical
 //! prefix and the source kind. Gateway, interface, ifindex, table, metric,
@@ -35,11 +45,18 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 
-/// API version spoken by this backend (Kikimora control API v3).
+/// API framing version spoken by this backend. It stays 3 for both the
+/// legacy v1 and the schema-2 v2 capability generations (08D1 §31.5).
 pub(crate) const API_VERSION: i32 = 3;
 
-/// Handshake capability required before any route call is made.
-pub(crate) const MANAGED_CAPABILITY: &str = "managed_selected_routes_v1";
+/// Legacy capability: route intents without the activation fence.
+pub(crate) const MANAGED_CAPABILITY_V1: &str = "managed_selected_routes_v1";
+
+/// Schema-2 capability: every intent carries ActivationID/ModeGeneration.
+pub(crate) const MANAGED_CAPABILITY_V2: &str = "managed_selected_routes_v2";
+
+/// Privileged route-control authentication capability (08D1 §31.6).
+pub(crate) const PRIVILEGED_AUTH_CAPABILITY: &str = "privileged_control_auth_v1";
 
 /// One framed transaction must not hang the DNS request path.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +80,14 @@ pub(crate) struct LeshyRouteIntentWire {
     pub prefix: String,
     /// "dns" or "static".
     pub source: String,
+    /// Exact ActivationID for the current managed activation (schema 2).
+    /// Absent on the legacy v1 wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_id: Option<String>,
+    /// Exact committed ModeGeneration for the current activation. Absent on
+    /// the legacy v1 wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_generation: Option<u64>,
 }
 
 /// The controller's exact verdict for one intent.
@@ -75,6 +100,12 @@ pub(crate) struct LeshyRouteResultWire {
     pub family: u8,
     /// Authoritative selected-route generation.
     pub generation: u64,
+    /// ActivationID for this route (L13).
+    #[serde(default)]
+    pub activation_id: Option<String>,
+    /// Mode generation for this route (L13).
+    #[serde(default)]
+    pub mode_generation: Option<u64>,
     /// applied | already-applied | denied | conflict
     pub state: String,
     /// Denial marker: "family N is not ready for this role" lets the DNS
@@ -210,15 +241,30 @@ impl ControlTransport for SocketTransport {
 }
 
 #[cfg(unix)]
-async fn connect(path: &str) -> Result<tokio::net::UnixStream> {
+type ControlStream = tokio::net::UnixStream;
+
+#[cfg(windows)]
+type ControlStream = uds_compat::UnixStream;
+
+#[cfg(not(any(unix, windows)))]
+// No transport exists on unsupported platforms; the type only keeps the
+// `connect` signature type-correct while the function bails closed.
+type ControlStream = tokio::io::DuplexStream;
+
+#[cfg(unix)]
+async fn connect(path: &str) -> Result<ControlStream> {
     Ok(tokio::net::UnixStream::connect(path).await?)
 }
 
-#[cfg(not(unix))]
-async fn connect(_path: &str) -> Result<tokio::net::TcpStream> {
-    // Managed mode is Linux/macOS-only until Kikimora ships a Windows named
-    // pipe transport; the error keeps the type checking out.
-    bail!("the Kikimora managed backend currently requires a Unix control socket")
+#[cfg(windows)]
+async fn connect(path: &str) -> Result<ControlStream> {
+    Ok(uds_compat::UnixStream::connect(path).await?)
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn connect(_path: &str) -> Result<ControlStream> {
+    // Managed mode is Linux/macOS/Windows only until Kikimora ships a fallback.
+    bail!("the Kikimora managed backend requires a Unix or AF_UNIX control socket")
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +304,69 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Activation identity (schema 2, 08D1 §31.4)
+// ---------------------------------------------------------------------------
+
+/// The schema-2 activation fence: the exact ActivationID and committed
+/// ModeGeneration generated by the controller for this managed activation.
+///
+/// `None` means the legacy v1 protocol (no activation identity on the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedIdentity {
+    activation_id: String,
+    mode_generation: u64,
+}
+
+impl ManagedIdentity {
+    /// Validate and pair the generated config fields. The config layer
+    /// already rejects half a fence; this repeats the check so the backend
+    /// can never be constructed with a partial or malformed identity.
+    pub(crate) fn from_config(
+        activation_id: Option<&str>,
+        mode_generation: Option<u64>,
+    ) -> Result<Option<Self>> {
+        match (activation_id, mode_generation) {
+            (None, None) => Ok(None),
+            (Some(id), Some(generation)) => {
+                if id.len() != 32
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    bail!("kikimora activation id must be 32 lowercase hex characters");
+                }
+                if generation == 0 {
+                    bail!("kikimora mode generation must be positive");
+                }
+                Ok(Some(Self {
+                    activation_id: id.to_string(),
+                    mode_generation: generation,
+                }))
+            }
+            _ => bail!("kikimora activation id and mode generation must be set together"),
+        }
+    }
+
+    fn activation_id(&self) -> Option<String> {
+        Some(self.activation_id.clone())
+    }
+
+    fn mode_generation(&self) -> Option<u64> {
+        Some(self.mode_generation)
+    }
+}
+
+/// Capabilities the controller must advertise before this backend may use
+/// any route method. v2 additionally requires privileged request auth.
+fn required_capabilities(identity: Option<&ManagedIdentity>) -> &'static [&'static str] {
+    if identity.is_some() {
+        &[MANAGED_CAPABILITY_V2, PRIVILEGED_AUTH_CAPABILITY]
+    } else {
+        &[MANAGED_CAPABILITY_V1]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
 
@@ -266,6 +375,8 @@ pub(crate) struct KikimoraRouteBackend {
     invalidation_rx: Mutex<Option<mpsc::UnboundedReceiver<RouteInvalidation>>>,
     /// Keeps the subscription pump alive for real transports.
     _pump: Option<tokio::task::JoinHandle<()>>,
+    /// Schema-2 activation fence; `None` on the legacy v1 protocol.
+    identity: Option<ManagedIdentity>,
 }
 
 /// Loads the privileged bearer credential (08D1 §31.6): the file holds
@@ -296,17 +407,28 @@ impl KikimoraRouteBackend {
     /// pump that invalidates registry entries on controller generation
     /// changes and marks authority unknown on socket loss. A configured
     /// auth file is loaded before any route call; failure is fatal.
-    pub(crate) fn new(socket_path: &str, auth_file: Option<&str>) -> Result<Self> {
+    ///
+    /// A complete ActivationID/ModeGeneration pair switches the wire to
+    /// `managed_selected_routes_v2`; absent fields keep the legacy v1 shape.
+    pub(crate) fn new(
+        socket_path: &str,
+        auth_file: Option<&str>,
+        activation_id: Option<&str>,
+        mode_generation: Option<u64>,
+    ) -> Result<Self> {
+        let identity = ManagedIdentity::from_config(activation_id, mode_generation)?;
+        let required = required_capabilities(identity.as_ref()).to_vec();
         let credential = load_auth_credential(auth_file)?;
         let (tx, rx) = mpsc::unbounded_channel();
         let pump_socket = socket_path.to_string();
         let pump = tokio::spawn(async move {
-            subscription_pump(pump_socket, tx).await;
+            subscription_pump(pump_socket, tx, required).await;
         });
         Ok(Self::with_parts(
             Box::new(SocketTransport::new(socket_path, credential)),
             Mutex::new(Some(rx)),
             Some(pump),
+            identity,
         ))
     }
 
@@ -314,23 +436,35 @@ impl KikimoraRouteBackend {
     /// has no live sender, so the monitor sees a closed channel immediately.
     #[cfg(test)]
     pub(crate) fn with_test_transport(transport: Box<dyn ControlTransport>) -> Self {
+        Self::with_test_transport_identity(transport, None)
+    }
+
+    /// Test constructor around a scripted transport with an explicit schema-2
+    /// activation identity.
+    #[cfg(test)]
+    pub(crate) fn with_test_transport_identity(
+        transport: Box<dyn ControlTransport>,
+        identity: Option<ManagedIdentity>,
+    ) -> Self {
         let (_tx, rx) = mpsc::unbounded_channel();
-        Self::with_parts(transport, Mutex::new(Some(rx)), None)
+        Self::with_parts(transport, Mutex::new(Some(rx)), None, identity)
     }
 
     fn with_parts(
         transport: Box<dyn ControlTransport>,
         invalidation_rx: Mutex<Option<mpsc::UnboundedReceiver<RouteInvalidation>>>,
         pump: Option<tokio::task::JoinHandle<()>>,
+        identity: Option<ManagedIdentity>,
     ) -> Self {
         Self {
             transport,
             invalidation_rx,
             _pump: pump,
+            identity,
         }
     }
 
-    fn wire_intent(intent: &RouteIntent) -> LeshyRouteIntentWire {
+    fn wire_intent(&self, intent: &RouteIntent) -> LeshyRouteIntentWire {
         LeshyRouteIntentWire {
             zone: intent.zone.clone(),
             prefix: format!(
@@ -341,6 +475,14 @@ impl KikimoraRouteBackend {
                 RouteSource::Dns => "dns".to_string(),
                 RouteSource::Static => "static".to_string(),
             },
+            activation_id: self
+                .identity
+                .as_ref()
+                .and_then(ManagedIdentity::activation_id),
+            mode_generation: self
+                .identity
+                .as_ref()
+                .and_then(ManagedIdentity::mode_generation),
         }
     }
 
@@ -397,7 +539,7 @@ impl RouteBackend for KikimoraRouteBackend {
         intent: &RouteIntent,
         _previous: Option<&RouteOwnership>,
     ) -> Result<EnsureResult> {
-        let wire = Self::wire_intent(intent);
+        let wire = self.wire_intent(intent);
         let (_, result) = self.transport.call("EnsureLeshyRoute", Some(&wire)).await?;
         let Some(result) = result else {
             bail!("kikimora EnsureLeshyRoute returned no route result");
@@ -429,7 +571,7 @@ impl RouteBackend for KikimoraRouteBackend {
         // §18.2: explicit registry retirement reaches the controller through
         // ForgetLeshyRoute regardless of the local ownership flag — the flag
         // governs local kernel deletion only.
-        let wire = Self::wire_intent(intent);
+        let wire = self.wire_intent(intent);
         self.transport.call("ForgetLeshyRoute", Some(&wire)).await?;
         Ok(())
     }
@@ -460,11 +602,15 @@ impl RouteBackend for KikimoraRouteBackend {
 /// zone the matching registry entries are invalidated; on any socket loss the
 /// whole registry's authority is marked unknown. Reconnects with bounded
 /// backoff, never falling back to the local writer.
-async fn subscription_pump(socket_path: String, tx: mpsc::UnboundedSender<RouteInvalidation>) {
+async fn subscription_pump(
+    socket_path: String,
+    tx: mpsc::UnboundedSender<RouteInvalidation>,
+    required: Vec<&'static str>,
+) {
     let mut backoff = RECONNECT_MIN;
     loop {
         let started = tokio::time::Instant::now();
-        match subscription_session(&socket_path, &tx).await {
+        match subscription_session(&socket_path, &tx, &required).await {
             Ok(()) => tracing::debug!("Kikimora subscription ended"),
             Err(e) => tracing::debug!(error = %e, "Kikimora subscription lost"),
         }
@@ -483,6 +629,7 @@ async fn subscription_pump(socket_path: String, tx: mpsc::UnboundedSender<RouteI
 async fn subscription_session(
     socket_path: &str,
     tx: &mpsc::UnboundedSender<RouteInvalidation>,
+    required: &[&'static str],
 ) -> Result<()> {
     let mut conn = connect(socket_path).await?;
 
@@ -502,15 +649,17 @@ async fn subscription_session(
     if !handshake.ok {
         bail!("kikimora handshake failed: {}", handshake.error);
     }
-    if !handshake
-        .capabilities
-        .iter()
-        .any(|c| c == MANAGED_CAPABILITY)
-    {
-        bail!(
-            "kikimora does not advertise {MANAGED_CAPABILITY}; managed mode stays inactive \
-             (never falls back to the local writer)"
-        );
+    for required_capability in required {
+        if !handshake
+            .capabilities
+            .iter()
+            .any(|c| c == required_capability)
+        {
+            bail!(
+                "kikimora does not advertise {required_capability}; managed mode stays inactive \
+                 (never falls back to the local writer)"
+            );
+        }
     }
 
     // Subscribe: every material controller state change arrives as a frame.
@@ -595,6 +744,16 @@ pub(crate) mod fake {
     }
 
     impl FakeTransport {
+        /// All capabilities a fully deployed schema-2 controller advertises.
+        /// Tests that need a narrower controller can override the response.
+        pub(crate) fn all_capabilities() -> Vec<String> {
+            vec![
+                MANAGED_CAPABILITY_V1.to_string(),
+                MANAGED_CAPABILITY_V2.to_string(),
+                PRIVILEGED_AUTH_CAPABILITY.to_string(),
+            ]
+        }
+
         pub(crate) fn new() -> Self {
             Self {
                 requests: Mutex::new(Vec::new()),
@@ -615,7 +774,7 @@ pub(crate) mod fake {
             let response = ControlResponse {
                 ok: true,
                 error: String::new(),
-                capabilities: vec![MANAGED_CAPABILITY.to_string()],
+                capabilities: Self::all_capabilities(),
                 leshy_route: Some(result),
                 snapshot: None,
             };
@@ -626,7 +785,7 @@ pub(crate) mod fake {
             *self.response.lock().unwrap() = Some(ControlResponse {
                 ok: true,
                 error: String::new(),
-                capabilities: vec![MANAGED_CAPABILITY.to_string()],
+                capabilities: Self::all_capabilities(),
                 leshy_route: Some(result),
                 snapshot: None,
             });
@@ -710,7 +869,7 @@ pub(crate) mod fake {
         }
     }
 
-    /// Protocol fixture: the exact verdict shape API v3 returns.
+    /// Protocol fixture: the exact verdict shape API v4 returns.
     pub(crate) fn applied_result(prefix: &str, family: u8) -> LeshyRouteResultWire {
         LeshyRouteResultWire {
             role: "primary".to_string(),
@@ -718,6 +877,8 @@ pub(crate) mod fake {
             prefix: prefix.to_string(),
             family,
             generation: 7,
+            activation_id: None,
+            mode_generation: None,
             state: "applied".to_string(),
             reason: None,
         }
@@ -871,6 +1032,91 @@ mod tests {
         }
     }
 
+    fn schema2_identity() -> ManagedIdentity {
+        ManagedIdentity::from_config(Some("0123456789abcdef0123456789abcdef"), Some(7))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn schema2_requests_carry_the_exact_activation_fence() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            Some(schema2_identity()),
+        );
+
+        let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
+        backend.ensure_route(&intent, None).await.unwrap();
+
+        let requests = transport.requests();
+        let wire = requests[0].leshy_route.as_ref().unwrap();
+        assert_eq!(
+            wire.activation_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(wire.mode_generation, Some(7));
+
+        let encoded = serde_json::to_value(wire).unwrap();
+        assert_eq!(encoded["activation_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(encoded["mode_generation"], 7);
+    }
+
+    #[tokio::test]
+    async fn legacy_requests_omit_the_activation_fence() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+
+        let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
+        backend.ensure_route(&intent, None).await.unwrap();
+
+        let requests = transport.requests();
+        let encoded = serde_json::to_value(requests[0].leshy_route.as_ref().unwrap()).unwrap();
+        assert!(
+            encoded.get("activation_id").is_none(),
+            "v1 wire must not carry activation_id: {encoded}"
+        );
+        assert!(
+            encoded.get("mode_generation").is_none(),
+            "v1 wire must not carry mode_generation: {encoded}"
+        );
+    }
+
+    #[test]
+    fn activation_identity_requires_a_complete_valid_pair() {
+        assert!(ManagedIdentity::from_config(None, None).unwrap().is_none());
+        assert!(
+            ManagedIdentity::from_config(Some("0123456789abcdef0123456789abcdef"), Some(1))
+                .unwrap()
+                .is_some()
+        );
+
+        for (id, generation) in [
+            (Some("0123456789abcdef0123456789abcdef"), None),
+            (None, Some(1)),
+            (Some("too-short"), Some(1)),
+            (Some("0123456789ABCDEF0123456789ABCDEF"), Some(1)),
+            (Some("0123456789abcdef0123456789abcdef"), Some(0)),
+        ] {
+            assert!(
+                ManagedIdentity::from_config(id, generation).is_err(),
+                "invalid identity must fail closed: {id:?}/{generation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_capabilities_follow_the_protocol_generation() {
+        let identity = schema2_identity();
+        assert_eq!(
+            required_capabilities(Some(&identity)),
+            &[MANAGED_CAPABILITY_V2, PRIVILEGED_AUTH_CAPABILITY]
+        );
+        assert_eq!(required_capabilities(None), &[MANAGED_CAPABILITY_V1]);
+    }
+
     #[tokio::test]
     async fn static_source_is_labelled_on_the_wire() {
         let transport = Arc::new(FakeTransport::new());
@@ -947,6 +1193,8 @@ mod tests {
             prefix: "2001:db8::1/128".to_string(),
             family: 6,
             generation: 7,
+            activation_id: None,
+            mode_generation: None,
             state: "applied".to_string(),
             reason: None,
         };
@@ -1144,6 +1392,85 @@ mod auth_tests {
             !without.contains("privileged_auth"),
             "unconfigured installs keep the legacy wire shape: {without}"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod af_unix_tests {
+    use super::fake::{applied_result, FakeTransport};
+    use super::*;
+    use crate::routing::backend::{fake::host_intent_v4, RouteBackend};
+
+    /// The request shape the controller side parses in this test.
+    #[derive(Debug, Deserialize)]
+    struct ObservedRequest {
+        version: i32,
+        method: String,
+        #[serde(default)]
+        privileged_auth: Option<String>,
+        #[serde(default)]
+        leshy_route: Option<LeshyRouteIntentWire>,
+    }
+
+    /// The response shape a real controller would write.
+    #[derive(Serialize)]
+    struct ScriptedResponse {
+        ok: bool,
+        error: String,
+        capabilities: Vec<String>,
+        leshy_route: Option<LeshyRouteResultWire>,
+    }
+
+    /// End-to-end proof of the real Windows AF_UNIX transport (08D1 §41.4):
+    /// a `uds_windows` listener accepts the `uds-compat` stream a
+    /// `SocketTransport` dials, and the schema-2 fence survives the framed
+    /// JSON round trip. No TCP, pipe or local-writer path is involved.
+    #[tokio::test]
+    async fn windows_af_unix_round_trips_the_schema2_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kikimora.sock");
+        let listener = uds_compat::UnixListener::bind(&path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut conn, _addr) = listener.accept().await.unwrap();
+            let request: ObservedRequest = read_frame(&mut conn).await.unwrap();
+            assert_eq!(request.version, API_VERSION);
+            assert_eq!(request.method, "EnsureLeshyRoute");
+            assert_eq!(
+                request.privileged_auth.as_deref(),
+                Some("a".repeat(64).as_str())
+            );
+            let wire = request.leshy_route.expect("route intent");
+            assert_eq!(
+                wire.activation_id.as_deref(),
+                Some("0123456789abcdef0123456789abcdef")
+            );
+            assert_eq!(wire.mode_generation, Some(7));
+            write_frame(
+                &mut conn,
+                &ScriptedResponse {
+                    ok: true,
+                    error: String::new(),
+                    capabilities: FakeTransport::all_capabilities(),
+                    leshy_route: Some(applied_result("10.0.0.1/32", 4)),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let identity =
+            ManagedIdentity::from_config(Some("0123456789abcdef0123456789abcdef"), Some(7))
+                .unwrap();
+        let transport = SocketTransport::new(path.to_str().unwrap(), Some("a".repeat(64)));
+        let backend =
+            KikimoraRouteBackend::with_test_transport_identity(Box::new(transport), identity);
+
+        let intent = host_intent_v4(10, 0, 0, 1, "corp");
+        let result = backend.ensure_route(&intent, None).await.unwrap();
+        assert_eq!(result.outcome, EnsureOutcome::Added);
+        assert!(!result.ownership.owned);
+        server.await.unwrap();
     }
 }
 
