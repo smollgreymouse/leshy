@@ -602,18 +602,16 @@ fn parse_prefix(cidr: &str) -> Result<RoutePrefix> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{bail, Result};
     use crate::config::{DnsProtocol, RouteType, ZoneMode};
     use crate::dns::DnsHandler;
     use crate::routing::backend::fake::FakeBackend;
     use crate::routing::kikimora::fake::{applied_result, FakeTransport};
     use crate::routing::kikimora::KikimoraRouteBackend;
     use crate::routing::model::ObservedRoute;
-    use crate::routing::registry::ReconcileReport;
-    use crate::reload::ZoneChange;
     use crate::server::apply_reload;
     use crate::zones::ZoneMatcher;
     use std::net::Ipv6Addr;
+    use tokio::sync::RwLock;
 
     fn via_zone(name: &str, gateway: &str) -> ZoneConfig {
         ZoneConfig {
@@ -1280,7 +1278,10 @@ kikimora_socket = "leshy-l14-absent.sock"
     #[tokio::test]
     async fn managed_reload_sends_zero_controller_calls_until_changed() -> anyhow::Result<()> {
         let transport = Arc::new(FakeTransport::new());
-        transport.set_result(crate::routing::kikimora::fake::applied_result("10.0.0.1/32", 4));
+        transport.set_result(crate::routing::kikimora::fake::applied_result(
+            "10.0.0.1/32",
+            4,
+        ));
         let backend = managed_backend(&transport);
         let mgr = Arc::new(RouteManager::with_backend(
             Arc::clone(&backend),
@@ -1290,11 +1291,13 @@ kikimora_socket = "leshy-l14-absent.sock"
         let zone = via_zone("corp", "192.168.1.1");
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 1);
 
-        mgr.add_route(std::net::IpAddr::V4(ip), &zone).await.unwrap();
+        mgr.add_route(std::net::IpAddr::V4(ip), &zone)
+            .await
+            .unwrap();
         assert_eq!(transport.call_count(), 1);
 
         // Reload with no changes should not emit any invalidations.
-        let mut new_config = crate::config::Config {
+        let new_config = crate::config::Config {
             server: crate::config::ServerConfig {
                 listen_address: std::net::SocketAddr::from(([127, 0, 0, 1], 5399)),
                 default_upstream: vec![],
@@ -1328,9 +1331,8 @@ kikimora_socket = "leshy-l14-absent.sock"
         Ok(())
     }
 
-    // #[tokio::test]
-    // async fn reload_rejects_kikimora_socket_changes() -> anyhow::Result<()> {
-        let server: crate::config::ServerConfig = toml::from_str(
+    fn reload_test_server() -> ServerConfig {
+        toml::from_str(
             r#"
 listen_address = "127.0.0.1:5399"
 default_upstream = ["127.0.0.1:5300"]
@@ -1339,217 +1341,191 @@ kikimora_socket = "/run/kikimora/core.sock"
 max_dynamic_routes = 100
 "#,
         )
-        .unwrap();
-        let mgr = RouteManager::for_server(&server).unwrap();
-        assert_eq!(mgr.reconcile_mode(), ReconcileMode::AuthorityOnDemand);
+        .expect("reload test server config parses")
+    }
 
-        // Try to hot-reload with a different socket.
-        let mut new_server = server.clone();
-        new_server.kikimora_socket = Some("/run/kikimora/core.sock.bak".to_string());
-        let new_config = crate::config::Config {
-            server: new_server,
-            zones: vec![zone.clone()],
+    /// Build a handler whose route manager is the fake backend, so the reload
+    /// tests can observe every backend mutation and prove that a rejected
+    /// transaction touched nothing.
+    fn reload_test_handler(
+        server: &ServerConfig,
+        backend: &Arc<FakeBackend>,
+    ) -> Result<Arc<RwLock<DnsHandler>>> {
+        let zones = vec![via_zone("corp", "192.168.1.1")];
+        let config = crate::config::Config {
+            server: server.clone(),
+            zones: zones.clone(),
         };
-        let handler = Arc::new(RwLock::new(DnsHandler::new(
-            new_config.clone(),
-            ZoneMatcher::new(vec![zone.clone()]).unwrap(),
-        )?));
-    //     match apply_reload(&handler, new_config).await {
-    //         Ok(_) => bail!("expected a restart-only error"),
-    //         Err(e) => {
-    //             if !e.to_string().contains("restart Leshy") {
-    //                 bail!("expected error text 'restart Leshy', got: {}", e);
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
+        let matcher = ZoneMatcher::new(zones)?;
+        let manager = RouteManager::with_backend(
+            Arc::clone(backend),
+            server.route_aggregation_prefix,
+            server.max_dynamic_routes,
+        );
+        Ok(Arc::new(RwLock::new(DnsHandler::with_route_manager(
+            config, matcher, manager,
+        ))))
+    }
 
-    // #[tokio::test]
-    // async fn reload_rejects_capacity_changes() -> anyhow::Result<()> {
-    //     let server: crate::config::ServerConfig = toml::from_str(
-    //         r#"
-    // listen_address = "127.0.0.1:5399"
-    // default_upstream = ["127.0.0.1:5300"]
-    // routing_backend = "kikimora"
-    // kikimora_socket = "/run/kikimora/core.sock"
-    // max_dynamic_routes = 100
-    // "#,
-    //     )
-    //     .unwrap();
-    //     let zone = via_zone("corp", "192.168.1.1");
-    //     let new_config = crate::config::Config {
-    //         server: server.clone(),
-    //         zones: vec![zone.clone()],
-    //     };
-    //     let handler = Arc::new(RwLock::new(DnsHandler::new(
-    //         new_config.clone(),
-    //         ZoneMatcher::new(vec![zone.clone()]).unwrap(),
-    //     )?));
-    //
-    //     // Try to hot-reload with a different capacity.
-    //     let mut new_server = server.clone();
-    //     new_server.max_dynamic_routes = 200;
-    //     let mut reload_config = new_config.clone();
-    //     reload_config.server = new_server;
-    //     match apply_reload(&handler, reload_config).await {
-    //         Ok(_) => bail!("expected a restart-only error"),
-    //         Err(e) => {
-    //             if !e.to_string().contains("restart Leshy") {
-    //                 bail!("expected error text 'restart Leshy', got: {}", e);
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
+    /// Shared body of the restart-only reload regressions (08D1 §19.1).
+    ///
+    /// The change must be rejected by the real `apply_reload` transaction with
+    /// the documented restart error, before any route is retired and before
+    /// the live configuration is swapped.
+    async fn assert_restart_only_rejection(
+        field: &str,
+        mutate: impl FnOnce(&mut ServerConfig),
+    ) -> Result<()> {
+        let server = reload_test_server();
+        let backend = Arc::new(FakeBackend::new());
+        let handler = reload_test_handler(&server, &backend)?;
 
-    // #[tokio::test]
-    // async fn reload_rejects_aggregation_prefix_changes() -> anyhow::Result<()> {
-    //     let server: crate::config::ServerConfig = toml::from_str(
-    //         r#"
-    // listen_address = "127.0.0.1:5399"
-    // default_upstream = ["127.0.0.1:5300"]
-    // routing_backend = "kikimora"
-    // kikimora_socket = "/run/kikimora/core.sock"
-    // max_dynamic_routes = 100
-    // "#,
-    //     )
-    //     .unwrap();
-    //     let zone = via_zone("corp", "192.168.1.1");
-    //     let new_config = crate::config::Config {
-    //         server: server.clone(),
-    //         zones: vec![zone.clone()],
-    //     };
-    //     let handler = Arc::new(RwLock::new(DnsHandler::new(
-    //         new_config.clone(),
-    //         ZoneMatcher::new(vec![zone.clone()]).unwrap(),
-    //     )?));
-    //
-    //     // Try to hot-reload with a different aggregation prefix.
-    //     let mut new_server = server.clone();
-    //     new_server.route_aggregation_prefix = Some(24);
-    //     let mut reload_config = new_config.clone();
-    //     reload_config.server = new_server;
-    //     match apply_reload(&handler, reload_config).await {
-    //         Ok(_) => bail!("expected a restart-only error"),
-    //         Err(e) => {
-    //             if !e.to_string().contains("restart Leshy") {
-    //                 bail!("expected error text 'restart Leshy', got: {}", e);
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
+        let mut changed_server = server.clone();
+        mutate(&mut changed_server);
+        let reload_config = crate::config::Config {
+            server: changed_server,
+            zones: vec![via_zone("corp", "192.168.1.1")],
+        };
 
-    // #[tokio::test]
-    // async fn reload_two_zones_only_changed_one_is_targeted() -> anyhow::Result<()> {
-    //     let server: crate::config::ServerConfig = toml::from_str(
-    //         r#"
-    // listen_address = "127.0.0.1:5399"
-    // default_upstream = ["127.0.0.1:5300"]
-    // routing_backend = "kikimora"
-    // kikimora_socket = "/run/kikimora/core.sock"
-    // max_dynamic_routes = 100
-    // "#,
-    //     )
-    //     .unwrap();
-    //     let zone1 = crate::config::ZoneConfig {
-    //         name: "corp".to_string(),
-    //         mode: crate::config::ZoneMode::Inclusive,
-    //         dns_servers: vec![],
-    //         route_type: crate::config::RouteType::Via,
-    //         route_target: "192.168.1.1".to_string(),
-    //         route_target_ipv6: None,
-    //         domains: vec!["corp.example.com".to_string()],
-    //         patterns: vec![],
-    //         static_routes: vec![],
-    //         dns_protocol: crate::config::DnsProtocol::Udp,
-    //         cache_min_ttl: None,
-    //         cache_max_ttl: None,
-    //         cache_negative_ttl: None,
-    //         ipv6: false,
-    //     };
-    //     let zone2 = zone1.clone();
-    //     let mut new_zone2 = zone1.clone();
-    //     new_zone2.domains = vec!["new.example.com".to_string()];
-    //
-    //     let new_config = crate::config::Config {
-    //         server: server.clone(),
-    //         zones: vec![zone1.clone(), new_zone2.clone()],
-    //     };
-    //     let handler = Arc::new(RwLock::new(DnsHandler::new(
-    //         new_config.clone(),
-    //         ZoneMatcher::new(vec![zone1.clone(), new_zone2.clone()]).unwrap(),
-    //     )?));
-    //
-    //     // Load and add routes for both zones.
-    //     let mgr = RouteManager::for_server(&new_config.server).unwrap();
-    //     let ip1 = std::net::Ipv4Addr::new(10, 0, 0, 1);
-    //     let ip2 = std::net::Ipv4Addr::new(10, 0, 0, 2);
-    //     mgr.add_route(std::net::IpAddr::V4(ip1), &zone1).await.unwrap();
-    //     mgr.add_route(std::net::IpAddr::V4(ip2), &new_zone2).await.unwrap();
-    //
-    //     // Reload with only the second zone changed.
-    //     let mut reload_zone2 = new_zone2.clone();
-    //     reload_zone2.domains = vec!["reload.example.com".to_string()];
-    //     let mut reload_config = new_config.clone();
-    //     reload_config.zones[1] = reload_zone2;
-    //
-    //     match apply_reload(&handler, reload_config).await {
-    //         Ok(_) => bail!("reload should succeed"),
-    //         Err(e) => bail!("reload failed: {}", e),
-    //     }
-    //     Ok(())
-    // }
+        let error = apply_reload(&handler, reload_config)
+            .await
+            .expect_err("apply_reload must reject a restart-only change");
+
+        anyhow::ensure!(
+            error.to_string().contains("restart Leshy"),
+            "changed {field}: expected the restart-only error, got: {error}"
+        );
+
+        let live = handler.read().await.config().server.clone();
+        assert_eq!(
+            live.kikimora_socket, server.kikimora_socket,
+            "changed {field}: the live socket must not be swapped"
+        );
+        assert_eq!(
+            live.route_aggregation_prefix, server.route_aggregation_prefix,
+            "changed {field}: the live aggregation prefix must not be swapped"
+        );
+        assert_eq!(
+            live.max_dynamic_routes, server.max_dynamic_routes,
+            "changed {field}: the live capacity must not be swapped"
+        );
+        assert_eq!(
+            live.routing_backend, server.routing_backend,
+            "changed {field}: the live backend must not be swapped"
+        );
+
+        assert_eq!(
+            backend.ensure_count(),
+            0,
+            "changed {field}: a rejected reload must not ensure any route"
+        );
+        assert_eq!(
+            backend.remove_count(),
+            0,
+            "changed {field}: a rejected reload must not retire any route"
+        );
+        assert_eq!(
+            backend.snapshot_count(),
+            0,
+            "changed {field}: a rejected reload must not snapshot the kernel"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
-    async fn managed_reload_sends_zero_controller_calls_until_changed() -> anyhow::Result<()> {
-        let transport = Arc::new(FakeTransport::new());
-        transport.set_result(crate::routing::kikimora::fake::applied_result("10.0.0.1/32", 4));
-        let backend = managed_backend(&transport);
-        let mgr = Arc::new(RouteManager::with_backend(
-            Arc::clone(&backend),
-            None,
-            DEFAULT_MAX_DYNAMIC_ROUTES,
-        ));
-        let zone = via_zone("corp", "192.168.1.1");
-        let ip = std::net::Ipv4Addr::new(10, 0, 0, 1);
+    async fn reload_rejects_kikimora_socket_changes() -> Result<()> {
+        assert_restart_only_rejection("kikimora_socket", |server| {
+            server.kikimora_socket = Some("/run/kikimora/core.sock.bak".to_string());
+        })
+        .await
+    }
 
-        mgr.add_route(std::net::IpAddr::V4(ip), &zone).await.unwrap();
-        assert_eq!(transport.call_count(), 1);
+    #[tokio::test]
+    async fn reload_rejects_capacity_changes() -> Result<()> {
+        assert_restart_only_rejection("max_dynamic_routes", |server| {
+            server.max_dynamic_routes = 200;
+        })
+        .await
+    }
 
-        // Reload with no changes should not emit any invalidations.
-        let mut new_config = crate::config::Config {
-            server: crate::config::ServerConfig {
-                listen_address: std::net::SocketAddr::from(([127, 0, 0, 1], 5399)),
-                default_upstream: vec![],
-                route_failure_mode: crate::config::RouteFailureMode::Servfail,
-                auto_reload: false,
-                config_dir: None,
-                cache_size: 100,
-                cache_min_ttl: 0,
-                cache_max_ttl: 0,
-                cache_negative_ttl: 0,
-                route_aggregation_prefix: None,
-                max_dynamic_routes: DEFAULT_MAX_DYNAMIC_ROUTES,
-                routing_backend: crate::config::RoutingBackend::Kikimora,
-                kikimora_socket: Some("leshy-l14-test.sock".to_string()),
-                writer_lock: None,
-                kikimora_auth_file: None,
-                kikimora_activation_id: None,
-                kikimora_mode_generation: None,
-            },
-            zones: vec![zone.clone()],
+    #[tokio::test]
+    async fn reload_rejects_aggregation_prefix_changes() -> Result<()> {
+        assert_restart_only_rejection("route_aggregation_prefix", |server| {
+            server.route_aggregation_prefix = Some(24);
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_routing_backend_changes() -> Result<()> {
+        assert_restart_only_rejection("routing_backend", |server| {
+            server.routing_backend = RoutingBackend::Local;
+        })
+        .await
+    }
+
+    /// 08D1 §19.2: a reload that changes one zone retires exactly that zone's
+    /// owned rows through the real `apply_reload` transaction. The untouched
+    /// zone keeps its ownership with zero backend calls.
+    #[tokio::test]
+    async fn reload_two_zones_only_changed_one_is_targeted() -> Result<()> {
+        let server = reload_test_server();
+        let corp = via_zone("corp", "192.168.1.1");
+        let mut edge = via_zone("edge", "192.168.2.1");
+        edge.domains = vec!["edge.example.com".to_string()];
+
+        let config = crate::config::Config {
+            server: server.clone(),
+            zones: vec![corp.clone(), edge.clone()],
         };
-        let new_mgr = Arc::new(RouteManager::for_server(&new_config.server).unwrap());
+        let matcher = ZoneMatcher::new(vec![corp.clone(), edge.clone()])?;
+        let backend = Arc::new(FakeBackend::new());
+        let manager = RouteManager::with_backend(
+            Arc::clone(&backend),
+            server.route_aggregation_prefix,
+            server.max_dynamic_routes,
+        );
 
-        // No invalidations should be sent.
-        let report = new_mgr
-            .handle_invalidation(backend::RouteInvalidation::Zone("corp".to_string()))
-            .await;
-        assert_eq!(report.adds, 0);
-        assert_eq!(report.removes, 0);
-        assert_eq!(transport.call_count(), 1);
+        let corp_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let edge_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        manager.add_route(corp_ip, &corp).await?;
+        manager.add_route(edge_ip, &edge).await?;
+        assert_eq!(backend.ensure_count(), 2);
+
+        let handler = Arc::new(RwLock::new(DnsHandler::with_route_manager(
+            config, matcher, manager,
+        )));
+        backend.reset_counters();
+
+        // Only `edge` changes; `corp` keeps the same routing policy.
+        let mut changed_edge = edge.clone();
+        changed_edge.domains = vec!["reloaded.example.com".to_string()];
+        let mut reload_config = handler.read().await.config().clone();
+        reload_config.zones = vec![corp.clone(), changed_edge.clone()];
+
+        apply_reload(&handler, reload_config).await?;
+
+        let removed = backend.removed();
+        assert_eq!(
+            removed.len(),
+            1,
+            "only the changed zone may retire an owned row, got {removed:?}"
+        );
+        assert_eq!(removed[0].zone, "edge");
+        assert_eq!(
+            backend.ensure_count(),
+            0,
+            "the unchanged zone must not be re-ensured on reload"
+        );
+
+        let live = handler.read().await.config().clone();
+        assert_eq!(live.zones.len(), 2);
+        assert_eq!(live.zones[0], corp, "the unchanged zone keeps its config");
+        assert_eq!(
+            live.zones[1].domains,
+            vec!["reloaded.example.com".to_string()],
+            "the changed zone is swapped in"
+        );
         Ok(())
     }
 }
