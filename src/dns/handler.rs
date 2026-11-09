@@ -416,8 +416,11 @@ impl DnsHandler {
     }
 
     /// Retire exactly these owned intents (old-zone state during a reload).
-    /// Returns how many were retired.
-    pub async fn retire_zone_intents(&self, intents: &[crate::routing::RouteIntent]) -> usize {
+    /// An exact-delete failure is returned so the reload transaction aborts.
+    pub async fn retire_zone_intents(
+        &self,
+        intents: &[crate::routing::RouteIntent],
+    ) -> anyhow::Result<crate::routing::RetirementReport> {
         let route_manager = self.route_manager.read().await;
         route_manager.retire_intents(intents).await
     }

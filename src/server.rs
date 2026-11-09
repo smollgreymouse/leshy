@@ -2,6 +2,7 @@ use crate::config::{Config, ServerConfig};
 use crate::dns::{DnsHandler, DnsServer};
 use crate::reload::{diff_zones, ConfigWatcher, ZoneChange};
 use crate::zones::ZoneMatcher;
+use anyhow::Context;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -207,16 +208,31 @@ pub async fn apply_reload(
     // (4) Remove explicit old-zone owned rows. Removing a zone is operator
     // intent (full cleanup); a changed zone retires exactly its old intents,
     // and a replacement row on the same prefix is never deleted.
+    //
+    // 08D1 §19.1: any exact cleanup/retirement failure aborts the transaction.
+    // The config, matcher and the ownership evidence stay as they were, and
+    // the caller never sees a successful reload for a half-retired state.
     for change in &changes {
         if let ZoneChange::Removed(old) = change {
             tracing::info!(zone = old.name, "Removing zone and cleaning up routes");
-            if let Err(e) = handler_guard.cleanup_zone(&old.name).await {
-                tracing::error!(zone = old.name, error = %e, "Failed to cleanup zone");
-            }
+            handler_guard
+                .cleanup_zone(&old.name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "removing zone '{}' failed; reload aborted before the config swap",
+                        old.name
+                    )
+                })?;
         }
     }
     for intents in &old_intents {
-        handler_guard.retire_zone_intents(intents).await;
+        handler_guard
+            .retire_zone_intents(intents)
+            .await
+            .with_context(|| {
+                "retiring the previous zone routes failed; reload aborted before the config swap"
+            })?;
     }
 
     // (5)+(6) Swap config/matcher; the DNS cache is cleared with it.

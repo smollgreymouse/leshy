@@ -17,7 +17,7 @@ use crate::routing::backend::{
     ControllerDenied, EnsureOutcome, RouteBackend, RouteConflict, RouteInvalidation,
 };
 use crate::routing::model::*;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,6 +44,17 @@ struct RouteEntry {
     verified_epoch: u64,
     /// Last error message, if any.
     last_error: Option<String>,
+}
+
+/// Result of retiring one exact owned intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetireOutcome {
+    /// The exact row was deleted and the entry dropped.
+    Retired,
+    /// A newer intent owns this key now; nothing was deleted.
+    ReplacedByNewerIntent,
+    /// No entry exists for this key; nothing to do.
+    Absent,
 }
 
 /// Outcome of reconciling one Dirty entry.
@@ -591,37 +602,41 @@ impl RouteRegistry {
     /// entry's desired intent is still `intent` — a replacement intent that
     /// was verified in the meantime keeps the entry and its kernel row. The
     /// backend additionally refuses to delete a foreign row on the prefix.
-    /// Returns `true` when the intent was retired.
+    ///
+    /// An exact-delete failure is returned as `Err` and keeps the desired
+    /// intent plus the ownership evidence, so a reload can abort instead of
+    /// claiming a retirement that did not happen (08D1 §19.1/§49.6).
     pub(crate) async fn retire_intent(
         &self,
         intent: &RouteIntent,
         backend: &dyn RouteBackend,
-    ) -> bool {
+    ) -> Result<RetireOutcome> {
         // Decide and mutate the kernel under the entry lock; the map read
         // guard is dropped before the (rare) entry removal below.
         let retired = {
             let map = self.entries.read().await;
-            match map.get(&intent.key) {
-                Some(entry) => {
-                    let mut locked = entry.lock().await;
-                    if locked.desired.as_ref() != Some(intent) {
-                        // A replacement intent owns this key now.
-                        false
-                    } else {
-                        let ownership = locked.ownership.clone();
-                        match backend.remove_route(intent, ownership.as_ref()).await {
-                            Ok(()) => {
-                                locked.desired = None;
-                                locked.ownership = None;
-                                locked.state = RouteState::Pending;
-                                true
-                            }
-                            Err(_) => false,
-                        }
-                    }
-                }
-                None => false,
+            let Some(entry) = map.get(&intent.key) else {
+                return Ok(RetireOutcome::Absent);
+            };
+            let mut locked = entry.lock().await;
+            if locked.desired.as_ref() != Some(intent) {
+                // A replacement intent owns this key now.
+                return Ok(RetireOutcome::ReplacedByNewerIntent);
             }
+            let ownership = locked.ownership.clone();
+            backend
+                .remove_route(intent, ownership.as_ref())
+                .await
+                .with_context(|| {
+                    format!(
+                        "retiring {} for zone '{}'",
+                        intent.key.prefix.network, intent.zone
+                    )
+                })?;
+            locked.desired = None;
+            locked.ownership = None;
+            locked.state = RouteState::Pending;
+            true
         };
 
         if retired {
@@ -637,7 +652,7 @@ impl RouteRegistry {
                 }
             }
         }
-        retired
+        Ok(RetireOutcome::Retired)
     }
 
     /// Count dynamic (DNS-sourced) intents in the registry.

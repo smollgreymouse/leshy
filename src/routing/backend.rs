@@ -193,6 +193,8 @@ pub(crate) mod fake {
         conflict: Mutex<Option<(String, String)>>,
         /// Scripted result for the next `resolve_target` calls.
         resolved: Mutex<Option<RouteTarget>>,
+        /// Scripted failure for the next `remove_route` calls.
+        remove_error: Mutex<Option<String>>,
         pub ensured: Mutex<Vec<RouteIntent>>,
         pub removed: Mutex<Vec<RouteIntent>>,
         /// Routes reported by `snapshot`.
@@ -210,6 +212,7 @@ pub(crate) mod fake {
                 outcome: Mutex::new(None),
                 conflict: Mutex::new(None),
                 resolved: Mutex::new(None),
+                remove_error: Mutex::new(None),
                 ensured: Mutex::new(Vec::new()),
                 removed: Mutex::new(Vec::new()),
                 observed: Mutex::new(Vec::new()),
@@ -265,6 +268,12 @@ pub(crate) mod fake {
 
         pub(crate) fn set_resolved(&self, target: RouteTarget) {
             *self.state.resolved.lock().unwrap() = Some(target);
+        }
+
+        /// Script one exact-delete failure; the next `remove_route` returns it
+        /// and the following calls succeed again.
+        pub(crate) fn set_remove_error(&self, message: &str) {
+            *self.state.remove_error.lock().unwrap() = Some(message.to_string());
         }
 
         pub(crate) fn ensured(&self) -> Vec<RouteIntent> {
@@ -381,6 +390,9 @@ pub(crate) mod fake {
         ) -> Result<()> {
             self.state.removes.fetch_add(1, Ordering::SeqCst);
             self.state.removed.lock().unwrap().push(intent.clone());
+            if let Some(message) = self.state.remove_error.lock().unwrap().take() {
+                return Err(anyhow::anyhow!(message));
+            }
             Ok(())
         }
 

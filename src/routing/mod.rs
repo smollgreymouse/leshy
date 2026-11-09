@@ -61,6 +61,15 @@ pub const DEFAULT_MAX_DYNAMIC_ROUTES: usize = 16384;
 /// How often the safety audit re-reads the routing table.
 const AUDIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What one `retire_intents` call did to the exact old-zone ownership set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetirementReport {
+    /// Exact owned rows deleted and registry entries dropped.
+    pub retired: usize,
+    /// Keys already owned by a newer (replacement) intent; left untouched.
+    pub skipped_replaced: usize,
+}
+
 /// Kernel I/O counters for the invalidation path (08D1 §16.3).
 ///
 /// `full_snapshots` counts manager-level full-FIB reads: a `Full`
@@ -515,22 +524,30 @@ impl RouteManager {
     ///
     /// A replacement intent that was verified in the meantime keeps its
     /// registry entry and kernel row; a foreign row on the same prefix is
-    /// never touched by the backend.
-    pub async fn retire_intents(&self, intents: &[RouteIntent]) -> usize {
-        let mut retired = 0usize;
+    /// never touched by the backend. An exact-delete failure is returned so
+    /// the caller can abort the reload instead of dropping the error (08D1
+    /// section 19.1); ownership evidence stays in the registry.
+    pub async fn retire_intents(&self, intents: &[RouteIntent]) -> Result<RetirementReport> {
+        let mut report = RetirementReport::default();
         for intent in intents {
-            if self
+            match self
                 .registry
                 .retire_intent(intent, self.backend.as_ref())
-                .await
+                .await?
             {
-                retired += 1;
+                registry::RetireOutcome::Retired => report.retired += 1,
+                registry::RetireOutcome::ReplacedByNewerIntent => report.skipped_replaced += 1,
+                registry::RetireOutcome::Absent => {}
             }
         }
-        if retired > 0 {
-            tracing::info!(retired, "Old-zone route intents retired");
+        if report.retired > 0 || report.skipped_replaced > 0 {
+            tracing::info!(
+                retired = report.retired,
+                skipped_replaced = report.skipped_replaced,
+                "Old-zone route intents retired"
+            );
         }
-        retired
+        Ok(report)
     }
 
     /// Count of dynamic (DNS-sourced) intents currently registered.
@@ -1029,8 +1046,9 @@ mod tests {
 
         // ...then the old intent is retired. The registry key now belongs to
         // the replacement, so neither the row nor the entry may be deleted.
-        let retired = mgr.retire_intents(&old_intents).await;
-        assert_eq!(retired, 0);
+        let retired = mgr.retire_intents(&old_intents).await.unwrap();
+        assert_eq!(retired.retired, 0);
+        assert_eq!(retired.skipped_replaced, 1);
         assert_eq!(
             backend.remove_count(),
             0,
@@ -1619,6 +1637,207 @@ max_dynamic_routes = 100
             "the changed zone is swapped in"
         );
         Ok(())
+    }
+
+    /// 08D1 §19.1/§19.2 reload transaction matrix: a failure at any point
+    /// before the config swap must abort, keep the old config and matcher, and
+    /// keep the exact ownership evidence.
+    mod reload_transaction_tests {
+        use super::*;
+
+        async fn handler_with_owned_route(
+            server: &ServerConfig,
+            zone: &ZoneConfig,
+            backend: &Arc<FakeBackend>,
+            ip: IpAddr,
+        ) -> Result<Arc<RwLock<DnsHandler>>> {
+            let manager = RouteManager::with_backend(
+                Arc::clone(backend),
+                server.route_aggregation_prefix,
+                server.max_dynamic_routes,
+            );
+            manager.add_route(ip, zone).await?;
+            let config = crate::config::Config {
+                server: server.clone(),
+                zones: vec![zone.clone()],
+            };
+            let matcher = ZoneMatcher::new(vec![zone.clone()])?;
+            Ok(Arc::new(RwLock::new(DnsHandler::with_route_manager(
+                config, matcher, manager,
+            ))))
+        }
+
+        #[tokio::test]
+        async fn removed_zone_cleanup_failure_aborts_reload() -> Result<()> {
+            let server = reload_test_server();
+            let corp = via_zone("corp", "192.168.1.1");
+            let backend = Arc::new(FakeBackend::new());
+            let handler = handler_with_owned_route(
+                &server,
+                &corp,
+                &backend,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            )
+            .await?;
+            assert_eq!(backend.ensure_count(), 1);
+
+            backend.set_remove_error("kernel delete failed");
+            let reload_config = crate::config::Config {
+                server: server.clone(),
+                zones: vec![],
+            };
+
+            let error = apply_reload(&handler, reload_config)
+                .await
+                .expect_err("a failed removed-zone cleanup must abort the reload");
+            assert!(
+                error.to_string().contains("failed"),
+                "expected a cleanup failure, got: {error}"
+            );
+
+            assert_eq!(
+                handler.read().await.config().zones.len(),
+                1,
+                "the old config must survive a failed transaction"
+            );
+            assert!(
+                !handler
+                    .read()
+                    .await
+                    .zone_route_intents("corp")
+                    .await
+                    .is_empty(),
+                "ownership evidence must survive a failed retirement"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn changed_zone_retirement_failure_aborts_reload() -> Result<()> {
+            let server = reload_test_server();
+            let corp = via_zone("corp", "192.168.1.1");
+            let backend = Arc::new(FakeBackend::new());
+            let handler = handler_with_owned_route(
+                &server,
+                &corp,
+                &backend,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            )
+            .await?;
+
+            backend.set_remove_error("kernel delete failed");
+            let mut changed = corp.clone();
+            changed.domains = vec!["changed.example.com".to_string()];
+            let reload_config = crate::config::Config {
+                server: server.clone(),
+                zones: vec![changed],
+            };
+
+            let error = apply_reload(&handler, reload_config)
+                .await
+                .expect_err("a failed changed-zone retirement must abort the reload");
+            assert!(
+                error.to_string().contains("retiring"),
+                "expected a retirement failure, got: {error}"
+            );
+
+            let live = handler.read().await.config().clone();
+            assert_eq!(
+                live.zones[0].domains, corp.domains,
+                "the old zone must survive a failed transaction"
+            );
+            assert!(
+                !handler
+                    .read()
+                    .await
+                    .zone_route_intents("corp")
+                    .await
+                    .is_empty(),
+                "ownership evidence must survive a failed retirement"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn replacement_static_route_failure_aborts_before_retirement() -> Result<()> {
+            let server = reload_test_server();
+            let corp = via_zone("corp", "192.168.1.1");
+            let backend = Arc::new(FakeBackend::new());
+            let handler = handler_with_owned_route(
+                &server,
+                &corp,
+                &backend,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+            )
+            .await?;
+            assert_eq!(backend.remove_count(), 0);
+
+            backend.set_outcome(Err(anyhow::anyhow!("add refused")));
+            let mut changed = corp.clone();
+            changed.static_routes = vec!["10.9.9.0/24".to_string()];
+            let reload_config = crate::config::Config {
+                server: server.clone(),
+                zones: vec![changed],
+            };
+
+            let error = apply_reload(&handler, reload_config)
+                .await
+                .expect_err("a failed replacement row must abort the reload");
+            assert!(
+                error.to_string().contains("failed to verify"),
+                "expected a replacement failure, got: {error}"
+            );
+            assert_eq!(
+                backend.remove_count(),
+                0,
+                "retirement must not start when the replacement proof failed"
+            );
+            assert_eq!(
+                handler.read().await.config().zones[0].static_routes.len(),
+                0,
+                "the old config must survive"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn managed_reload_without_changes_sends_no_controller_rpc() -> Result<()> {
+            let server = reload_test_server();
+            let zone = via_zone("corp", "192.168.1.1");
+            let transport = Arc::new(FakeTransport::new());
+            transport.set_result(crate::routing::kikimora::fake::applied_result(
+                "10.0.0.1/32",
+                4,
+            ));
+            let backend = managed_backend(&transport);
+            let manager =
+                RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+            assert_eq!(manager.reconcile_mode(), ReconcileMode::AuthorityOnDemand);
+            manager
+                .add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
+                .await?;
+            assert_eq!(transport.call_count(), 1);
+
+            let config = crate::config::Config {
+                server: server.clone(),
+                zones: vec![zone.clone()],
+            };
+            let matcher = ZoneMatcher::new(vec![zone.clone()])?;
+            let handler = Arc::new(RwLock::new(DnsHandler::with_route_manager(
+                config, matcher, manager,
+            )));
+
+            let before = transport.call_count();
+            let reload_config = handler.read().await.config().clone();
+            apply_reload(&handler, reload_config).await?;
+
+            assert_eq!(
+                transport.call_count(),
+                before,
+                "a no-change managed reload must send zero controller RPC"
+            );
+            Ok(())
+        }
     }
 
     /// 08D1 §16.3/§6.5: the invalidation path reads back exactly the keys the
