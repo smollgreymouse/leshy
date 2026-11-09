@@ -40,16 +40,15 @@ use crate::config::{RoutingBackend, ServerConfig, ZoneConfig};
 use aggregator::{RouteAction, RouteAggregator};
 use anyhow::{Context, Result};
 use backend::{EnsureOutcome, ReconcileMode, RouteBackend};
+#[cfg(target_os = "linux")]
+use linux::LinuxRouteBackend as PlatformBackend;
+#[cfg(target_os = "macos")]
+use macos::MacosRouteBackend as PlatformBackend;
 use registry::RouteRegistry;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-#[cfg(target_os = "linux")]
-use linux::LinuxRouteBackend as PlatformBackend;
-#[cfg(target_os = "macos")]
-use macos::MacosRouteBackend as PlatformBackend;
 #[cfg(target_os = "windows")]
 use windows::WindowsRouteBackend as PlatformBackend;
 
@@ -62,6 +61,35 @@ pub const DEFAULT_MAX_DYNAMIC_ROUTES: usize = 16384;
 /// How often the safety audit re-reads the routing table.
 const AUDIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Kernel I/O counters for the invalidation path (08D1 §16.3).
+///
+/// `full_snapshots` counts manager-level full-FIB reads: a `Full`
+/// invalidation (periodic safety audit, explicit diagnostic) or an initial
+/// read. `targeted_reads` counts the per-key read-backs a Prefix, Interface or
+/// Zone event performs. A targeted event must never move `full_snapshots`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ReconcileCounters {
+    pub full_snapshots: u64,
+    pub targeted_reads: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReconcileCounterState {
+    full_snapshots: AtomicU64,
+    targeted_reads: AtomicU64,
+}
+
+impl ReconcileCounterState {
+    #[allow(dead_code)]
+    fn read(&self) -> ReconcileCounters {
+        ReconcileCounters {
+            full_snapshots: self.full_snapshots.load(Ordering::SeqCst),
+            targeted_reads: self.targeted_reads.load(Ordering::SeqCst),
+        }
+    }
+}
+
 pub struct RouteManager {
     backend: Arc<dyn RouteBackend>,
     registry: Arc<RouteRegistry>,
@@ -72,6 +100,8 @@ pub struct RouteManager {
     /// Managed mode understands only Zone and AuthorityLost; every other
     /// kind is an invariant violation and must never trigger a snapshot.
     authority_invariant_violations: Arc<AtomicU64>,
+    /// Proof that surfaced events stay targeted (08D1 §16.3).
+    reconcile_counters: Arc<ReconcileCounterState>,
 }
 
 impl RouteManager {
@@ -148,12 +178,14 @@ impl RouteManager {
             let epoch = Arc::clone(&self.kernel_epoch);
             let registry = Arc::clone(&self.registry);
             let backend = Arc::clone(&self.backend);
+            let counters = Arc::clone(&self.reconcile_counters);
             tokio::spawn(async move {
                 while let Some(invalidation) = rx.recv().await {
                     let report = reconcile_after_invalidation(
                         &registry,
                         backend.as_ref(),
                         &epoch,
+                        &counters,
                         invalidation,
                     )
                     .await;
@@ -173,6 +205,7 @@ impl RouteManager {
         let epoch = Arc::clone(&self.kernel_epoch);
         let registry = Arc::clone(&self.registry);
         let backend = Arc::clone(&self.backend);
+        let counters = Arc::clone(&self.reconcile_counters);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(AUDIT_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -185,6 +218,7 @@ impl RouteManager {
                     &registry,
                     backend.as_ref(),
                     &epoch,
+                    &counters,
                     backend::RouteInvalidation::Full,
                 )
                 .await;
@@ -238,9 +272,17 @@ impl RouteManager {
             &self.registry,
             self.backend.as_ref(),
             &self.kernel_epoch,
+            &self.reconcile_counters,
             invalidation,
         )
         .await
+    }
+
+    /// Counters proving the event path stays targeted (08D1 §16.3):
+    /// `full_snapshots` only moves for a `Full` invalidation/audit.
+    #[allow(dead_code)]
+    pub fn reconcile_counters(&self) -> ReconcileCounters {
+        self.reconcile_counters.read()
     }
 
     /// Test-visible count of invalidations an AuthorityOnDemand backend could
@@ -285,6 +327,7 @@ impl RouteManager {
             aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
             kernel_epoch: Arc::new(AtomicU64::new(0)),
             authority_invariant_violations: Arc::new(AtomicU64::new(0)),
+            reconcile_counters: Arc::new(ReconcileCounterState::default()),
         };
         manager.start_kernel_watch();
         manager
@@ -543,15 +586,17 @@ async fn dispatch_authority_invalidation(
 }
 
 /// Bump the shared kernel epoch, mark entries dirty per the invalidation and
-/// reconcile them against one fresh snapshot.
+/// reconcile them against exactly the proof the invalidation allows.
 ///
-/// Both the monitor task and the periodic audit go through this, so every
-/// reconcile makes the registry's verified epochs line up with
-/// [`RouteManager::kernel_epoch`] again and the DNS fast path stays exact.
+/// A `Full` invalidation (periodic safety audit, explicit diagnostic) is the
+/// only path that reads the whole FIB. Prefix, Interface and Zone events read
+/// back only the keys they invalidated (08D1 §16.3): the event path must never
+/// turn one kernel notification into a full v4+v6 snapshot.
 async fn reconcile_after_invalidation(
     registry: &Arc<RouteRegistry>,
     backend: &dyn RouteBackend,
     kernel_epoch: &AtomicU64,
+    counters: &ReconcileCounterState,
     invalidation: backend::RouteInvalidation,
 ) -> ReconcileReport {
     // §15 targeted-epoch semantics: only a Full invalidation advances the
@@ -563,18 +608,32 @@ async fn reconcile_after_invalidation(
         kernel_epoch.fetch_add(1, Ordering::SeqCst);
     }
     let epoch = kernel_epoch.load(Ordering::SeqCst);
-    registry.mark_dirty(invalidation, epoch).await;
+    let dirty_keys = registry.mark_dirty(invalidation.clone(), epoch).await;
     // §14.2: the dispatch branches on the backend's reconcile mode.
     match backend.reconcile_mode() {
-        ReconcileMode::KernelSnapshot => match backend.snapshot().await {
-            Ok(snapshot) => registry.reconcile_dirty(backend, &snapshot, epoch).await,
-            Err(e) => {
-                // A Full invalidation already advanced the epoch, so no entry
-                // can claim Verified against stale kernel state until the
-                // next reconcile succeeds.
-                tracing::debug!(error = %e, "Route snapshot failed after an invalidation");
-                ReconcileReport::default()
+        ReconcileMode::KernelSnapshot => match invalidation {
+            backend::RouteInvalidation::Full => {
+                counters.full_snapshots.fetch_add(1, Ordering::SeqCst);
+                match backend.snapshot().await {
+                    Ok(snapshot) => registry.reconcile_dirty(backend, &snapshot, epoch).await,
+                    Err(e) => {
+                        // A Full invalidation already advanced the epoch, so
+                        // no entry can claim Verified against stale kernel
+                        // state until the next reconcile succeeds.
+                        tracing::debug!(error = %e, "Route snapshot failed after an invalidation");
+                        ReconcileReport::default()
+                    }
+                }
             }
+            // 08D1 §16.3: targeted events read back exactly their own keys.
+            backend::RouteInvalidation::Prefix(_)
+            | backend::RouteInvalidation::Interface(_)
+            | backend::RouteInvalidation::Zone(_) => {
+                reconcile_targeted_keys(registry, backend, &dirty_keys, epoch, counters).await
+            }
+            // A local-kernel backend never originates AuthorityLost; the
+            // managed dispatch owns it (08D1 §18.4).
+            backend::RouteInvalidation::AuthorityLost => ReconcileReport::default(),
         },
         // AuthorityOnDemand and RegistryOnly never snapshot here: the
         // demand-driven path (L14) and the shell backend own their own
@@ -583,6 +642,39 @@ async fn reconcile_after_invalidation(
             ReconcileReport::default()
         }
     }
+}
+
+/// Reconcile the keys a targeted invalidation named, one exact read-back each.
+///
+/// A failed read-back leaves the entry Dirty: no entry may claim Verified
+/// against a key the backend could not read.
+async fn reconcile_targeted_keys(
+    registry: &RouteRegistry,
+    backend: &dyn RouteBackend,
+    keys: &[model::RouteKey],
+    epoch: u64,
+    counters: &ReconcileCounterState,
+) -> ReconcileReport {
+    let mut report = ReconcileReport::default();
+    for key in keys {
+        counters.targeted_reads.fetch_add(1, Ordering::SeqCst);
+        match backend.observe_key(key).await {
+            Ok(rows) => {
+                let one = registry.reconcile_key(backend, key, &rows, epoch).await;
+                report.adds += one.adds;
+                report.removes += one.removes;
+                report.noops += one.noops;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    prefix = %key.prefix.network,
+                    "targeted read-back failed; the entry stays dirty"
+                );
+            }
+        }
+    }
+    report
 }
 
 /// Parse a CIDR string like "149.154.160.0/20" or plain IP "1.2.3.4".
@@ -1527,5 +1619,195 @@ max_dynamic_routes = 100
             "the changed zone is swapped in"
         );
         Ok(())
+    }
+
+    /// 08D1 §16.3/§6.5: the invalidation path reads back exactly the keys the
+    /// event named and never turns one kernel notification into a full-FIB
+    /// snapshot.
+    mod targeted_reconcile_tests {
+        use super::*;
+
+        fn key_of(ip: IpAddr) -> model::RouteKey {
+            model::RouteKey {
+                prefix: model::RoutePrefix::host(ip),
+                table: MAIN_TABLE,
+            }
+        }
+
+        fn ip(last: u8) -> IpAddr {
+            IpAddr::V4(Ipv4Addr::new(10, 9, 0, last))
+        }
+
+        async fn manager_with_routes(
+            routes: &[(&ZoneConfig, IpAddr)],
+        ) -> Result<(Arc<RouteManager>, Arc<FakeBackend>)> {
+            let backend = Arc::new(FakeBackend::new());
+            let mgr = Arc::new(RouteManager::with_backend(
+                Arc::clone(&backend),
+                None,
+                DEFAULT_MAX_DYNAMIC_ROUTES,
+            ));
+            for (zone, addr) in routes {
+                mgr.add_route(*addr, zone).await?;
+            }
+            backend.reset_counters();
+            Ok((mgr, backend))
+        }
+
+        #[tokio::test]
+        async fn prefix_event_triggers_one_targeted_read_and_no_snapshot() -> Result<()> {
+            let zone = via_zone("corp", "192.168.1.1");
+            let (mgr, backend) = manager_with_routes(&[(&zone, ip(1)), (&zone, ip(2))]).await?;
+
+            let report = mgr
+                .handle_invalidation(backend::RouteInvalidation::Prefix(key_of(ip(1))))
+                .await;
+
+            assert_eq!(
+                backend.snapshot_count(),
+                0,
+                "a Prefix event must not full-snapshot"
+            );
+            assert_eq!(
+                backend.targeted_read_count(),
+                1,
+                "exactly the named key is read back"
+            );
+            assert_eq!(
+                backend.ensure_count(),
+                1,
+                "the externally deleted row is repaired through the targeted path"
+            );
+            assert_eq!(report.adds, 1);
+            assert_eq!(mgr.reconcile_counters().full_snapshots, 0);
+            assert_eq!(mgr.reconcile_counters().targeted_reads, 1);
+            assert_eq!(
+                mgr.registry.dirty_count().await,
+                0,
+                "no entry may stay dirty after a successful targeted reconcile"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn interface_event_reads_back_only_the_affected_keys() -> Result<()> {
+            let zone = via_zone("corp", "192.168.1.1");
+            let (mgr, backend) =
+                manager_with_routes(&[(&zone, ip(1)), (&zone, ip(2)), (&zone, ip(3))]).await?;
+
+            // An unrelated ifindex dirties nothing and performs zero I/O.
+            let quiet = mgr
+                .handle_invalidation(backend::RouteInvalidation::Interface(99))
+                .await;
+            assert_eq!(quiet.adds + quiet.removes + quiet.noops, 0);
+            assert_eq!(backend.targeted_read_count(), 0);
+            assert_eq!(backend.snapshot_count(), 0);
+
+            // Every recorded row was installed through ifindex 1.
+            let report = mgr
+                .handle_invalidation(backend::RouteInvalidation::Interface(1))
+                .await;
+            assert_eq!(backend.targeted_read_count(), 3);
+            assert_eq!(
+                backend.snapshot_count(),
+                0,
+                "an Interface event must not full-snapshot"
+            );
+            assert_eq!(report.adds, 3);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn zone_event_reads_back_only_that_zones_keys() -> Result<()> {
+            let corp = via_zone("corp", "192.168.1.1");
+            let edge = via_zone("edge", "192.168.2.1");
+            let (mgr, backend) =
+                manager_with_routes(&[(&corp, ip(1)), (&corp, ip(2)), (&edge, ip(3))]).await?;
+
+            let report = mgr
+                .handle_invalidation(backend::RouteInvalidation::Zone("corp".to_string()))
+                .await;
+
+            assert_eq!(backend.targeted_read_count(), 2);
+            assert_eq!(
+                backend.snapshot_count(),
+                0,
+                "a Zone event must not full-snapshot"
+            );
+            assert_eq!(report.adds, 2);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn full_invalidation_still_reads_exactly_one_full_snapshot() -> Result<()> {
+            let zone = via_zone("corp", "192.168.1.1");
+            let (mgr, backend) = manager_with_routes(&[(&zone, ip(1)), (&zone, ip(2))]).await?;
+
+            mgr.handle_invalidation(backend::RouteInvalidation::Full)
+                .await;
+
+            assert_eq!(backend.snapshot_count(), 1);
+            assert_eq!(backend.targeted_read_count(), 0);
+            assert_eq!(
+                backend.ensure_count(),
+                2,
+                "a Full reconcile still proves every desired key"
+            );
+            assert_eq!(mgr.reconcile_counters().full_snapshots, 1);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn one_prefix_event_among_a_thousand_verified_keys_stays_flat() -> Result<()> {
+            let zone = via_zone("corp", "192.168.1.1");
+            let backend = Arc::new(FakeBackend::new());
+            let mgr = Arc::new(RouteManager::with_backend(
+                Arc::clone(&backend),
+                None,
+                DEFAULT_MAX_DYNAMIC_ROUTES,
+            ));
+
+            let mut addrs = Vec::new();
+            for index in 0..1000u32 {
+                let addr = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + index + 1));
+                mgr.add_route(addr, &zone).await?;
+                addrs.push(addr);
+            }
+            backend.reset_counters();
+
+            let report = mgr
+                .handle_invalidation(backend::RouteInvalidation::Prefix(key_of(addrs[500])))
+                .await;
+            assert_eq!(report.adds, 1);
+            assert_eq!(
+                backend.targeted_read_count(),
+                1,
+                "one Prefix event performs one targeted read"
+            );
+            assert_eq!(
+                backend.snapshot_count(),
+                0,
+                "a targeted event never reads the full FIB"
+            );
+
+            // The other 999 keys keep their Verified fast path: zero extra
+            // backend work of any kind.
+            backend.reset_counters();
+            for addr in &addrs {
+                mgr.add_route(*addr, &zone).await?;
+            }
+            assert_eq!(
+                backend.ensure_count(),
+                0,
+                "verified keys must not re-ensure"
+            );
+            assert_eq!(
+                backend.targeted_read_count(),
+                0,
+                "no unrelated targeted reads"
+            );
+            assert_eq!(backend.snapshot_count(), 0, "no extra full snapshots");
+            Ok(())
+        }
     }
 }

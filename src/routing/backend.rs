@@ -123,6 +123,20 @@ pub(crate) trait RouteBackend: Send + Sync {
     /// Read the kernel routing table.
     async fn snapshot(&self) -> Result<Vec<ObservedRoute>>;
 
+    /// Targeted read-back of every row occupying one key (08D1 §16.3).
+    ///
+    /// A local `KernelSnapshot` backend must read exactly this key from the
+    /// kernel (or its event-coherent cache) and must never fall back to a
+    /// full-family dump: the Prefix/Interface/Zone event path uses this
+    /// instead of `snapshot()`. The default fails closed, which is correct for
+    /// `AuthorityOnDemand` and `RegistryOnly` backends — they never receive a
+    /// local kernel invalidation and must not claim a kernel proof they cannot
+    /// produce.
+    async fn observe_key(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+        let _ = key;
+        anyhow::bail!("this routing backend has no targeted kernel read-back")
+    }
+
     /// Kernel invalidation stream, when the platform can observe changes.
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>>;
 
@@ -172,6 +186,7 @@ pub(crate) mod fake {
         pub removes: AtomicU64,
         pub snapshots: AtomicU64,
         pub resolves: AtomicU64,
+        pub targeted_reads: AtomicU64,
         /// Scripted result for the next `ensure_route` calls.
         outcome: Mutex<Option<Result<EnsureOutcome>>>,
         /// Scripted foreign-route conflict for the next `ensure_route` calls.
@@ -191,6 +206,7 @@ pub(crate) mod fake {
                 removes: AtomicU64::new(0),
                 snapshots: AtomicU64::new(0),
                 resolves: AtomicU64::new(0),
+                targeted_reads: AtomicU64::new(0),
                 outcome: Mutex::new(None),
                 conflict: Mutex::new(None),
                 resolved: Mutex::new(None),
@@ -228,6 +244,10 @@ pub(crate) mod fake {
 
         pub(crate) fn snapshot_count(&self) -> u64 {
             self.state.snapshots.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn targeted_read_count(&self) -> u64 {
+            self.state.targeted_reads.load(Ordering::SeqCst)
         }
 
         pub(crate) fn resolve_count(&self) -> u64 {
@@ -271,6 +291,7 @@ pub(crate) mod fake {
             self.state.removes.store(0, Ordering::SeqCst);
             self.state.snapshots.store(0, Ordering::SeqCst);
             self.state.resolves.store(0, Ordering::SeqCst);
+            self.state.targeted_reads.store(0, Ordering::SeqCst);
         }
 
         /// Shared handle for passing the same fake into several owners.
@@ -366,6 +387,16 @@ pub(crate) mod fake {
         async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
             self.state.snapshots.fetch_add(1, Ordering::SeqCst);
             Ok(self.state.observed.lock().unwrap().clone())
+        }
+
+        async fn observe_key(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+            self.state.targeted_reads.fetch_add(1, Ordering::SeqCst);
+            let observed = self.state.observed.lock().unwrap();
+            Ok(observed
+                .iter()
+                .filter(|row| row.key == *key)
+                .cloned()
+                .collect())
         }
 
         fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {

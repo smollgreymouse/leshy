@@ -46,6 +46,19 @@ struct RouteEntry {
     last_error: Option<String>,
 }
 
+/// Outcome of reconciling one Dirty entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileStep {
+    /// The entry was not Dirty or had no desired intent.
+    Skipped,
+    /// The recorded exact identity is still present.
+    Noop,
+    /// The backend created the missing row.
+    Added,
+    /// The backend refused or failed; the entry stays unverified.
+    Failed,
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -167,46 +180,67 @@ impl RouteRegistry {
         Ok(result.outcome)
     }
 
-    /// Mark entries dirty based on an invalidation signal.
-    pub(crate) async fn mark_dirty(&self, invalidation: RouteInvalidation, epoch: u64) {
+    /// Mark entries dirty based on an invalidation signal, returning the keys
+    /// that became Dirty so the caller can read back exactly those keys
+    /// (08D1 §16.3). A Full invalidation returns every desired key; the
+    /// caller still reconciles it against one full snapshot.
+    pub(crate) async fn mark_dirty(
+        &self,
+        invalidation: RouteInvalidation,
+        epoch: u64,
+    ) -> Vec<RouteKey> {
         if matches!(invalidation, RouteInvalidation::AuthorityLost) {
             self.mark_authority_lost().await;
-            return;
+            return Vec::new();
         }
+        let mut dirty = Vec::new();
         let mut map = self.entries.write().await;
         match invalidation {
             RouteInvalidation::Zone(zone) => {
-                for entry in map.values_mut() {
+                for (key, entry) in map.iter_mut() {
                     let mut locked = entry.lock().await;
                     if let Some(ref intent) = locked.desired {
                         if intent.zone == zone {
                             locked.state = RouteState::Dirty;
                             locked.dirty_epoch = epoch;
+                            dirty.push(key.clone());
                         }
                     }
                 }
             }
             RouteInvalidation::Full => {
-                for entry in map.values_mut() {
+                for (key, entry) in map.iter_mut() {
                     let mut locked = entry.lock().await;
                     if locked.desired.is_some() {
                         locked.state = RouteState::Dirty;
                         locked.dirty_epoch = epoch;
+                        dirty.push(key.clone());
                     }
                 }
             }
             RouteInvalidation::Interface(ifindex) => {
-                for entry in map.values_mut() {
+                for (key, entry) in map.iter_mut() {
                     let mut locked = entry.lock().await;
                     if let Some(ref intent) = locked.desired {
-                        if let RouteTarget::Device {
-                            ifindex: Some(idx), ..
-                        } = &intent.target
-                        {
-                            if *idx == ifindex {
-                                locked.state = RouteState::Dirty;
-                                locked.dirty_epoch = epoch;
-                            }
+                        // The OIF the kernel reported may come from the intent
+                        // (a device route) or from the exact recorded
+                        // observation (a gateway route reached through that
+                        // interface, whose target carries no ifindex).
+                        let intent_ifindex = match &intent.target {
+                            RouteTarget::Device {
+                                ifindex: Some(idx), ..
+                            } => Some(*idx),
+                            _ => None,
+                        };
+                        let observed_ifindex = locked
+                            .ownership
+                            .as_ref()
+                            .and_then(|ownership| ownership.observed.as_ref())
+                            .and_then(|observed| observed.identity.ifindex);
+                        if intent_ifindex == Some(ifindex) || observed_ifindex == Some(ifindex) {
+                            locked.state = RouteState::Dirty;
+                            locked.dirty_epoch = epoch;
+                            dirty.push(key.clone());
                         }
                     }
                 }
@@ -217,6 +251,7 @@ impl RouteRegistry {
                     if locked.desired.is_some() {
                         locked.state = RouteState::Dirty;
                         locked.dirty_epoch = epoch;
+                        dirty.push(key);
                     }
                 }
             }
@@ -224,6 +259,7 @@ impl RouteRegistry {
                 // Delegated to mark_authority_lost before the map lock.
             }
         }
+        dirty
     }
 
     /// Invalidate the controller's authority over every managed entry
@@ -265,76 +301,116 @@ impl RouteRegistry {
         snapshot: &[ObservedRoute],
         epoch: u64,
     ) -> ReconcileReport {
-        let mut adds = 0usize;
-        let removes = 0usize;
-        let mut noops = 0usize;
+        let mut report = ReconcileReport::default();
 
         let map = self.entries.read().await;
         for (key, entry) in map.iter() {
             let mut locked = entry.lock().await;
-            if locked.state != RouteState::Dirty || locked.desired.is_none() {
-                continue;
-            }
-
-            let intent = locked.desired.clone().unwrap();
-
-            // §49.2: the snapshot no-op proof is the EXACT identity — same
-            // key, same target AND the same kernel identity as the recorded
-            // ownership observation. A changed protocol/metric/OIF/LUID, a
-            // disappeared row, multiple same-key rows or owned-without-
-            // observation all fall through to the backend revalidation.
-            let recorded_identity = locked
-                .ownership
-                .as_ref()
-                .and_then(|o| o.observed.as_ref())
-                .map(|o| o.identity.clone());
-            let acceptable = recorded_identity.as_ref().and_then(|identity| {
-                let same_key: Vec<&ObservedRoute> = snapshot
-                    .iter()
-                    .filter(|r| r.key == *key && r.target == intent.target)
-                    .collect();
-                // Exactly one acceptable same-key row with the identical
-                // recorded identity.
-                if same_key.len() == 1 && same_key[0].identity == *identity {
-                    Some(())
-                } else {
-                    None
-                }
-            });
-
-            if acceptable.is_some() {
-                locked.state = RouteState::Verified;
-                locked.verified_epoch = epoch;
-                locked.dirty_epoch = epoch;
-                noops += 1;
-            } else {
-                // Re-apply the route with the recorded ownership (§14.4).
-                match backend
-                    .ensure_route(&intent, locked.ownership.as_ref())
-                    .await
-                {
-                    Ok(result) => {
-                        locked.ownership = Some(result.ownership);
-                        locked.state = RouteState::Verified;
-                        locked.verified_epoch = epoch;
-                        locked.dirty_epoch = epoch;
-                        match result.outcome {
-                            EnsureOutcome::Added => adds += 1,
-                            EnsureOutcome::AlreadyMatching => noops += 1,
-                        }
-                    }
-                    Err(_) => {
-                        locked.state = RouteState::Error;
-                    }
-                }
+            match Self::reconcile_entry(key, &mut locked, backend, snapshot, epoch).await {
+                ReconcileStep::Added => report.adds += 1,
+                ReconcileStep::Noop => report.noops += 1,
+                ReconcileStep::Skipped | ReconcileStep::Failed => {}
             }
         }
         drop(map);
 
-        ReconcileReport {
-            adds,
-            removes,
-            noops,
+        report
+    }
+
+    /// Reconcile exactly one key against the rows read back for that key
+    /// (08D1 §16.3). This is the targeted event path: it applies the same
+    /// exact-identity proof as a full snapshot, but only for the keys the
+    /// invalidation named.
+    pub(crate) async fn reconcile_key(
+        &self,
+        backend: &dyn RouteBackend,
+        key: &RouteKey,
+        rows: &[ObservedRoute],
+        epoch: u64,
+    ) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
+
+        let map = self.entries.read().await;
+        let Some(entry) = map.get(key) else {
+            return report;
+        };
+        let mut locked = entry.lock().await;
+        match Self::reconcile_entry(key, &mut locked, backend, rows, epoch).await {
+            ReconcileStep::Added => report.adds += 1,
+            ReconcileStep::Noop => report.noops += 1,
+            ReconcileStep::Skipped | ReconcileStep::Failed => {}
+        }
+        drop(locked);
+        drop(map);
+
+        report
+    }
+
+    /// The one exact-identity reconcile rule shared by the full-snapshot and
+    /// targeted paths.
+    async fn reconcile_entry(
+        key: &RouteKey,
+        locked: &mut RouteEntry,
+        backend: &dyn RouteBackend,
+        rows: &[ObservedRoute],
+        epoch: u64,
+    ) -> ReconcileStep {
+        if locked.state != RouteState::Dirty || locked.desired.is_none() {
+            return ReconcileStep::Skipped;
+        }
+
+        let intent = locked.desired.clone().unwrap();
+
+        // §49.2: the snapshot no-op proof is the EXACT identity — same
+        // key, same target AND the same kernel identity as the recorded
+        // ownership observation. A changed protocol/metric/OIF/LUID, a
+        // disappeared row, multiple same-key rows or owned-without-
+        // observation all fall through to the backend revalidation.
+        let recorded_identity = locked
+            .ownership
+            .as_ref()
+            .and_then(|o| o.observed.as_ref())
+            .map(|o| o.identity.clone());
+        let acceptable = recorded_identity.as_ref().and_then(|identity| {
+            let same_key: Vec<&ObservedRoute> = rows
+                .iter()
+                .filter(|r| r.key == *key && r.target == intent.target)
+                .collect();
+            // Exactly one acceptable same-key row with the identical
+            // recorded identity.
+            if same_key.len() == 1 && same_key[0].identity == *identity {
+                Some(())
+            } else {
+                None
+            }
+        });
+
+        if acceptable.is_some() {
+            locked.state = RouteState::Verified;
+            locked.verified_epoch = epoch;
+            locked.dirty_epoch = epoch;
+            return ReconcileStep::Noop;
+        }
+
+        // Re-apply the route with the recorded ownership (§14.4).
+        match backend
+            .ensure_route(&intent, locked.ownership.as_ref())
+            .await
+        {
+            Ok(result) => {
+                locked.ownership = Some(result.ownership);
+                locked.state = RouteState::Verified;
+                locked.verified_epoch = epoch;
+                locked.dirty_epoch = epoch;
+                match result.outcome {
+                    EnsureOutcome::Added => ReconcileStep::Added,
+                    EnsureOutcome::AlreadyMatching => ReconcileStep::Noop,
+                }
+            }
+            Err(_) => {
+                locked.state = RouteState::Error;
+                ReconcileStep::Failed
+            }
         }
     }
 

@@ -921,6 +921,13 @@ impl RouteBackend for WindowsRouteBackend {
         Ok(out)
     }
 
+    async fn observe_key(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+        // Targeted read-back for one destination (08D1 §16.3). The Windows
+        // writer has no event path yet (L12), so this exists for the shared
+        // contract rather than for a listener.
+        read_prefix(key).await
+    }
+
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
         // L12: Windows route-change observer (NotifyRouteChange2).
         // This is implemented in a later step (L13).

@@ -399,6 +399,18 @@ async fn ipv6_route_event_restores_externally_deleted_128() {
         restored,
         "the /128 row must be restored by the IPv6 event in <5s"
     );
+
+    // 08D1 §16.3: the event path stays targeted — the repair came from a
+    // per-key read-back, never from a full v4+v6 FIB snapshot.
+    let counters = manager.reconcile_counters();
+    assert_eq!(
+        counters.full_snapshots, 0,
+        "an event-driven repair must not read the full FIB: {counters:?}"
+    );
+    assert!(
+        counters.targeted_reads >= 1,
+        "the event must produce at least one targeted read: {counters:?}"
+    );
 }
 
 /// §16.6: deleting and recreating the interface invalidates the old ifindex.

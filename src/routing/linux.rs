@@ -833,6 +833,18 @@ impl RouteBackend for LinuxRouteBackend {
         Ok(cache.values().flatten().cloned().collect())
     }
 
+    async fn observe_key(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+        // Targeted event path (08D1 §16.3): read this key back from the
+        // kernel and update only this cache entry. Never a family dump.
+        self.refresh_key(key).await
+    }
+
+    async fn observe_key(&self, key: &RouteKey) -> Result<Vec<ObservedRoute>> {
+        // Targeted event path (08D1 §16.3): read this key back from the
+        // kernel and update only this cache entry. Never a family dump.
+        self.refresh_key(key).await
+    }
+
     fn take_invalidation_receiver(&self) -> Option<mpsc::UnboundedReceiver<RouteInvalidation>> {
         self.invalidation_rx
             .try_lock()
