@@ -65,8 +65,58 @@ jobs:
       # 08D1 §16.6: real /32 and /128 add/read-back, <5s event restore,
       # 1000-duplicate flatness and foreign-row safety in a disposable
       # network namespace.
+      #
+      # The test binaries are built as the runner user, before sudo. The
+      # root-only script never calls cargo/rustup and only receives absolute
+      # binary paths (ip netns exec keeps the filesystem path).
+      - name: Build privileged acceptance binaries
+        run: |
+          cargo test --test linux_route_registry_netns --no-run
+          cargo test --test netns_monitor_probe --no-run
+
+      - name: Resolve privileged acceptance binaries
+        id: netns_bins
+        run: |
+          REGISTRY_BIN="$(ls -t target/debug/deps/linux_route_registry_netns-* | grep -v '\.d$' | head -1)"
+          MONITOR_BIN="$(ls -t target/debug/deps/netns_monitor_probe-* | grep -v '\.d$' | head -1)"
+          test -x "$REGISTRY_BIN"
+          test -x "$MONITOR_BIN"
+          echo "registry=$PWD/$REGISTRY_BIN" >> "$GITHUB_OUTPUT"
+          echo "monitor=$PWD/$MONITOR_BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Verify required privileged tests are present
+        env:
+          LESHY_REGISTRY_TEST_BIN: ${{ steps.netns_bins.outputs.registry }}
+          LESHY_MONITOR_PROBE_BIN: ${{ steps.netns_bins.outputs.monitor }}
+        run: |
+          REGISTRY_LIST="$("$LESHY_REGISTRY_TEST_BIN" --list --ignored)"
+          MONITOR_LIST="$("$LESHY_MONITOR_PROBE_BIN" --list --ignored)"
+          echo "$REGISTRY_LIST"
+          echo "$MONITOR_LIST"
+          for test in \
+            real_kernel_add_readback_delete_and_conflict_safety \
+            real_kernel_dual_stack_through_one_device \
+            ipv6_route_event_restores_externally_deleted_128 \
+            real_kernel_interface_recreate_invalidates_old_ifindex
+          do
+            grep -q "$test" <<<"$REGISTRY_LIST" || { echo "missing registry test: $test"; exit 1; }
+          done
+          for test in \
+            production_monitor_delivers_invalidations \
+            raw_monitor_sees_route_churn
+          do
+            grep -q "$test" <<<"$MONITOR_LIST" || { echo "missing monitor test: $test"; exit 1; }
+          done
+
       - name: Run privileged netns acceptance
-        run: sudo -E ./tests/linux-route-registry-netns.sh
+        env:
+          LESHY_REGISTRY_TEST_BIN: ${{ steps.netns_bins.outputs.registry }}
+          LESHY_MONITOR_PROBE_BIN: ${{ steps.netns_bins.outputs.monitor }}
+        run: |
+          sudo -E env \
+            LESHY_REGISTRY_TEST_BIN="$LESHY_REGISTRY_TEST_BIN" \
+            LESHY_MONITOR_PROBE_BIN="$LESHY_MONITOR_PROBE_BIN" \
+            ./tests/linux-route-registry-netns.sh
 
   integration-linux:
     name: Integration Tests (Linux)
