@@ -28,6 +28,7 @@ use tokio::sync::{Mutex, RwLock};
 // ---------------------------------------------------------------------------
 
 /// State of a single route key in the registry.
+#[derive(Debug)]
 struct RouteEntry {
     /// The most recent desired intent for this key.
     desired: Option<RouteIntent>,
@@ -55,6 +56,7 @@ struct RouteEntry {
 /// `Arc<Mutex<RouteEntry>>`.  The per-entry mutex may span one backend await,
 /// deliberately coalescing concurrent DNS requests for the same route while
 /// allowing different prefixes to proceed concurrently.
+#[derive(Debug)]
 pub(crate) struct RouteRegistry {
     entries: RwLock<HashMap<RouteKey, Arc<Mutex<RouteEntry>>>>,
     max_dynamic_routes: usize,
@@ -167,6 +169,10 @@ impl RouteRegistry {
 
     /// Mark entries dirty based on an invalidation signal.
     pub(crate) async fn mark_dirty(&self, invalidation: RouteInvalidation, epoch: u64) {
+        if matches!(invalidation, RouteInvalidation::AuthorityLost) {
+            self.mark_authority_lost().await;
+            return;
+        }
         let mut map = self.entries.write().await;
         match invalidation {
             RouteInvalidation::Zone(zone) => {
@@ -214,7 +220,42 @@ impl RouteRegistry {
                     }
                 }
             }
+            RouteInvalidation::AuthorityLost => {
+                // Delegated to mark_authority_lost before the map lock.
+            }
         }
+    }
+
+    /// Invalidate the controller's authority over every managed entry
+    /// (08D1 §18.4/§18.5).
+    ///
+    /// Every desired entry becomes Dirty/unverified, but the desired intent
+    /// and exact ownership metadata are preserved. No backend call is made:
+    /// the next demand for a key is the only thing that revalidates it. This
+    /// deliberately does not touch `full_epoch` — that epoch is the local
+    /// kernel-snapshot proof, which a managed controller loss cannot provide.
+    pub(crate) async fn mark_authority_lost(&self) {
+        let map = self.entries.read().await;
+        for entry in map.values() {
+            let mut locked = entry.lock().await;
+            if locked.desired.is_some() {
+                locked.state = RouteState::Dirty;
+            }
+        }
+    }
+
+    /// Test-only visibility into unverified entries after a targeted or
+    /// authority-wide invalidation.
+    #[cfg(test)]
+    pub(crate) async fn dirty_count(&self) -> usize {
+        let map = self.entries.read().await;
+        let mut count = 0usize;
+        for entry in map.values() {
+            if entry.lock().await.state == RouteState::Dirty {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Reconcile dirty entries against a fresh snapshot.

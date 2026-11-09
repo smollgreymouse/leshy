@@ -78,7 +78,13 @@ pub enum RouteInvalidation {
     /// Kikimora managed backend when the controller's route generation or
     /// family readiness for that zone changed.
     Zone(String),
-    /// The kernel state cannot be mapped to individual keys.
+    /// Global control authority is unknown (08D1 §18.4): the managed backend
+    /// lost its controller connection or a subscription frame was malformed.
+    /// Every managed entry becomes Dirty but no bulk RPC is issued.
+    AuthorityLost,
+    /// The kernel state cannot be mapped to individual keys. This is a
+    /// local-kernel full-snapshot invalidation and is never emitted by the
+    /// Kikimora managed backend.
     Full,
 }
 

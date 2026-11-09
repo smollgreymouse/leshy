@@ -422,21 +422,31 @@ impl DnsHandler {
         route_manager.retire_intents(intents).await
     }
 
-    /// Mark every registry entry dirty and run one reconcile (the tail step
-    /// of a config reload).
-    pub async fn reconcile_routes_after_reload(&self) -> usize {
+    /// Invalidate the affected zones after a config reload (08D1 §19.2).
+    ///
+    /// Each affected zone is marked through the same targeted `Zone`
+    /// invalidation the kernel/controller listener uses: only that zone's
+    /// entries become Dirty/reconciled. Ordinary reload never emits `Full`.
+    pub async fn reconcile_routes_after_reload(&self, zones: &[String]) -> usize {
         let route_manager = self.route_manager.read().await;
-        let report = route_manager
-            .handle_invalidation(crate::routing::backend::RouteInvalidation::Full)
-            .await;
-        if report.adds > 0 || report.removes > 0 {
-            tracing::info!(
-                adds = report.adds,
-                removes = report.removes,
-                "Reload reconciliation applied route changes"
-            );
+        let mut total = 0usize;
+        for zone in zones {
+            let report = route_manager
+                .handle_invalidation(crate::routing::backend::RouteInvalidation::Zone(
+                    zone.clone(),
+                ))
+                .await;
+            if report.adds > 0 || report.removes > 0 {
+                tracing::info!(
+                    zone = zone,
+                    adds = report.adds,
+                    removes = report.removes,
+                    "Reload reconciliation applied route changes"
+                );
+            }
+            total += report.adds + report.removes;
         }
-        report.adds + report.removes
+        total
     }
 
     /// Returns true if any zone has static routes configured

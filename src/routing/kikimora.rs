@@ -24,8 +24,8 @@
 //! There is deliberately no fallback to the local writer: if the controller
 //! is unreachable the intents fail and the DNS layer applies its failure
 //! policy. A socket loss marks every entry's authority unknown through a
-//! full invalidation, so a stale Verified entry is never trusted for a new
-//! intent.
+//! local `AuthorityLost` invalidation (never a bulk RPC), so a stale Verified
+//! entry is never trusted for a new intent.
 
 use crate::config::ZoneConfig;
 use crate::routing::backend::{
@@ -377,6 +377,9 @@ pub(crate) struct KikimoraRouteBackend {
     _pump: Option<tokio::task::JoinHandle<()>>,
     /// Schema-2 activation fence; `None` on the legacy v1 protocol.
     identity: Option<ManagedIdentity>,
+    /// Test-visible proof that AuthorityOnDemand never asks for a local
+    /// kernel snapshot (§18.3/§18.8).
+    snapshot_calls: AtomicU64,
 }
 
 /// Loads the privileged bearer credential (08D1 §31.6): the file holds
@@ -461,7 +464,14 @@ impl KikimoraRouteBackend {
             invalidation_rx,
             _pump: pump,
             identity,
+            snapshot_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Test-only snapshot invocation counter (must stay zero in managed mode).
+    #[cfg(test)]
+    pub(crate) fn snapshot_calls(&self) -> u64 {
+        self.snapshot_calls.load(Ordering::SeqCst)
     }
 
     fn wire_intent(&self, intent: &RouteIntent) -> LeshyRouteIntentWire {
@@ -583,7 +593,8 @@ impl RouteBackend for KikimoraRouteBackend {
     async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
         // §18.3: the managed backend has no local kernel snapshot — an empty
         // vector would be misread as "every route missing". Authority is
-        // demand-driven (L14 implements the dispatch).
+        // demand-driven; tests assert this counter stays zero.
+        self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!(
             "managed Kikimora backend has no local kernel snapshot; authority is demand-driven"
         );
@@ -599,23 +610,29 @@ impl RouteBackend for KikimoraRouteBackend {
 // ---------------------------------------------------------------------------
 
 /// Long-lived subscription loop: on every controller generation change for a
-/// zone the matching registry entries are invalidated; on any socket loss the
-/// whole registry's authority is marked unknown. Reconnects with bounded
-/// backoff, never falling back to the local writer.
+/// zone the matching registry entries are invalidated. Any connection loss,
+/// malformed frame or failed reconnect marks global authority unknown. The
+/// per-role generation memory survives reconnects so an unchanged controller
+/// does not dirty anything merely because the socket came back.
+///
+/// Reconnects use the bounded 1s -> 30s backoff and never fall back to the
+/// local writer. `Full` is a local-kernel signal and is never emitted here.
 async fn subscription_pump(
     socket_path: String,
     tx: mpsc::UnboundedSender<RouteInvalidation>,
     required: Vec<&'static str>,
 ) {
     let mut backoff = RECONNECT_MIN;
+    let mut generations: HashMap<String, u64> = HashMap::new();
     loop {
         let started = tokio::time::Instant::now();
-        match subscription_session(&socket_path, &tx, &required).await {
+        match subscription_session(&socket_path, &tx, &required, &mut generations).await {
             Ok(()) => tracing::debug!("Kikimora subscription ended"),
             Err(e) => tracing::debug!(error = %e, "Kikimora subscription lost"),
         }
-        // Socket loss: every entry's authority is now unknown.
-        let _ = tx.send(RouteInvalidation::Full);
+        // §18.4: the controller connection no longer vouches for any managed
+        // route. Only the next demand revalidates a key; no bulk RPC here.
+        let _ = tx.send(RouteInvalidation::AuthorityLost);
         if started.elapsed() >= Duration::from_secs(60) {
             backoff = RECONNECT_MIN;
         }
@@ -630,6 +647,7 @@ async fn subscription_session(
     socket_path: &str,
     tx: &mpsc::UnboundedSender<RouteInvalidation>,
     required: &[&'static str],
+    generations: &mut HashMap<String, u64>,
 ) -> Result<()> {
     let mut conn = connect(socket_path).await?;
 
@@ -675,7 +693,6 @@ async fn subscription_session(
     )
     .await?;
 
-    let mut generations: HashMap<String, u64> = HashMap::new();
     loop {
         let response: ControlResponse = read_frame(&mut conn).await?;
         if !response.ok {
@@ -684,7 +701,7 @@ async fn subscription_session(
         let Some(snapshot) = response.snapshot else {
             continue;
         };
-        for invalidation in snapshot_invalidations(&mut generations, &snapshot) {
+        for invalidation in snapshot_invalidations(generations, &snapshot) {
             let _ = tx.send(invalidation);
         }
     }
@@ -696,7 +713,9 @@ async fn subscription_session(
 /// The controller bumps the generation on every change that makes the
 /// previous routes stale (transport generation, ifindex, family readiness,
 /// freeze/withdraw cycles). A role with a zone invalidates just that zone;
-/// anything unattributable invalidates everything.
+/// a change that cannot be attributed to a zone marks global authority
+/// unknown. `Full` is reserved for local kernel snapshots and is never
+/// emitted by the managed backend.
 fn snapshot_invalidations(
     generations: &mut HashMap<String, u64>,
     snapshot: &CoreSnapshot,
@@ -715,7 +734,7 @@ fn snapshot_invalidations(
         }
         match &publication.zone {
             Some(zone) if !zone.is_empty() => out.push(RouteInvalidation::Zone(zone.clone())),
-            _ => out.push(RouteInvalidation::Full),
+            _ => out.push(RouteInvalidation::AuthorityLost),
         }
     }
     out
@@ -1273,14 +1292,32 @@ mod tests {
     }
 
     #[test]
-    fn generation_change_without_a_zone_invalidates_everything() {
+    fn generation_change_without_a_zone_loses_authority() {
         let mut generations = HashMap::new();
         let snapshot: CoreSnapshot = serde_json::from_str(
             r#"{"roles":[{"id":"secondary","publication":{"published":true,"generation":3}}]}"#,
         )
         .unwrap();
         let out = snapshot_invalidations(&mut generations, &snapshot);
-        assert_eq!(out, vec![RouteInvalidation::Full]);
+        assert_eq!(out, vec![RouteInvalidation::AuthorityLost]);
+    }
+
+    #[test]
+    fn unchanged_generations_after_reconnect_do_not_dirty() {
+        // The generation map survives reconnects: the same controller state
+        // seen again must not invalidate anything merely because the socket
+        // was re-established.
+        let mut generations = HashMap::new();
+        let snapshot: CoreSnapshot = serde_json::from_str(
+            r#"{"roles":[{"id":"primary","publication":{"zone":"primary","generation":5}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_invalidations(&mut generations, &snapshot),
+            vec![RouteInvalidation::Zone("primary".to_string())]
+        );
+        assert!(snapshot_invalidations(&mut generations, &snapshot).is_empty());
+        assert!(snapshot_invalidations(&mut generations, &snapshot).is_empty());
     }
 
     #[test]

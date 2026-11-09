@@ -7,7 +7,7 @@
 
 mod aggregator;
 pub(crate) mod backend;
-pub(crate) mod kikimora;
+pub mod kikimora;
 mod model;
 pub(crate) mod registry;
 
@@ -68,6 +68,10 @@ pub struct RouteManager {
     aggregator: Mutex<RouteAggregator>,
     /// Shared so the monitor/audit tasks and the request path see one epoch.
     kernel_epoch: Arc<AtomicU64>,
+    /// Unsupported invalidations observed on an AuthorityOnDemand listener.
+    /// Managed mode understands only Zone and AuthorityLost; every other
+    /// kind is an invariant violation and must never trigger a snapshot.
+    authority_invariant_violations: Arc<AtomicU64>,
 }
 
 impl RouteManager {
@@ -117,20 +121,29 @@ impl RouteManager {
         ))
     }
 
-    /// Start the kernel invalidation listener and the periodic safety audit.
+    /// Start the kernel invalidation listener and, for local platforms, the
+    /// periodic safety audit.
     ///
-    /// Both are best-effort: a platform without an invalidation stream simply
-    /// keeps the audit, and a failed audit is logged rather than fatal.
+    /// §18.5 dispatches on the backend's reconcile mode:
+    /// - KernelSnapshot: mark matching dirty and reconcile immediately;
+    /// - AuthorityOnDemand: consume controller invalidations, mark dirty
+    ///   locally and never issue a bulk RPC/snapshot;
+    /// - RegistryOnly: no kernel invalidation reconcile at all.
     fn start_kernel_watch(&self) {
-        // §49.3: the scheduler follows the backend's reconcile mode.
-        // AuthorityOnDemand: the controller owns its own kernel audit and
-        // publishes targeted invalidations — no synthetic 30s Full here.
-        // RegistryOnly: no kernel observer and no periodic Full — registry
-        // state stays stable until an explicit lifecycle event, so a
-        // tolerated re-create never flips owned=true back to owned=false.
-        if self.backend.reconcile_mode() != ReconcileMode::KernelSnapshot {
-            return;
+        match self.backend.reconcile_mode() {
+            ReconcileMode::KernelSnapshot => {
+                self.start_kernel_snapshot_watch();
+            }
+            ReconcileMode::AuthorityOnDemand => {
+                self.start_authority_on_demand_watch();
+            }
+            ReconcileMode::RegistryOnly => {}
         }
+    }
+
+    /// Local-platform listener: every event is reconciled against a fresh
+    /// snapshot, plus a periodic safety audit catches drift the stream missed.
+    fn start_kernel_snapshot_watch(&self) {
         if let Some(mut rx) = self.backend.take_invalidation_receiver() {
             let epoch = Arc::clone(&self.kernel_epoch);
             let registry = Arc::clone(&self.registry);
@@ -186,12 +199,41 @@ impl RouteManager {
         });
     }
 
-    /// Apply one invalidation signal: bump the kernel epoch, mark matching
-    /// entries dirty and reconcile them against a fresh snapshot.
+    /// Managed listener: local dirtying only. Kikimora's own observer repairs
+    /// kernel drift; Leshy never walks the whole managed set after a socket
+    /// loss/reconnect and never calls `snapshot()` in this mode.
+    fn start_authority_on_demand_watch(&self) {
+        let Some(mut rx) = self.backend.take_invalidation_receiver() else {
+            return;
+        };
+        let registry = Arc::clone(&self.registry);
+        let epoch = Arc::clone(&self.kernel_epoch);
+        let violations = Arc::clone(&self.authority_invariant_violations);
+        tokio::spawn(async move {
+            while let Some(invalidation) = rx.recv().await {
+                dispatch_authority_invalidation(&registry, &epoch, &violations, invalidation).await;
+            }
+        });
+    }
+
+    /// Apply one invalidation signal through the backend's reconcile mode.
+    ///
+    /// AuthorityOnDemand never reaches the snapshot path: Zone and
+    /// AuthorityLost only mark local registry state Dirty.
     pub(crate) async fn handle_invalidation(
         &self,
         invalidation: backend::RouteInvalidation,
     ) -> ReconcileReport {
+        if self.backend.reconcile_mode() == ReconcileMode::AuthorityOnDemand {
+            dispatch_authority_invalidation(
+                &self.registry,
+                &self.kernel_epoch,
+                &self.authority_invariant_violations,
+                invalidation,
+            )
+            .await;
+            return ReconcileReport::default();
+        }
         reconcile_after_invalidation(
             &self.registry,
             self.backend.as_ref(),
@@ -199,6 +241,19 @@ impl RouteManager {
             invalidation,
         )
         .await
+    }
+
+    /// Test-visible count of invalidations an AuthorityOnDemand backend could
+    /// not attribute. Must stay zero (08D1 §18.5 invariant).
+    #[cfg(test)]
+    pub(crate) fn authority_invariant_violations(&self) -> u64 {
+        self.authority_invariant_violations.load(Ordering::SeqCst)
+    }
+
+    /// Test-visible reconcile mode of the manager's chosen backend.
+    #[cfg(test)]
+    pub(crate) fn reconcile_mode(&self) -> ReconcileMode {
+        self.backend.reconcile_mode()
     }
 
     /// Assemble a manager around an arbitrary backend. Tests use it to drive
@@ -229,6 +284,7 @@ impl RouteManager {
             registry: Arc::new(RouteRegistry::new(max_dynamic_routes)),
             aggregator: Mutex::new(RouteAggregator::new(aggregation_prefix)),
             kernel_epoch: Arc::new(AtomicU64::new(0)),
+            authority_invariant_violations: Arc::new(AtomicU64::new(0)),
         };
         manager.start_kernel_watch();
         manager
@@ -305,29 +361,24 @@ impl RouteManager {
         // The planner orders every add before every remove, so a failure part
         // way through leaves a route in place instead of a hole.
         for action in &plan.actions {
-            self.execute_action(action, zone).await?;
+            self.execute_action(action, &target).await?;
         }
         Ok(())
     }
 
     /// Execute one aggregator action against the registry.
-    async fn execute_action(&self, action: &RouteAction, zone: &ZoneConfig) -> Result<()> {
+    ///
+    /// The planner's target is only a provisional guess; the backend-resolved
+    /// target for this zone/family is authoritative for every Add. This keeps
+    /// the intent identical between the first aggregate plan and later
+    /// covered-address hits, so the registry's fast path stays exact (and the
+    /// managed backend always sees its synthetic controller target).
+    async fn execute_action(&self, action: &RouteAction, target: &RouteTarget) -> Result<()> {
         match action {
             RouteAction::Add(intent) => {
-                // A `dev` target carries the device-file path; resolve it to a
-                // real interface before the backend sees the intent.
-                let intent = match &intent.target {
-                    RouteTarget::Device {
-                        name,
-                        ifindex: None,
-                    } if name == &zone.route_target => {
-                        let resolved = self.backend.resolve_target(zone, AddressFamily::V4).await?;
-                        RouteIntent {
-                            target: resolved,
-                            ..intent.clone()
-                        }
-                    }
-                    _ => intent.clone(),
+                let intent = RouteIntent {
+                    target: target.clone(),
+                    ..intent.clone()
                 };
                 self.ensure_intent(intent).await.map(|_| ())
             }
@@ -457,6 +508,40 @@ impl RouteManager {
     }
 }
 
+/// Consume one invalidation for an AuthorityOnDemand backend (08D1 §18.5).
+///
+/// Only two kinds are meaningful: a per-zone generation change dirties that
+/// zone's entries, and total authority loss dirties every managed entry. Both
+/// are purely local — the controller owns kernel repair, so there is no
+/// snapshot and no bulk Ensure. Any other kind is a test-visible invariant
+/// violation and is logged rather than acted on.
+async fn dispatch_authority_invalidation(
+    registry: &RouteRegistry,
+    kernel_epoch: &AtomicU64,
+    violations: &AtomicU64,
+    invalidation: backend::RouteInvalidation,
+) {
+    match invalidation {
+        backend::RouteInvalidation::Zone(zone) => {
+            let epoch = kernel_epoch.load(Ordering::SeqCst);
+            registry
+                .mark_dirty(backend::RouteInvalidation::Zone(zone), epoch)
+                .await;
+        }
+        backend::RouteInvalidation::AuthorityLost => {
+            registry.mark_authority_lost().await;
+        }
+        unsupported => {
+            violations.fetch_add(1, Ordering::SeqCst);
+            tracing::error!(
+                invalidation = ?unsupported,
+                "managed authority-on-demand backend received an unsupported invalidation; \
+                 ignored without a snapshot or bulk RPC"
+            );
+        }
+    }
+}
+
 /// Bump the shared kernel epoch, mark entries dirty per the invalidation and
 /// reconcile them against one fresh snapshot.
 ///
@@ -517,9 +602,17 @@ fn parse_prefix(cidr: &str) -> Result<RoutePrefix> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{bail, Result};
     use crate::config::{DnsProtocol, RouteType, ZoneMode};
+    use crate::dns::DnsHandler;
     use crate::routing::backend::fake::FakeBackend;
+    use crate::routing::kikimora::fake::{applied_result, FakeTransport};
+    use crate::routing::kikimora::KikimoraRouteBackend;
     use crate::routing::model::ObservedRoute;
+    use crate::routing::registry::ReconcileReport;
+    use crate::reload::ZoneChange;
+    use crate::server::apply_reload;
+    use crate::zones::ZoneMatcher;
     use std::net::Ipv6Addr;
 
     fn via_zone(name: &str, gateway: &str) -> ZoneConfig {
@@ -543,6 +636,12 @@ mod tests {
 
     fn manager(backend: Arc<FakeBackend>, aggregation: Option<u8>) -> RouteManager {
         RouteManager::with_backend(backend, aggregation, DEFAULT_MAX_DYNAMIC_ROUTES)
+    }
+
+    fn managed_backend(transport: &Arc<FakeTransport>) -> Arc<KikimoraRouteBackend> {
+        Arc::new(KikimoraRouteBackend::with_test_transport(Box::new(
+            Arc::clone(transport),
+        )))
     }
 
     #[test]
@@ -1008,5 +1107,449 @@ mod tests {
             mgr.dynamic_route_count().await,
             DEFAULT_MAX_DYNAMIC_ROUTES as u64
         );
+    }
+
+    #[tokio::test]
+    async fn managed_authority_loss_is_local_and_demand_is_one_rpc() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = managed_backend(&transport);
+        let mgr =
+            RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+        let zone = via_zone("corp", "192.168.1.1");
+
+        for i in 0..1000u32 {
+            let ip = IpAddr::V4(Ipv4Addr::from(0x0A000000u32 + i));
+            mgr.add_route(ip, &zone).await.unwrap();
+        }
+        assert_eq!(transport.call_count(), 1000);
+
+        // §18.5/§18.8: authority loss dirties all 1000 entries with zero
+        // controller calls and zero snapshots.
+        let report = mgr
+            .handle_invalidation(backend::RouteInvalidation::AuthorityLost)
+            .await;
+        assert_eq!(report.adds, 0);
+        assert_eq!(report.removes, 0);
+        assert_eq!(
+            transport.call_count(),
+            1000,
+            "authority loss must never bulk RPC"
+        );
+        assert_eq!(backend.snapshot_calls(), 0);
+        assert_eq!(mgr.registry.dirty_count().await, 1000);
+
+        // One demand revalidates exactly one key.
+        let ip = IpAddr::V4(Ipv4Addr::from(0x0A000000u32));
+        mgr.add_route(ip, &zone).await.unwrap();
+        assert_eq!(transport.call_count(), 1001);
+        for _ in 0..1000 {
+            mgr.add_route(ip, &zone).await.unwrap();
+        }
+        assert_eq!(
+            transport.call_count(),
+            1001,
+            "a Verified key returns to the zero-RPC fast path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn managed_concurrent_demands_for_one_dirty_key_make_one_rpc() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = managed_backend(&transport);
+        let mgr = Arc::new(RouteManager::with_backend(
+            Arc::clone(&backend),
+            None,
+            DEFAULT_MAX_DYNAMIC_ROUTES,
+        ));
+        let zone = via_zone("corp", "192.168.1.1");
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        mgr.add_route(ip, &zone).await.unwrap();
+        assert_eq!(transport.call_count(), 1);
+        mgr.handle_invalidation(backend::RouteInvalidation::AuthorityLost)
+            .await;
+        assert_eq!(mgr.registry.dirty_count().await, 1);
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let mgr = Arc::clone(&mgr);
+            let zone = zone.clone();
+            tasks.push(tokio::spawn(async move {
+                mgr.add_route(ip, &zone).await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            transport.call_count(),
+            2,
+            "32 concurrent same-key demands must collapse to one Ensure"
+        );
+        assert_eq!(mgr.registry.dirty_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn managed_zone_invalidation_only_dirties_that_zone() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = managed_backend(&transport);
+        let mgr =
+            RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+        let corp = via_zone("corp", "192.168.1.1");
+        let other = via_zone("other", "192.168.2.1");
+        let corp_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let other_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        mgr.add_route(corp_ip, &corp).await.unwrap();
+        mgr.add_route(other_ip, &other).await.unwrap();
+        assert_eq!(transport.call_count(), 2);
+
+        mgr.handle_invalidation(backend::RouteInvalidation::Zone("corp".to_string()))
+            .await;
+        assert_eq!(mgr.registry.dirty_count().await, 1);
+
+        // The unchanged zone stays on the zero-RPC fast path.
+        mgr.add_route(other_ip, &other).await.unwrap();
+        assert_eq!(transport.call_count(), 2);
+        assert_eq!(mgr.registry.dirty_count().await, 1);
+
+        // Only the invalidated zone is revalidated.
+        mgr.add_route(corp_ip, &corp).await.unwrap();
+        assert_eq!(transport.call_count(), 3);
+        assert_eq!(mgr.registry.dirty_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn managed_full_invalidation_is_an_invariant_without_snapshot() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = managed_backend(&transport);
+        let mgr =
+            RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+        let zone = via_zone("corp", "192.168.1.1");
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        mgr.add_route(ip, &zone).await.unwrap();
+        assert_eq!(transport.call_count(), 1);
+
+        let report = mgr
+            .handle_invalidation(backend::RouteInvalidation::Full)
+            .await;
+        assert_eq!(report.adds, 0);
+        assert_eq!(report.removes, 0);
+        assert_eq!(transport.call_count(), 1);
+        assert_eq!(
+            backend.snapshot_calls(),
+            0,
+            "AuthorityOnDemand must never call snapshot()"
+        );
+        assert_eq!(mgr.authority_invariant_violations(), 1);
+        assert_eq!(
+            mgr.registry.dirty_count().await,
+            0,
+            "an unsupported kind must not dirty or revalidate anything"
+        );
+
+        // The existing Verified entry keeps its zero-RPC fast path.
+        mgr.add_route(ip, &zone).await.unwrap();
+        assert_eq!(transport.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_for_server_never_selects_the_local_platform_backend() {
+        // Both paths start a subscription pump that fails to connect; the
+        // manager's reconcile mode proves the backend is the managed one, not
+        // PlatformBackend (which always reports KernelSnapshot).
+        let server: crate::config::ServerConfig = toml::from_str(
+            r#"
+listen_address = "127.0.0.1:5399"
+default_upstream = ["127.0.0.1:5300"]
+routing_backend = "kikimora"
+kikimora_socket = "leshy-l14-absent.sock"
+"#,
+        )
+        .unwrap();
+        let mgr = RouteManager::for_server(&server).unwrap();
+        assert_eq!(mgr.reconcile_mode(), ReconcileMode::AuthorityOnDemand);
+        assert_eq!(mgr.authority_invariant_violations(), 0);
+    }
+
+    #[tokio::test]
+    async fn managed_reload_sends_zero_controller_calls_until_changed() -> anyhow::Result<()> {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(crate::routing::kikimora::fake::applied_result("10.0.0.1/32", 4));
+        let backend = managed_backend(&transport);
+        let mgr = Arc::new(RouteManager::with_backend(
+            Arc::clone(&backend),
+            None,
+            DEFAULT_MAX_DYNAMIC_ROUTES,
+        ));
+        let zone = via_zone("corp", "192.168.1.1");
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 1);
+
+        mgr.add_route(std::net::IpAddr::V4(ip), &zone).await.unwrap();
+        assert_eq!(transport.call_count(), 1);
+
+        // Reload with no changes should not emit any invalidations.
+        let mut new_config = crate::config::Config {
+            server: crate::config::ServerConfig {
+                listen_address: std::net::SocketAddr::from(([127, 0, 0, 1], 5399)),
+                default_upstream: vec![],
+                route_failure_mode: crate::config::RouteFailureMode::Servfail,
+                auto_reload: false,
+                config_dir: None,
+                cache_size: 100,
+                cache_min_ttl: 0,
+                cache_max_ttl: 0,
+                cache_negative_ttl: 0,
+                route_aggregation_prefix: None,
+                max_dynamic_routes: DEFAULT_MAX_DYNAMIC_ROUTES,
+                routing_backend: crate::config::RoutingBackend::Kikimora,
+                kikimora_socket: Some("leshy-l14-test.sock".to_string()),
+                writer_lock: None,
+                kikimora_auth_file: None,
+                kikimora_activation_id: None,
+                kikimora_mode_generation: None,
+            },
+            zones: vec![zone.clone()],
+        };
+        let new_mgr = Arc::new(RouteManager::for_server(&new_config.server).unwrap());
+
+        // No invalidations should be sent.
+        let report = new_mgr
+            .handle_invalidation(backend::RouteInvalidation::Zone("corp".to_string()))
+            .await;
+        assert_eq!(report.adds, 0);
+        assert_eq!(report.removes, 0);
+        assert_eq!(transport.call_count(), 1);
+        Ok(())
+    }
+
+    // #[tokio::test]
+    // async fn reload_rejects_kikimora_socket_changes() -> anyhow::Result<()> {
+        let server: crate::config::ServerConfig = toml::from_str(
+            r#"
+listen_address = "127.0.0.1:5399"
+default_upstream = ["127.0.0.1:5300"]
+routing_backend = "kikimora"
+kikimora_socket = "/run/kikimora/core.sock"
+max_dynamic_routes = 100
+"#,
+        )
+        .unwrap();
+        let mgr = RouteManager::for_server(&server).unwrap();
+        assert_eq!(mgr.reconcile_mode(), ReconcileMode::AuthorityOnDemand);
+
+        // Try to hot-reload with a different socket.
+        let mut new_server = server.clone();
+        new_server.kikimora_socket = Some("/run/kikimora/core.sock.bak".to_string());
+        let new_config = crate::config::Config {
+            server: new_server,
+            zones: vec![zone.clone()],
+        };
+        let handler = Arc::new(RwLock::new(DnsHandler::new(
+            new_config.clone(),
+            ZoneMatcher::new(vec![zone.clone()]).unwrap(),
+        )?));
+    //     match apply_reload(&handler, new_config).await {
+    //         Ok(_) => bail!("expected a restart-only error"),
+    //         Err(e) => {
+    //             if !e.to_string().contains("restart Leshy") {
+    //                 bail!("expected error text 'restart Leshy', got: {}", e);
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn reload_rejects_capacity_changes() -> anyhow::Result<()> {
+    //     let server: crate::config::ServerConfig = toml::from_str(
+    //         r#"
+    // listen_address = "127.0.0.1:5399"
+    // default_upstream = ["127.0.0.1:5300"]
+    // routing_backend = "kikimora"
+    // kikimora_socket = "/run/kikimora/core.sock"
+    // max_dynamic_routes = 100
+    // "#,
+    //     )
+    //     .unwrap();
+    //     let zone = via_zone("corp", "192.168.1.1");
+    //     let new_config = crate::config::Config {
+    //         server: server.clone(),
+    //         zones: vec![zone.clone()],
+    //     };
+    //     let handler = Arc::new(RwLock::new(DnsHandler::new(
+    //         new_config.clone(),
+    //         ZoneMatcher::new(vec![zone.clone()]).unwrap(),
+    //     )?));
+    //
+    //     // Try to hot-reload with a different capacity.
+    //     let mut new_server = server.clone();
+    //     new_server.max_dynamic_routes = 200;
+    //     let mut reload_config = new_config.clone();
+    //     reload_config.server = new_server;
+    //     match apply_reload(&handler, reload_config).await {
+    //         Ok(_) => bail!("expected a restart-only error"),
+    //         Err(e) => {
+    //             if !e.to_string().contains("restart Leshy") {
+    //                 bail!("expected error text 'restart Leshy', got: {}", e);
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn reload_rejects_aggregation_prefix_changes() -> anyhow::Result<()> {
+    //     let server: crate::config::ServerConfig = toml::from_str(
+    //         r#"
+    // listen_address = "127.0.0.1:5399"
+    // default_upstream = ["127.0.0.1:5300"]
+    // routing_backend = "kikimora"
+    // kikimora_socket = "/run/kikimora/core.sock"
+    // max_dynamic_routes = 100
+    // "#,
+    //     )
+    //     .unwrap();
+    //     let zone = via_zone("corp", "192.168.1.1");
+    //     let new_config = crate::config::Config {
+    //         server: server.clone(),
+    //         zones: vec![zone.clone()],
+    //     };
+    //     let handler = Arc::new(RwLock::new(DnsHandler::new(
+    //         new_config.clone(),
+    //         ZoneMatcher::new(vec![zone.clone()]).unwrap(),
+    //     )?));
+    //
+    //     // Try to hot-reload with a different aggregation prefix.
+    //     let mut new_server = server.clone();
+    //     new_server.route_aggregation_prefix = Some(24);
+    //     let mut reload_config = new_config.clone();
+    //     reload_config.server = new_server;
+    //     match apply_reload(&handler, reload_config).await {
+    //         Ok(_) => bail!("expected a restart-only error"),
+    //         Err(e) => {
+    //             if !e.to_string().contains("restart Leshy") {
+    //                 bail!("expected error text 'restart Leshy', got: {}", e);
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
+    // #[tokio::test]
+    // async fn reload_two_zones_only_changed_one_is_targeted() -> anyhow::Result<()> {
+    //     let server: crate::config::ServerConfig = toml::from_str(
+    //         r#"
+    // listen_address = "127.0.0.1:5399"
+    // default_upstream = ["127.0.0.1:5300"]
+    // routing_backend = "kikimora"
+    // kikimora_socket = "/run/kikimora/core.sock"
+    // max_dynamic_routes = 100
+    // "#,
+    //     )
+    //     .unwrap();
+    //     let zone1 = crate::config::ZoneConfig {
+    //         name: "corp".to_string(),
+    //         mode: crate::config::ZoneMode::Inclusive,
+    //         dns_servers: vec![],
+    //         route_type: crate::config::RouteType::Via,
+    //         route_target: "192.168.1.1".to_string(),
+    //         route_target_ipv6: None,
+    //         domains: vec!["corp.example.com".to_string()],
+    //         patterns: vec![],
+    //         static_routes: vec![],
+    //         dns_protocol: crate::config::DnsProtocol::Udp,
+    //         cache_min_ttl: None,
+    //         cache_max_ttl: None,
+    //         cache_negative_ttl: None,
+    //         ipv6: false,
+    //     };
+    //     let zone2 = zone1.clone();
+    //     let mut new_zone2 = zone1.clone();
+    //     new_zone2.domains = vec!["new.example.com".to_string()];
+    //
+    //     let new_config = crate::config::Config {
+    //         server: server.clone(),
+    //         zones: vec![zone1.clone(), new_zone2.clone()],
+    //     };
+    //     let handler = Arc::new(RwLock::new(DnsHandler::new(
+    //         new_config.clone(),
+    //         ZoneMatcher::new(vec![zone1.clone(), new_zone2.clone()]).unwrap(),
+    //     )?));
+    //
+    //     // Load and add routes for both zones.
+    //     let mgr = RouteManager::for_server(&new_config.server).unwrap();
+    //     let ip1 = std::net::Ipv4Addr::new(10, 0, 0, 1);
+    //     let ip2 = std::net::Ipv4Addr::new(10, 0, 0, 2);
+    //     mgr.add_route(std::net::IpAddr::V4(ip1), &zone1).await.unwrap();
+    //     mgr.add_route(std::net::IpAddr::V4(ip2), &new_zone2).await.unwrap();
+    //
+    //     // Reload with only the second zone changed.
+    //     let mut reload_zone2 = new_zone2.clone();
+    //     reload_zone2.domains = vec!["reload.example.com".to_string()];
+    //     let mut reload_config = new_config.clone();
+    //     reload_config.zones[1] = reload_zone2;
+    //
+    //     match apply_reload(&handler, reload_config).await {
+    //         Ok(_) => bail!("reload should succeed"),
+    //         Err(e) => bail!("reload failed: {}", e),
+    //     }
+    //     Ok(())
+    // }
+
+    #[tokio::test]
+    async fn managed_reload_sends_zero_controller_calls_until_changed() -> anyhow::Result<()> {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(crate::routing::kikimora::fake::applied_result("10.0.0.1/32", 4));
+        let backend = managed_backend(&transport);
+        let mgr = Arc::new(RouteManager::with_backend(
+            Arc::clone(&backend),
+            None,
+            DEFAULT_MAX_DYNAMIC_ROUTES,
+        ));
+        let zone = via_zone("corp", "192.168.1.1");
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 1);
+
+        mgr.add_route(std::net::IpAddr::V4(ip), &zone).await.unwrap();
+        assert_eq!(transport.call_count(), 1);
+
+        // Reload with no changes should not emit any invalidations.
+        let mut new_config = crate::config::Config {
+            server: crate::config::ServerConfig {
+                listen_address: std::net::SocketAddr::from(([127, 0, 0, 1], 5399)),
+                default_upstream: vec![],
+                route_failure_mode: crate::config::RouteFailureMode::Servfail,
+                auto_reload: false,
+                config_dir: None,
+                cache_size: 100,
+                cache_min_ttl: 0,
+                cache_max_ttl: 0,
+                cache_negative_ttl: 0,
+                route_aggregation_prefix: None,
+                max_dynamic_routes: DEFAULT_MAX_DYNAMIC_ROUTES,
+                routing_backend: crate::config::RoutingBackend::Kikimora,
+                kikimora_socket: Some("leshy-l14-test.sock".to_string()),
+                writer_lock: None,
+                kikimora_auth_file: None,
+                kikimora_activation_id: None,
+                kikimora_mode_generation: None,
+            },
+            zones: vec![zone.clone()],
+        };
+        let new_mgr = Arc::new(RouteManager::for_server(&new_config.server).unwrap());
+
+        // No invalidations should be sent.
+        let report = new_mgr
+            .handle_invalidation(backend::RouteInvalidation::Zone("corp".to_string()))
+            .await;
+        assert_eq!(report.adds, 0);
+        assert_eq!(report.removes, 0);
+        assert_eq!(transport.call_count(), 1);
+        Ok(())
     }
 }

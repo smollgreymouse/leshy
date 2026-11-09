@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, ServerConfig};
 use crate::dns::{DnsHandler, DnsServer};
 use crate::reload::{diff_zones, ConfigWatcher, ZoneChange};
 use crate::zones::ZoneMatcher;
@@ -150,10 +150,36 @@ pub async fn apply_reload(
     let mut handler_guard = handler.write().await;
     let old_config = handler_guard.config().clone();
 
+    // (0) Routing-manager construction is restart-only (08D1 §19.1). Validate
+    // before the matcher or any route retirement: a hot swap cannot rebuild
+    // RouteManager, so these changes must be applied by a process restart.
+    if routing_manager_restart_required(&old_config.server, &new_config.server) {
+        anyhow::bail!(
+            "routing manager configuration changed; restart Leshy to apply routing \
+             backend/capacity changes"
+        );
+    }
+
     // (1) Build and validate the new matcher first: a broken config must
     // never retire the old routes.
     let new_matcher = ZoneMatcher::new(new_config.zones.clone())?;
     let changes = diff_zones(&old_config.zones, &new_config.zones);
+
+    // Affected zones for the targeted reload invalidation, fixed before the
+    // swap so it cannot observe half-applied state.
+    let affected_zones = {
+        let mut zones: Vec<String> = changes
+            .iter()
+            .map(|change| match change {
+                ZoneChange::Added(zone) => zone.name.clone(),
+                ZoneChange::Removed(zone) => zone.name.clone(),
+                ZoneChange::Changed { new, .. } => new.name.clone(),
+            })
+            .collect();
+        zones.sort();
+        zones.dedup();
+        zones
+    };
 
     // Snapshot the owned intents of same-name changed zones before the new
     // state replaces them in the registry.
@@ -208,8 +234,11 @@ pub async fn apply_reload(
         });
     }
 
-    // (7) Mark affected registry entries dirty and run one reconcile.
-    handler_guard.reconcile_routes_after_reload().await;
+    // (7) Dirty exactly the affected zones and reconcile them. Ordinary
+    // reload never emits a full-kernel invalidation (§19.2).
+    handler_guard
+        .reconcile_routes_after_reload(&affected_zones)
+        .await;
 
     tracing::info!(
         changes = changes.len(),
@@ -217,6 +246,16 @@ pub async fn apply_reload(
         "Configuration applied successfully"
     );
     Ok(())
+}
+
+/// Fields that define `RouteManager` construction cannot be hot-reloaded
+/// (08D1 §19.1). The cutover orchestrator intentionally writes them while
+/// Leshy is stopped and then restarts the process.
+fn routing_manager_restart_required(old: &ServerConfig, new: &ServerConfig) -> bool {
+    old.routing_backend != new.routing_backend
+        || old.kikimora_socket != new.kikimora_socket
+        || old.route_aggregation_prefix != new.route_aggregation_prefix
+        || old.max_dynamic_routes != new.max_dynamic_routes
 }
 
 /// Retry applying static routes every 10 seconds until all succeed.

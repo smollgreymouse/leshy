@@ -53,6 +53,7 @@ impl AggregationPlan {
 /// prefix (e.g. /22) covering that IP. Future IPs in the same range and zone
 /// are automatic no-ops. If an IP from a *different* zone falls into an
 /// existing aggregate, the aggregate is split into non-conflicting sub-prefixes.
+#[derive(Debug)]
 pub struct RouteAggregator {
     /// Desired prefixes: (network_as_u32, prefix_len) -> owner.
     desired: HashMap<(u32, u8), RouteOwner>,
