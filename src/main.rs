@@ -29,6 +29,38 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Print the managed-routing capabilities this build supports
+    Capabilities {
+        /// Machine-readable JSON (stable sorted array)
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Every managed-routing capability this build advertises (08D1 §31.5).
+///
+/// Stable, sorted and side-effect free: the command performs no config load,
+/// socket connect, DNS bind or route mutation.
+pub const SUPPORTED_CAPABILITIES: [&str; 4] = [
+    "af_unix_control",
+    "managed_selected_routes_v1",
+    "managed_selected_routes_v2",
+    "privileged_control_auth_v1",
+];
+
+/// The exact JSON body of `leshy capabilities --json`.
+pub fn capabilities_json() -> String {
+    let mut out = String::from("[");
+    for (index, capability) in SUPPORTED_CAPABILITIES.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(capability);
+        out.push('"');
+    }
+    out.push(']');
+    out
 }
 
 #[derive(Subcommand, Debug)]
@@ -90,6 +122,17 @@ async fn main() -> anyhow::Result<()> {
                 service::uninstall(Some(&name))?;
             }
         },
+        Some(Command::Capabilities { json }) => {
+            // No config load, no socket, no DNS bind, no route mutation.
+            if json {
+                println!("{}", capabilities_json());
+            } else {
+                for capability in SUPPORTED_CAPABILITIES {
+                    println!("{capability}");
+                }
+            }
+            return Ok(());
+        }
         None => {
             server::init_console_tracing();
             server::run_server(cli.config).await?
@@ -103,6 +146,23 @@ async fn main() -> anyhow::Result<()> {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn capabilities_subcommand_parses_with_json() {
+        let cli = Cli::try_parse_from(["leshy", "capabilities", "--json"]).expect("parse");
+        match cli.command {
+            Some(Command::Capabilities { json }) => assert!(json),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capabilities_json_is_stable_and_sorted() {
+        assert_eq!(
+            capabilities_json(),
+            r#"["af_unix_control","managed_selected_routes_v1","managed_selected_routes_v2","privileged_control_auth_v1"]"#
+        );
+    }
 
     #[test]
     fn default_invocation_has_no_command() {
