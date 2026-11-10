@@ -118,6 +118,36 @@ jobs:
             LESHY_MONITOR_PROBE_BIN="$LESHY_MONITOR_PROBE_BIN" \
             ./tests/linux-route-registry-netns.sh
 
+      # 08D1 Production Plan C3: the product's own SIGTERM path must remove
+      # exactly the local-owned rows and leave a same-prefix foreign fixture
+      # untouched, with a clean exit status.
+      - name: Build SIGTERM acceptance binaries
+        run: |
+          cargo build --bin leshy
+          cargo test --test linux_sigterm_cleanup --no-run
+
+      - name: Resolve SIGTERM acceptance binaries
+        id: sigterm_bins
+        run: |
+          LESHY_BIN="$PWD/target/debug/leshy"
+          GATE_BIN="$(ls -t target/debug/deps/linux_sigterm_cleanup-* | grep -v '\.d$' | head -1)"
+          test -x "$LESHY_BIN"
+          test -x "$GATE_BIN"
+          echo "leshy=$LESHY_BIN" >> "$GITHUB_OUTPUT"
+          echo "gate=$PWD/$GATE_BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Run privileged SIGTERM acceptance
+        env:
+          LESHY_BIN: ${{ steps.sigterm_bins.outputs.leshy }}
+          LESHY_SIGTERM_TEST_BIN: ${{ steps.sigterm_bins.outputs.gate }}
+          LESHY_SIGTERM_LOG: ${{ github.workspace }}/sigterm-gate.log
+        run: |
+          sudo -E env \
+            LESHY_BIN="$LESHY_BIN" \
+            LESHY_SIGTERM_TEST_BIN="$LESHY_SIGTERM_TEST_BIN" \
+            LESHY_SIGTERM_LOG="$LESHY_SIGTERM_LOG" \
+            ./tests/linux-sigterm-netns.sh
+
   integration-linux:
     name: Integration Tests (Linux)
     runs-on: ubuntu-latest

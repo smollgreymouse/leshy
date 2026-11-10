@@ -228,40 +228,13 @@ impl KernelIo for NetlinkIo {
 
     async fn delete(&self, intent: &RouteIntent) -> Result<()> {
         let _guard = self.io_lock.lock().await;
-        let prefix = &intent.key.prefix;
-        let mut msg = RouteMessage::default();
-        // The doit handler is registered per family: a DEL with an unspecified
-        // family is rejected by the kernel before the prefix is even looked at.
-        msg.header.address_family = match prefix.network {
-            IpAddr::V4(_) => netlink_packet_route::AddressFamily::Inet,
-            IpAddr::V6(_) => netlink_packet_route::AddressFamily::Inet6,
-        };
-        msg.header.destination_prefix_length = prefix.prefix_len;
-        msg.header.table = MAIN_TABLE_U8;
-        // Ownership was already proven by the exact read-back before this
-        // delete runs, so the DEL must match the row whatever its scope,
-        // protocol or metric are: the kernel compares all three and an
-        // assumed Boot/link delete silently misses the row (ESRCH), leaving
-        // it in the table. NOWHERE scope and UNSPEC protocol mean "match
-        // any"; an absent priority matches any metric.
-        msg.header.scope = RouteScope::NoWhere;
-        msg.header.protocol = RouteProtocol::Unspec;
-        match prefix.network {
-            IpAddr::V4(addr) => {
-                msg.attributes
-                    .push(netlink_packet_route::route::RouteAttribute::Destination(
-                        RouteAddress::Inet(addr),
-                    ));
-            }
-            IpAddr::V6(addr) => {
-                msg.attributes
-                    .push(netlink_packet_route::route::RouteAttribute::Destination(
-                        RouteAddress::Inet6(addr),
-                    ));
-            }
-        }
-
-        match self.handle.route().del(msg).execute().await {
+        match self
+            .handle
+            .route()
+            .del(delete_message(intent))
+            .execute()
+            .await
+        {
             Ok(()) => Ok(()),
             // ESRCH: nothing to delete.
             Err(rtnetlink::Error::NetlinkError(err)) if matches!(err.code, Some(code) if code.get() == -3) => {
@@ -270,6 +243,53 @@ impl KernelIo for NetlinkIo {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Netlink DEL for exactly the row Leshy owns.
+///
+/// A prefix is not an identity: a foreign row may share it with a better
+/// metric, and the kernel deletes the first matching row. Ownership evidence
+/// has already proven the row, so the DEL pins the writer's protocol and, when
+/// the family carries a non-zero default (IPv6 uses 1024), the metric too.
+/// IPv4's metric 0 means "any priority" to the kernel, and the owned row always
+/// has the lowest metric, so it is the row the kernel matches first.
+fn delete_message(intent: &RouteIntent) -> RouteMessage {
+    let prefix = &intent.key.prefix;
+    let mut msg = RouteMessage::default();
+    // The doit handler is registered per family: a DEL with an unspecified
+    // family is rejected by the kernel before the prefix is even looked at.
+    msg.header.address_family = match prefix.network {
+        IpAddr::V4(_) => netlink_packet_route::AddressFamily::Inet,
+        IpAddr::V6(_) => netlink_packet_route::AddressFamily::Inet6,
+    };
+    msg.header.destination_prefix_length = prefix.prefix_len;
+    msg.header.table = MAIN_TABLE_U8;
+    // Scope stays unspecified (NOWHERE = "match any"): the kernel carries no
+    // scope for IPv6 rows, and an assumed Link/Universe value misses them.
+    msg.header.scope = RouteScope::NoWhere;
+    msg.header.protocol = LESHY_PROTOCOL;
+    let metric = expected_metric(prefix);
+    if metric != 0 {
+        msg.attributes
+            .push(netlink_packet_route::route::RouteAttribute::Priority(
+                metric,
+            ));
+    }
+    match prefix.network {
+        IpAddr::V4(addr) => {
+            msg.attributes
+                .push(netlink_packet_route::route::RouteAttribute::Destination(
+                    RouteAddress::Inet(addr),
+                ));
+        }
+        IpAddr::V6(addr) => {
+            msg.attributes
+                .push(netlink_packet_route::route::RouteAttribute::Destination(
+                    RouteAddress::Inet6(addr),
+                ));
+        }
+    }
+    msg
 }
 
 /// Fill an add/replace request from an intent.
@@ -794,35 +814,37 @@ impl RouteBackend for LinuxRouteBackend {
             );
         };
         let rows = self.rows_for(&intent.key).await?;
-        match rows.as_slice() {
-            // Delete only the exact owned identity; a foreign row on the
-            // same prefix belongs to someone else.
-            [row] if row.identity == observed.identity && row.target == intent.target => {
-                self.delete_row(intent).await?;
-                self.refresh_key(&intent.key).await?;
-                Ok(())
-            }
-            [row] => {
-                tracing::debug!(
-                    prefix = %intent.key.prefix.network,
-                    prefix_len = intent.key.prefix.prefix_len,
-                    owner = ?row.target,
-                    identity = ?row.identity,
-                    "Leaving a non-owned row in place"
-                );
-                Ok(())
-            }
-            // The exact owned row is already gone: absence is success.
-            [] => Ok(()),
-            rows => {
-                tracing::debug!(
-                    prefix = %intent.key.prefix.network,
-                    rows = rows.len(),
-                    "Leaving an ambiguous multi-row prefix in place"
-                );
-                Ok(())
-            }
+        // A foreign row may share the prefix (different metric, protocol or
+        // target). Only the exact owned identity may be deleted, and its
+        // absence is success; a shared prefix is not a reason to leave the
+        // owned row behind (Production Plan C3).
+        let owns_a_row = rows
+            .iter()
+            .any(|row| row.identity == observed.identity && row.target == intent.target);
+        if !owns_a_row {
+            tracing::debug!(
+                prefix = %intent.key.prefix.network,
+                prefix_len = intent.key.prefix.prefix_len,
+                rows = rows.len(),
+                "The exact owned row is already gone; nothing to delete"
+            );
+            return Ok(());
         }
+
+        self.delete_row(intent).await?;
+        // Read-back proof: a DEL that matched a foreign row on the same
+        // prefix returns success while the owned row stays in the table.
+        let remaining = self.refresh_key(&intent.key).await?;
+        if remaining
+            .iter()
+            .any(|row| row.identity == observed.identity && row.target == intent.target)
+        {
+            anyhow::bail!(
+                "exact delete left the owned route {} in place",
+                intent.key.prefix.network
+            );
+        }
+        Ok(())
     }
 
     async fn snapshot(&self) -> Result<Vec<ObservedRoute>> {
@@ -1080,7 +1102,14 @@ mod tests {
         async fn delete(&self, intent: &RouteIntent) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.deletes.push(intent.clone());
-            state.rows.retain(|row| row.key != intent.key);
+            // Kernel DEL matches the identity the caller pins; the fake keeps
+            // the same rule so a same-prefix foreign row survives a delete.
+            let owned = synthesize(intent);
+            state.rows.retain(|row| {
+                !(row.key == intent.key
+                    && row.identity == owned.identity
+                    && row.target == owned.target)
+            });
             Ok(())
         }
     }
@@ -1381,6 +1410,104 @@ mod tests {
         };
         backend.remove_route(&intent, Some(&unowned)).await.unwrap();
         assert_eq!(io.state.lock().unwrap().deletes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_message_pins_the_owned_protocol_and_ipv6_metric() {
+        use netlink_packet_route::route::RouteAttribute;
+
+        let v4 = delete_message(&host_v4(10, 0, 0, 1, 7));
+        assert_eq!(v4.header.protocol, LESHY_PROTOCOL);
+        assert_eq!(v4.header.table, MAIN_TABLE_U8);
+        // IPv4 metric 0 means "any priority" to the kernel; pinning it would
+        // turn the DEL into a wildcard anyway, so it is omitted.
+        assert!(!v4
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute, RouteAttribute::Priority(_))));
+
+        let v6 = delete_message(&host_v6(1, 7));
+        // The owned IPv6 metric (1024) must be pinned: without it the kernel
+        // deletes the best-metric row, which may be a foreign one.
+        assert!(v6
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute, RouteAttribute::Priority(1024))));
+    }
+
+    #[tokio::test]
+    async fn remove_route_deletes_the_owned_v6_row_next_to_a_better_metric_foreign_row() {
+        let intent = host_v6(1, 7);
+        let observed = synthesize(&intent);
+        let mut foreign = observed.clone();
+        foreign.identity.metric = 500;
+        assert!(foreign.identity.metric < observed.identity.metric);
+        let io = Arc::new(FakeIo::new(vec![observed.clone(), foreign.clone()]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        let ownership = RouteOwnership {
+            owned: true,
+            observed: Some(observed.clone()),
+        };
+        backend
+            .remove_route(&intent, Some(&ownership))
+            .await
+            .expect("the owned row is deleted even when a foreign row shares the prefix");
+
+        let state = io.state.lock().unwrap();
+        assert_eq!(state.deletes.len(), 1);
+        assert_eq!(state.rows.len(), 1, "the foreign row must survive");
+        assert_eq!(state.rows[0].identity.metric, 500);
+    }
+
+    #[tokio::test]
+    async fn remove_route_deletes_the_owned_v4_row_next_to_a_foreign_row() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let observed = synthesize(&intent);
+        let mut foreign = observed.clone();
+        foreign.identity.metric = 500;
+        let io = Arc::new(FakeIo::new(vec![observed.clone(), foreign.clone()]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        let ownership = RouteOwnership {
+            owned: true,
+            observed: Some(observed.clone()),
+        };
+        backend
+            .remove_route(&intent, Some(&ownership))
+            .await
+            .expect("a shared prefix must not block the exact owned cleanup");
+
+        let state = io.state.lock().unwrap();
+        assert_eq!(state.deletes.len(), 1);
+        assert_eq!(state.rows.len(), 1, "the foreign row must survive");
+        assert_eq!(state.rows[0].identity.metric, 500);
+    }
+
+    #[tokio::test]
+    async fn remove_route_without_the_owned_row_deletes_nothing() {
+        let intent = host_v4(10, 0, 0, 1, 7);
+        let observed = synthesize(&intent);
+        let mut foreign = observed.clone();
+        foreign.identity.metric = 500;
+        let io = Arc::new(FakeIo::new(vec![foreign]));
+        let generation = Arc::new(AtomicU64::new(0));
+        let backend = test_backend(Arc::clone(&io), generation);
+
+        let ownership = RouteOwnership {
+            owned: true,
+            observed: Some(observed),
+        };
+        backend
+            .remove_route(&intent, Some(&ownership))
+            .await
+            .unwrap();
+
+        let state = io.state.lock().unwrap();
+        assert!(state.deletes.is_empty(), "a foreign row is never deleted");
+        assert_eq!(state.rows.len(), 1);
     }
 
     #[tokio::test]
