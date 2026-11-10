@@ -57,6 +57,42 @@ pub fn default_config_candidates() -> PathBuf {
 /// Load the configuration, start the DNS server, and run until the returned
 /// future is dropped or the process exits.
 pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
+    run_server_until(config_arg, shutdown_signal()).await
+}
+
+/// Resolve when the process is asked to stop: SIGTERM or Ctrl-C (08D1 §19.5).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Run the DNS server until the platform shutdown signal resolves.
+///
+/// Every background task (static-route retry, config watcher, reload
+/// consumer) is tracked and cancelled before the handler performs the exact
+/// route cleanup, so no detached work outlives the server (Production Plan
+/// C1).
+pub async fn run_server_until<F>(config_arg: Option<PathBuf>, shutdown: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
     let config_path = config_arg.unwrap_or_else(default_config_candidates);
 
     tracing::info!(config_path = ?config_path, "Loading configuration");
@@ -90,15 +126,23 @@ pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     // Create DNS handler (wrapped in Arc for reload)
     let handler = Arc::new(RwLock::new(DnsHandler::new(config.clone(), matcher)?));
 
+    // One cancellation signal for every background task.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut background: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Apply static routes (and spawn retry loop for dev zones where VPN may not be up yet)
     {
         let handler_guard = handler.read().await;
         let failures = handler_guard.apply_static_routes().await;
         if failures > 0 && handler_guard.has_static_routes() {
             let handler_retry = handler.clone();
-            tokio::spawn(async move {
-                retry_static_routes(handler_retry).await;
-            });
+            let mut cancel = cancel_rx.clone();
+            background.push(tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel.changed() => {}
+                    _ = retry_static_routes(handler_retry) => {}
+                }
+            }));
         }
     }
 
@@ -113,27 +157,67 @@ pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
         let (watcher, mut reload_rx) = ConfigWatcher::new(config_path.clone(), config_dir);
 
         // Spawn watcher task
-        tokio::spawn(async move {
-            if let Err(e) = watcher.watch().await {
-                tracing::error!("Config watcher error: {}", e);
+        let mut cancel = cancel_rx.clone();
+        background.push(tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.changed() => {}
+                result = watcher.watch() => {
+                    if let Err(e) = result {
+                        tracing::error!("Config watcher error: {}", e);
+                    }
+                }
             }
-        });
+        }));
 
         // Spawn reload handler task
         let handler_for_reload = handler.clone();
-        tokio::spawn(async move {
-            while let Some(new_config) = reload_rx.recv().await {
-                tracing::info!("Applying new configuration");
-
-                if let Err(e) = apply_reload(&handler_for_reload, new_config).await {
-                    tracing::error!(error = %e, "Failed to apply reload, keeping old config");
+        let mut cancel = cancel_rx.clone();
+        background.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.changed() => break,
+                    next = reload_rx.recv() => {
+                        let Some(new_config) = next else { break };
+                        tracing::info!("Applying new configuration");
+                        if let Err(e) = apply_reload(&handler_for_reload, new_config).await {
+                            tracing::error!(error = %e, "Failed to apply reload, keeping old config");
+                        }
+                    }
                 }
             }
-        });
+        }));
     }
 
-    // Run server
-    server.run().await?;
+    // Run the DNS server until it stops or the shutdown signal resolves.
+    let mut server_task = tokio::spawn(async move { server.run().await });
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = &mut server_task => {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(anyhow::anyhow!("DNS server task failed: {e}")),
+            }
+        }
+        _ = &mut shutdown => {
+            tracing::info!("Shutdown requested; stopping the DNS server");
+            server_task.abort();
+        }
+    }
+
+    // Cancel and join every background task with a bound.
+    let _ = cancel_tx.send(true);
+    let join_all = async {
+        for task in background {
+            let _ = task.await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(10), join_all)
+        .await
+        .is_err()
+    {
+        tracing::error!("Background tasks did not stop within 10s");
+    }
 
     // Production Plan C2: exact local-owned cleanup on the ordinary exit path.
     // The timeout bounds shutdown; managed mode performs no RPC and no local
