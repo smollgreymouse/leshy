@@ -115,6 +115,31 @@ fn add_foreign_row(family: &str, destination: &str, ifindex: &str, metric: u32) 
     powershell(&script);
 }
 
+/// Let the real notification stream drain before measuring cache flatness.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+}
+
+fn counters(manager: &RouteManager) -> leshy::routing::BackendCacheCounters {
+    manager
+        .backend_cache_counters()
+        .expect("the Windows backend reports cache counters")
+}
+
+fn add_foreign_row_protocol(
+    family: &str,
+    destination: &str,
+    ifindex: &str,
+    metric: u32,
+    protocol: &str,
+) {
+    let script = format!(
+        "New-NetRoute -AddressFamily {family} -DestinationPrefix '{destination}' -InterfaceIndex {ifindex} \
+         -NextHop 0.0.0.0 -RouteMetric {metric} -Protocol {protocol} -ErrorAction Stop | Out-Null"
+    );
+    powershell(&script);
+}
+
 /// Every route line that is not one of the disposable test prefixes.
 fn unrelated_routes() -> Vec<String> {
     let script =
@@ -406,6 +431,178 @@ async fn windows_external_delete_repairs_through_the_observer() {
         "the event must read the key back: {counters:?}"
     );
 
+    manager.cleanup_zone("winrt").await.expect("cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_wrong_protocol_row_is_foreign() {
+    require_enabled();
+    let adapter = test_adapter("LESHY_WIN_TEST_ADAPTER");
+    let ifindex = ifindex_of(&adapter);
+    let other = ifindex_of(&test_adapter("LESHY_WIN_TEST_OTHER_ADAPTER"));
+    let (zone, _device) = zone(&adapter, false);
+    let manager = manager();
+    cleanup(&manager).await;
+
+    // Same prefix and interface, but the route protocol is not NetMgmt.
+    add_foreign_row_protocol("IPv4", TEST_TAG, &other, 0, "Icmp");
+    let before = rows("IPv4", TEST_TAG);
+    assert_eq!(before.len(), 1, "wrong-protocol row installed");
+
+    let error = manager
+        .add_route(IpAddr::V4(V4_HOST), &zone)
+        .await
+        .expect_err("a wrong-protocol row must be foreign");
+    let rendered = error.to_string().to_lowercase();
+    assert!(
+        rendered.contains("conflict") || rendered.contains("already owned"),
+        "expected a route conflict, got: {error}"
+    );
+    assert_eq!(rows("IPv4", TEST_TAG), before, "the row must survive");
+    delete_row("IPv4", TEST_TAG, &other);
+    let _ = ifindex;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_desired_with_a_co_resident_foreign_row_conflicts() {
+    require_enabled();
+    let adapter = test_adapter("LESHY_WIN_TEST_ADAPTER");
+    let other_adapter = test_adapter("LESHY_WIN_TEST_OTHER_ADAPTER");
+    let other = ifindex_of(&other_adapter);
+    let (primary_zone, _primary_device) = zone(&adapter, false);
+    let (other_zone, _other_device) = zone(&other_adapter, false);
+    let manager = manager();
+    cleanup(&manager).await;
+
+    manager
+        .add_route(IpAddr::V4(V4_HOST), &primary_zone)
+        .await
+        .expect("desired row");
+    assert_eq!(rows("IPv4", TEST_TAG).len(), 1);
+
+    // A foreign co-resident row on the same disposable prefix.
+    add_foreign_row("IPv4", TEST_TAG, &other, 0);
+    let both = rows("IPv4", TEST_TAG);
+    assert_eq!(both.len(), 2, "desired + foreign must coexist: {both:?}");
+
+    // Demand a different exact target: the backend must classify the foreign
+    // co-resident row as a conflict, roll back only its own new row, and
+    // leave both pre-existing rows untouched.
+    let error = manager
+        .add_route(IpAddr::V4(V4_HOST), &other_zone)
+        .await
+        .expect_err("a foreign co-resident row must conflict");
+    let rendered = error.to_string().to_lowercase();
+    assert!(
+        rendered.contains("conflict") || rendered.contains("already owned"),
+        "expected a route conflict, got: {error}"
+    );
+    assert_eq!(
+        rows("IPv4", TEST_TAG),
+        both,
+        "neither pre-existing row may be deleted by the conflict"
+    );
+
+    // Cleanup removes only the owned row, never the foreign one.
+    manager.cleanup_zone("winrt").await.expect("cleanup");
+    let remaining = rows("IPv4", TEST_TAG);
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the foreign row may remain: {remaining:?}"
+    );
+    assert!(
+        remaining[0].starts_with(&format!("{other}|")),
+        "the remaining row must be the foreign one: {remaining:?}"
+    );
+    delete_row("IPv4", TEST_TAG, &other);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_thousand_duplicate_ensures_keep_full_refresh_flat() {
+    require_enabled();
+    let adapter = test_adapter("LESHY_WIN_TEST_ADAPTER");
+    let (zone, _device) = zone(&adapter, false);
+    let manager = manager();
+    cleanup(&manager).await;
+
+    manager
+        .add_route(IpAddr::V4(V4_HOST), &zone)
+        .await
+        .expect("first add");
+    settle();
+    let after_first = counters(&manager);
+
+    for _ in 0..1000 {
+        manager
+            .add_route(IpAddr::V4(V4_HOST), &zone)
+            .await
+            .expect("repeated ensure");
+    }
+    let after = counters(&manager);
+
+    assert_eq!(
+        after.full_refreshes, after_first.full_refreshes,
+        "1000 converged ensures must not refresh the FIB: {after:?} vs {after_first:?}"
+    );
+    assert_eq!(
+        rows("IPv4", TEST_TAG).len(),
+        1,
+        "1000 ensures must leave exactly one row"
+    );
+    manager.cleanup_zone("winrt").await.expect("cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn windows_observer_event_refreshes_once_then_fast_path_resumes() {
+    require_enabled();
+    let adapter = test_adapter("LESHY_WIN_TEST_ADAPTER");
+    let (zone, _device) = zone(&adapter, false);
+    let manager = manager();
+    cleanup(&manager).await;
+
+    manager
+        .add_route(IpAddr::V4(V4_HOST), &zone)
+        .await
+        .expect("add");
+    let before = counters(&manager);
+
+    // External delete: the observer must invalidate the cache, the repair
+    // performs a bounded number of refreshes, then the converged path is a
+    // pure cache hit again.
+    delete_prefix("IPv4", TEST_TAG);
+    let restored = wait_for(std::time::Duration::from_secs(10), || {
+        !rows("IPv4", TEST_TAG).is_empty()
+    });
+    assert!(restored, "NotifyRouteChange2 must drive the repair");
+
+    let after = counters(&manager);
+    assert!(
+        after.full_refreshes > before.full_refreshes,
+        "the event must force at least one refresh: {after:?} vs {before:?}"
+    );
+    assert!(
+        after.full_refreshes <= before.full_refreshes + 6,
+        "the event repair must be bounded, not a refresh loop: {after:?} vs {before:?}"
+    );
+
+    settle();
+    let settled = counters(&manager);
+    for _ in 0..100 {
+        manager
+            .add_route(IpAddr::V4(V4_HOST), &zone)
+            .await
+            .expect("converged ensure");
+    }
+    let final_counters = counters(&manager);
+    assert_eq!(
+        final_counters.full_refreshes, settled.full_refreshes,
+        "the fast path must resume after the event: {final_counters:?}"
+    );
     manager.cleanup_zone("winrt").await.expect("cleanup");
 }
 
