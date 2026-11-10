@@ -1,4 +1,4 @@
-﻿use crate::service::coordinator::{
+use crate::service::coordinator::{
     LifecycleCoordinator, LifecycleState, StatusReport, StatusSink, StopReason,
     GRACEFUL_STOP_TIMEOUT,
 };
@@ -411,6 +411,12 @@ fn run_service() -> Result<()> {
         }
     });
 
+    // The service log is the only visible channel under the SCM; record the
+    // failure while the file writer is still alive. A start that fails before
+    // readiness must leave a diagnosable reason in the log.
+    if let Err(e) = &outcome {
+        tracing::error!(error = %format!("{e:#}"), "Leshy service failed");
+    }
     drop(runtime);
     outcome
 }
