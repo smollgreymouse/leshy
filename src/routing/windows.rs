@@ -210,12 +210,31 @@ impl WindowsRouteBackend {
     /// difference against the pre-create state. Never deletes a pre-existing
     /// row.
     async fn rollback_new_rows(&self, key: &RouteKey, before: &[ObservedRoute]) {
+        // A fresh dump, not the cache: the row this create added may be
+        // invisible to a cache entry that was written before the create. A
+        // stale cache made the rollback a no-op, leaving an unowned row that
+        // no later shutdown sweep could identify (Production Plan C4
+        // stress run: 25 of 800 rows leaked this way).
+        if let Err(e) = self.refresh().await {
+            tracing::warn!(
+                ip = %key.prefix.network,
+                error = %e,
+                "route rollback could not refresh the table; the created row may leak"
+            );
+            return;
+        }
         let after = self.cached(key).await;
         for row in after
             .iter()
             .filter(|row| !before.iter().any(|old| old.identity == row.identity))
         {
-            let _ = self.api.delete_exact(key, &row.identity).await;
+            if let Err(e) = self.api.delete_exact(key, &row.identity).await {
+                tracing::warn!(
+                    ip = %key.prefix.network,
+                    error = %e,
+                    "route rollback could not delete the row this create added"
+                );
+            }
         }
         let _ = self.refresh().await;
     }

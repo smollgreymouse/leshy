@@ -543,6 +543,37 @@ fn find_exact_mib_row(
     Ok(None)
 }
 
+/// Upper bound on exact deletes for one key. A bounded loop keeps a table
+/// that keeps re-publishing the row from spinning a shutdown forever.
+const MAX_EXACT_DELETES: usize = 8;
+
+/// Delete every live row that carries exactly `identity`, then prove the
+/// table is empty for it.
+///
+/// `DeleteIpForwardEntry2` reports success while a second row with the same
+/// identity can still be present: two concurrent ensures may publish the same
+/// prefix twice, and a delete removes one copy. Deleting once and trusting the
+/// return code left roughly 100 of 800 rows behind at shutdown (Production
+/// Plan C4 stress run), so the loop re-reads the exact identity until nothing
+/// matches and fails loudly if the table refuses to converge.
+fn delete_all_matching(
+    mut next_row: impl FnMut() -> Result<Option<MIB_IPFORWARD_ROW2>>,
+    mut delete_row: impl FnMut(&MIB_IPFORWARD_ROW2) -> Result<()>,
+) -> Result<usize> {
+    let mut deleted = 0usize;
+    while deleted < MAX_EXACT_DELETES {
+        let Some(row) = next_row()? else {
+            return Ok(deleted);
+        };
+        delete_row(&row)?;
+        deleted += 1;
+    }
+    if next_row()?.is_some() {
+        anyhow::bail!("exact route delete did not converge after {MAX_EXACT_DELETES} attempts");
+    }
+    Ok(deleted)
+}
+
 /// Production API over iphlpapi.dll.
 #[derive(Default, Debug, Clone, Copy)]
 pub(crate) struct RealWindowsRouteApi;
@@ -597,22 +628,38 @@ impl WindowsRouteApi for RealWindowsRouteApi {
         identity: &RouteKernelIdentity,
     ) -> Result<WindowsDeleteOutcome> {
         let family = family_of_key(key);
-        let Some(row) = find_exact_mib_row(family, key, identity)? else {
+        let deleted = delete_all_matching(
+            || find_exact_mib_row(family, key, identity),
+            |row| {
+                // SAFETY: `row` is a live MIB_IPFORWARD_ROW2 read from the table.
+                let err = unsafe { DeleteIpForwardEntry2(row) };
+                if err.is_ok() || err == ERROR_NOT_FOUND {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "DeleteIpForwardEntry2 failed for {}: {err:?}",
+                    key.prefix.network
+                )
+            },
+        )?;
+        if deleted == 0 {
             tracing::debug!(
                 ip = %key.prefix.network,
                 "no live row carries the recorded identity; nothing to delete"
             );
             return Ok(WindowsDeleteOutcome::Absent);
-        };
-        // SAFETY: `row` is a live MIB_IPFORWARD_ROW2 read from the table.
-        let err = unsafe { DeleteIpForwardEntry2(&row) };
-        if err.is_ok() || err == ERROR_NOT_FOUND {
-            return Ok(WindowsDeleteOutcome::Deleted);
         }
-        anyhow::bail!(
-            "DeleteIpForwardEntry2 failed for {}: {err:?}",
-            key.prefix.network
-        )
+        if deleted > 1 {
+            // Concurrent ensures can publish the same identity twice (the
+            // kernel accepts the second create while the first is not yet
+            // visible). Every copy belongs to this process and must go.
+            tracing::warn!(
+                ip = %key.prefix.network,
+                copies = deleted,
+                "multiple rows carried the owned identity; all were deleted"
+            );
+        }
+        Ok(WindowsDeleteOutcome::Deleted)
     }
 
     fn subscribe(
@@ -1152,5 +1199,53 @@ mod tests {
             },
         };
         assert!(!observed_matches(&observed, &intent));
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    fn row(metric: u32) -> MIB_IPFORWARD_ROW2 {
+        MIB_IPFORWARD_ROW2 {
+            Metric: metric,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drains_every_copy_of_the_identity() {
+        let mut table = vec![row(0), row(0), row(0)];
+        let deleted = delete_all_matching(
+            || {
+                Ok(if table.is_empty() {
+                    None
+                } else {
+                    Some(table.remove(0))
+                })
+            },
+            |_| Ok(()),
+        )
+        .expect("drain");
+        assert_eq!(deleted, 3);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn absent_identity_deletes_nothing() {
+        let deleted = delete_all_matching(|| Ok(None), |_| Ok(())).expect("drain");
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn a_table_that_keeps_the_row_fails_instead_of_looping() {
+        let result = delete_all_matching(|| Ok(Some(row(0))), |_| Ok(()));
+        assert!(result.is_err(), "a non-converging delete must be an error");
+    }
+
+    #[test]
+    fn a_delete_error_is_returned() {
+        let result = delete_all_matching(|| Ok(Some(row(0))), |_| anyhow::bail!("boom"));
+        assert!(result.is_err());
     }
 }

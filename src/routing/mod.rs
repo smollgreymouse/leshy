@@ -1,4 +1,4 @@
-//! Route orchestration: turns DNS answers and static config into route intents
+﻿//! Route orchestration: turns DNS answers and static config into route intents
 //! and drives them through the unified registry.
 //!
 //! The manager owns no kernel state of its own. Every mutation goes through
@@ -50,7 +50,7 @@ use linux::LinuxRouteBackend as PlatformBackend;
 use macos::MacosRouteBackend as PlatformBackend;
 use registry::RouteRegistry;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 #[cfg(target_os = "windows")]
@@ -74,7 +74,7 @@ pub struct RetirementReport {
     pub skipped_replaced: usize,
 }
 
-/// Kernel I/O counters for the invalidation path (08D1 §16.3).
+/// Kernel I/O counters for the invalidation path (08D1 В§16.3).
 ///
 /// `full_snapshots` counts manager-level full-FIB reads: a `Full`
 /// invalidation (periodic safety audit, explicit diagnostic) or an initial
@@ -113,8 +113,15 @@ pub struct RouteManager {
     /// Managed mode understands only Zone and AuthorityLost; every other
     /// kind is an invariant violation and must never trigger a snapshot.
     authority_invariant_violations: Arc<AtomicU64>,
-    /// Proof that surfaced events stay targeted (08D1 §16.3).
+    /// Proof that surfaced events stay targeted (08D1 В§16.3).
     reconcile_counters: Arc<ReconcileCounterState>,
+    /// Set when the exact shutdown cleanup starts. Deleting an owned row
+    /// emits a kernel route event, and an event-driven reconcile would then
+    /// re-apply the still-desired static route behind the cleanup back
+    /// (Production Plan C4 stress run: 63 of 800 rows came back this way).
+    /// Once the process is stopping, the registry, not the kernel events,
+    /// decides what happens.
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl RouteManager {
@@ -167,7 +174,7 @@ impl RouteManager {
     /// Start the kernel invalidation listener and, for local platforms, the
     /// periodic safety audit.
     ///
-    /// §18.5 dispatches on the backend's reconcile mode:
+    /// В§18.5 dispatches on the backend's reconcile mode:
     /// - KernelSnapshot: mark matching dirty and reconcile immediately;
     /// - AuthorityOnDemand: consume controller invalidations, mark dirty
     ///   locally and never issue a bulk RPC/snapshot;
@@ -192,8 +199,14 @@ impl RouteManager {
             let registry = Arc::clone(&self.registry);
             let backend = Arc::clone(&self.backend);
             let counters = Arc::clone(&self.reconcile_counters);
+            let shutting_down = Arc::clone(&self.shutting_down);
             tokio::spawn(async move {
                 while let Some(invalidation) = rx.recv().await {
+                    if shutting_down.load(Ordering::SeqCst) {
+                        // The registry is tearing down: a delete event must
+                        // never re-create the row it just removed.
+                        continue;
+                    }
                     let report = reconcile_after_invalidation(
                         &registry,
                         backend.as_ref(),
@@ -219,6 +232,7 @@ impl RouteManager {
         let registry = Arc::clone(&self.registry);
         let backend = Arc::clone(&self.backend);
         let counters = Arc::clone(&self.reconcile_counters);
+        let shutting_down = Arc::clone(&self.shutting_down);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(AUDIT_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -227,6 +241,9 @@ impl RouteManager {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                if shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
                 let report = reconcile_after_invalidation(
                     &registry,
                     backend.as_ref(),
@@ -271,6 +288,9 @@ impl RouteManager {
         &self,
         invalidation: backend::RouteInvalidation,
     ) -> ReconcileReport {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return ReconcileReport::default();
+        }
         if self.backend.reconcile_mode() == ReconcileMode::AuthorityOnDemand {
             dispatch_authority_invalidation(
                 &self.registry,
@@ -298,7 +318,7 @@ impl RouteManager {
         self.backend.cache_counters()
     }
 
-    /// Counters proving the event path stays targeted (08D1 §16.3):
+    /// Counters proving the event path stays targeted (08D1 В§16.3):
     /// `full_snapshots` only moves for a `Full` invalidation/audit.
     #[allow(dead_code)]
     pub fn reconcile_counters(&self) -> ReconcileCounters {
@@ -306,7 +326,7 @@ impl RouteManager {
     }
 
     /// Test-visible count of invalidations an AuthorityOnDemand backend could
-    /// not attribute. Must stay zero (08D1 §18.5 invariant).
+    /// not attribute. Must stay zero (08D1 В§18.5 invariant).
     #[cfg(test)]
     pub(crate) fn authority_invariant_violations(&self) -> u64 {
         self.authority_invariant_violations.load(Ordering::SeqCst)
@@ -348,6 +368,7 @@ impl RouteManager {
             kernel_epoch: Arc::new(AtomicU64::new(0)),
             authority_invariant_violations: Arc::new(AtomicU64::new(0)),
             reconcile_counters: Arc::new(ReconcileCounterState::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         };
         manager.start_kernel_watch();
         manager
@@ -445,7 +466,7 @@ impl RouteManager {
                 };
                 self.ensure_intent(intent).await.map(|_| ())
             }
-            // §49.1: the aggregated Remove retires through the registry —
+            // В§49.1: the aggregated Remove retires through the registry вЂ”
             // the recorded actual intent/ownership decides, never a planner
             // guess with None ownership.
             RouteAction::Remove(intent) => {
@@ -512,7 +533,7 @@ impl RouteManager {
             errors = report.errors,
             "Zone routes retired"
         );
-        // §49.6: an exact-delete failure must surface — a caller (reload or
+        // В§49.6: an exact-delete failure must surface вЂ” a caller (reload or
         // operator cleanup) must not claim successful retirement while old
         // owned rows remain.
         if report.errors > 0 {
@@ -561,7 +582,7 @@ impl RouteManager {
         Ok(report)
     }
 
-    /// Shut down routing exactly as the reconcile mode requires (08D1 §19.5,
+    /// Shut down routing exactly as the reconcile mode requires (08D1 В§19.5,
     /// Production Plan C2).
     ///
     /// Local kernels remove exactly the rows this process owns; a foreign row
@@ -569,6 +590,9 @@ impl RouteManager {
     /// shutdown sends zero Forget, zero FlushZone and performs zero local FIB
     /// mutation.
     pub async fn shutdown_routes(&self) -> Result<usize> {
+        // First: no event-driven reconcile may re-apply a desired route while
+        // the cleanup deletes the owned rows one by one.
+        self.shutting_down.store(true, Ordering::SeqCst);
         match self.backend.reconcile_mode() {
             ReconcileMode::KernelSnapshot | ReconcileMode::RegistryOnly => {
                 let removed = self
@@ -603,11 +627,11 @@ impl RouteManager {
     }
 }
 
-/// Consume one invalidation for an AuthorityOnDemand backend (08D1 §18.5).
+/// Consume one invalidation for an AuthorityOnDemand backend (08D1 В§18.5).
 ///
 /// Only two kinds are meaningful: a per-zone generation change dirties that
 /// zone's entries, and total authority loss dirties every managed entry. Both
-/// are purely local — the controller owns kernel repair, so there is no
+/// are purely local вЂ” the controller owns kernel repair, so there is no
 /// snapshot and no bulk Ensure. Any other kind is a test-visible invariant
 /// violation and is logged rather than acted on.
 async fn dispatch_authority_invalidation(
@@ -642,7 +666,7 @@ async fn dispatch_authority_invalidation(
 ///
 /// A `Full` invalidation (periodic safety audit, explicit diagnostic) is the
 /// only path that reads the whole FIB. Prefix, Interface and Zone events read
-/// back only the keys they invalidated (08D1 §16.3): the event path must never
+/// back only the keys they invalidated (08D1 В§16.3): the event path must never
 /// turn one kernel notification into a full v4+v6 snapshot.
 async fn reconcile_after_invalidation(
     registry: &Arc<RouteRegistry>,
@@ -651,17 +675,17 @@ async fn reconcile_after_invalidation(
     counters: &ReconcileCounterState,
     invalidation: backend::RouteInvalidation,
 ) -> ReconcileReport {
-    // §15 targeted-epoch semantics: only a Full invalidation advances the
+    // В§15 targeted-epoch semantics: only a Full invalidation advances the
     // epoch (it is the full-kernel-snapshot proof). Targeted Prefix /
     // Interface / Zone invalidations mark the matching entries Dirty and
-    // re-verify them against the CURRENT full_epoch — unrelated Verified
+    // re-verify them against the CURRENT full_epoch вЂ” unrelated Verified
     // entries keep their fast path without any kernel I/O.
     if matches!(invalidation, backend::RouteInvalidation::Full) {
         kernel_epoch.fetch_add(1, Ordering::SeqCst);
     }
     let epoch = kernel_epoch.load(Ordering::SeqCst);
     let dirty_keys = registry.mark_dirty(invalidation.clone(), epoch).await;
-    // §14.2: the dispatch branches on the backend's reconcile mode.
+    // В§14.2: the dispatch branches on the backend's reconcile mode.
     match backend.reconcile_mode() {
         ReconcileMode::KernelSnapshot => match invalidation {
             backend::RouteInvalidation::Full => {
@@ -677,14 +701,14 @@ async fn reconcile_after_invalidation(
                     }
                 }
             }
-            // 08D1 §16.3: targeted events read back exactly their own keys.
+            // 08D1 В§16.3: targeted events read back exactly their own keys.
             backend::RouteInvalidation::Prefix(_)
             | backend::RouteInvalidation::Interface(_)
             | backend::RouteInvalidation::Zone(_) => {
                 reconcile_targeted_keys(registry, backend, &dirty_keys, epoch, counters).await
             }
             // A local-kernel backend never originates AuthorityLost; the
-            // managed dispatch owns it (08D1 §18.4).
+            // managed dispatch owns it (08D1 В§18.4).
             backend::RouteInvalidation::AuthorityLost => ReconcileReport::default(),
         },
         // AuthorityOnDemand and RegistryOnly never snapshot here: the
@@ -1218,6 +1242,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_fences_event_driven_reconcile() {
+        // Deleting an owned row emits a kernel event; without the fence the
+        // consumer re-applies the still-desired route and the row comes back
+        // after the cleanup already counted it as removed.
+        let backend = Arc::new(FakeBackend::new());
+        let mgr =
+            RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+        let zone = via_zone("corp", "192.168.1.1");
+        mgr.add_static_route("10.9.0.0/24", &zone).await.unwrap();
+        assert_eq!(backend.ensure_count(), 1);
+
+        let before = backend.ensure_count();
+        mgr.shutting_down.store(true, Ordering::SeqCst);
+        let report = mgr
+            .handle_invalidation(backend::RouteInvalidation::Full)
+            .await;
+        assert_eq!(report.adds, 0);
+        assert_eq!(report.removes, 0);
+        assert_eq!(report.noops, 0);
+        assert_eq!(
+            backend.ensure_count(),
+            before,
+            "no route may be re-applied once the shutdown cleanup started"
+        );
+        assert_eq!(backend.snapshot_count(), 0);
+    }
+
+    #[tokio::test]
     async fn capacity_denies_the_16385th_unique_dynamic_intent() {
         let backend = Arc::new(FakeBackend::new());
         let mgr =
@@ -1267,7 +1319,7 @@ mod tests {
         }
         assert_eq!(transport.call_count(), 1000);
 
-        // §18.5/§18.8: authority loss dirties all 1000 entries with zero
+        // В§18.5/В§18.8: authority loss dirties all 1000 entries with zero
         // controller calls and zero snapshots.
         let report = mgr
             .handle_invalidation(backend::RouteInvalidation::AuthorityLost)
@@ -1512,7 +1564,7 @@ max_dynamic_routes = 100
         ))))
     }
 
-    /// Shared body of the restart-only reload regressions (08D1 §19.1).
+    /// Shared body of the restart-only reload regressions (08D1 В§19.1).
     ///
     /// The change must be rejected by the real `apply_reload` transaction with
     /// the documented restart error, before any route is retired and before
@@ -1609,7 +1661,7 @@ max_dynamic_routes = 100
         .await
     }
 
-    /// 08D1 §19.2: a reload that changes one zone retires exactly that zone's
+    /// 08D1 В§19.2: a reload that changes one zone retires exactly that zone's
     /// owned rows through the real `apply_reload` transaction. The untouched
     /// zone keeps its ownership with zero backend calls.
     #[tokio::test]
@@ -1674,7 +1726,7 @@ max_dynamic_routes = 100
         Ok(())
     }
 
-    /// 08D1 §19.1/§19.2 reload transaction matrix: a failure at any point
+    /// 08D1 В§19.1/В§19.2 reload transaction matrix: a failure at any point
     /// before the config swap must abort, keep the old config and matcher, and
     /// keep the exact ownership evidence.
     mod reload_transaction_tests {
@@ -1941,7 +1993,7 @@ max_dynamic_routes = 100
             Ok(())
         }
     }
-    /// 08D1 §16.3/§6.5: the invalidation path reads back exactly the keys the
+    /// 08D1 В§16.3/В§6.5: the invalidation path reads back exactly the keys the
     /// event named and never turns one kernel notification into a full-FIB
     /// snapshot.
     mod targeted_reconcile_tests {
