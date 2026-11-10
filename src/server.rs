@@ -135,6 +135,25 @@ pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     // Run server
     server.run().await?;
 
+    // Production Plan C2: exact local-owned cleanup on the ordinary exit path.
+    // The timeout bounds shutdown; managed mode performs no RPC and no local
+    // FIB mutation inside shutdown_routes.
+    let cleanup = async {
+        let handler_guard = handler.read().await;
+        handler_guard.shutdown_routes().await
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), cleanup).await {
+        Ok(Ok(removed)) => {
+            tracing::info!(removed, "Shutdown route cleanup complete");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Shutdown route cleanup failed");
+        }
+        Err(_) => {
+            tracing::error!("Shutdown route cleanup timed out after 10s");
+        }
+    }
+
     Ok(())
 }
 

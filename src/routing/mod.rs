@@ -568,7 +568,6 @@ impl RouteManager {
     /// is never touched. The managed backend owns its FIB through Kikimora, so
     /// shutdown sends zero Forget, zero FlushZone and performs zero local FIB
     /// mutation.
-    #[allow(dead_code)]
     pub async fn shutdown_routes(&self) -> Result<usize> {
         match self.backend.reconcile_mode() {
             ReconcileMode::KernelSnapshot | ReconcileMode::RegistryOnly => {

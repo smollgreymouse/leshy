@@ -427,7 +427,6 @@ impl DnsHandler {
 
     /// Remove exactly the local-owned routes at shutdown (Production Plan
     /// C2). Managed mode performs no controller RPC and no local mutation.
-    #[allow(dead_code)]
     pub async fn shutdown_routes(&self) -> anyhow::Result<usize> {
         let route_manager = self.route_manager.read().await;
         route_manager.shutdown_routes().await
