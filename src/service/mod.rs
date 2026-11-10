@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+﻿#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -6,7 +6,10 @@ mod macos;
 mod windows;
 
 // The lifecycle coordinator is platform-independent so the SCM contract can
-// be unit-tested on every CI runner (Production Plan C4).
+// be unit-tested on every CI runner (Production Plan C4). It is compiled for
+// the Windows service and for test builds everywhere; a Linux release build
+// has no consumer for it.
+#[cfg(any(target_os = "windows", test))]
 mod coordinator;
 
 #[cfg(target_os = "windows")]
@@ -57,7 +60,7 @@ pub fn install(name: Option<&str>, config: Option<&Path>, depend_on: Option<&str
     #[cfg(target_os = "macos")]
     macos::install(name, &binary, config)?;
 
-    // The SCM dependency is a Windows contract (08D1 §31.3); other platforms
+    // The SCM dependency is a Windows contract (08D1 В§31.3); other platforms
     // gate the flag explicitly so the argument is never silently dropped.
     #[cfg(not(target_os = "windows"))]
     if depend_on.is_some() {
