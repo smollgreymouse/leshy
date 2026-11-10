@@ -145,6 +145,21 @@ pub(crate) trait RouteBackend: Send + Sync {
     fn reconcile_mode(&self) -> ReconcileMode {
         ReconcileMode::KernelSnapshot
     }
+
+    /// Optional local-backend cache counters (08D1 §41.3). `None` when the
+    /// backend has no coherent cache to report.
+    fn cache_counters(&self) -> Option<BackendCacheCounters> {
+        None
+    }
+}
+
+/// Coherent-cache counters a local backend can expose for acceptance runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendCacheCounters {
+    /// Full forwarding-table refreshes performed by the backend cache.
+    pub full_refreshes: u64,
+    /// Reads served from a current cache without touching the table.
+    pub cache_hits: u64,
 }
 
 /// The result of one ensure: the outcome plus the exact ownership the

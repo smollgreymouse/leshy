@@ -19,7 +19,11 @@ mod linux_monitor;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+mod windows_api;
 
+#[allow(unused_imports)]
+pub use backend::BackendCacheCounters;
 pub use model::{
     family_of, AddressFamily, RouteIntent, RouteKey, RoutePrefix, RouteSource, RouteTarget,
 };
@@ -285,6 +289,13 @@ impl RouteManager {
             invalidation,
         )
         .await
+    }
+
+    /// Optional local-backend coherent-cache counters (diagnostics for the
+    /// native acceptance gates). `None` for backends without a local cache.
+    #[allow(dead_code)]
+    pub fn backend_cache_counters(&self) -> Option<backend::BackendCacheCounters> {
+        self.backend.cache_counters()
     }
 
     /// Counters proving the event path stays targeted (08D1 §16.3):
