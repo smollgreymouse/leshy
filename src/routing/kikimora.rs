@@ -496,6 +496,33 @@ impl KikimoraRouteBackend {
         }
     }
 
+    /// Verify the controller's verdict fence before accepting it (08D1
+    /// post-D7 audit D8 §8.2): the response activation/generation must equal
+    /// the configured ManagedIdentity. A mismatched response is a
+    /// protocol/authority failure and fails closed — the DNS layer never
+    /// trusts a verdict from a foreign activation.
+    fn verify_result_fence(&self, result: &LeshyRouteResultWire) -> Result<()> {
+        let Some(identity) = &self.identity else {
+            // Legacy v1 compatibility: no identity configured, no fence to
+            // compare.
+            return Ok(());
+        };
+        match (&result.activation_id, result.mode_generation) {
+            (Some(id), Some(generation))
+                if *id == identity.activation_id && generation == identity.mode_generation =>
+            {
+                Ok(())
+            }
+            _ => bail!(
+                "kikimora verdict fence mismatch: controller answered activation {:?}/generation {:?}, this Leshy runs activation {}/generation {}",
+                result.activation_id,
+                result.mode_generation,
+                identity.activation_id,
+                identity.mode_generation
+            ),
+        }
+    }
+
     fn map_result(result: LeshyRouteResultWire) -> Result<EnsureOutcome> {
         match result.state.as_str() {
             "applied" => Ok(EnsureOutcome::Added),
@@ -554,6 +581,7 @@ impl RouteBackend for KikimoraRouteBackend {
         let Some(result) = result else {
             bail!("kikimora EnsureLeshyRoute returned no route result");
         };
+        self.verify_result_fence(&result)?;
         tracing::debug!(
             zone = result.zone,
             prefix = result.prefix,
@@ -1014,6 +1042,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verdict_with_matching_fence_is_accepted() {
+        let transport = Arc::new(FakeTransport::new());
+        let mut result = applied_result("10.0.0.1/32", 4);
+        result.activation_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        result.mode_generation = Some(7);
+        transport.set_result(result);
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            Some(ManagedIdentity {
+                activation_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                mode_generation: 7,
+            }),
+        );
+
+        let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
+        let outcome = backend.ensure_route(&intent, None).await.unwrap();
+        assert_eq!(outcome.outcome, EnsureOutcome::Added);
+    }
+
+    #[tokio::test]
+    async fn verdict_with_a_foreign_activation_fails_closed() {
+        let transport = Arc::new(FakeTransport::new());
+        let mut result = applied_result("10.0.0.1/32", 4);
+        result.activation_id = Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
+        result.mode_generation = Some(7);
+        transport.set_result(result);
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            Some(ManagedIdentity {
+                activation_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                mode_generation: 7,
+            }),
+        );
+
+        let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
+        let err = backend.ensure_route(&intent, None).await.unwrap_err();
+        // A mismatched fence is a protocol/authority failure, not a safety
+        // denial: it must never classify as ControllerDenied/RouteConflict.
+        assert!(err.to_string().contains("fence mismatch"), "err: {err}");
+        assert!(err.downcast_ref::<ControllerDenied>().is_none());
+        assert!(err.downcast_ref::<RouteConflict>().is_none());
+    }
+
+    #[tokio::test]
+    async fn verdict_with_a_stale_generation_fails_closed() {
+        let transport = Arc::new(FakeTransport::new());
+        let mut result = applied_result("10.0.0.1/32", 4);
+        result.activation_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        result.mode_generation = Some(6);
+        transport.set_result(result);
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            Some(ManagedIdentity {
+                activation_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                mode_generation: 7,
+            }),
+        );
+
+        let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
+        let err = backend.ensure_route(&intent, None).await.unwrap_err();
+        assert!(err.to_string().contains("fence mismatch"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn unfenced_verdict_fails_closed_under_an_identity() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            Some(ManagedIdentity {
+                activation_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                mode_generation: 7,
+            }),
+        );
+
+        let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
+        let err = backend.ensure_route(&intent, None).await.unwrap_err();
+        assert!(err.to_string().contains("fence mismatch"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn unfenced_verdict_is_accepted_on_the_v1_compatibility_wire() {
+        let transport = Arc::new(FakeTransport::new());
+        transport.set_result(applied_result("10.0.0.1/32", 4));
+        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+
+        let intent = host_intent(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), "corp");
+        let outcome = backend.ensure_route(&intent, None).await.unwrap();
+        assert_eq!(outcome.outcome, EnsureOutcome::Added);
+    }
+
+    #[tokio::test]
     async fn requests_carry_only_zone_prefix_and_source() {
         let transport = Arc::new(FakeTransport::new());
         transport.set_result(applied_result("10.0.0.1/32", 4));
@@ -1060,7 +1180,12 @@ mod tests {
     #[tokio::test]
     async fn schema2_requests_carry_the_exact_activation_fence() {
         let transport = Arc::new(FakeTransport::new());
-        transport.set_result(applied_result("10.0.0.1/32", 4));
+        // The scripted verdict echoes the exact activation fence (D8 §8.2):
+        // an unfenced verdict now fails closed under an identity.
+        let mut verdict = applied_result("10.0.0.1/32", 4);
+        verdict.activation_id = Some("0123456789abcdef0123456789abcdef".to_string());
+        verdict.mode_generation = Some(7);
+        transport.set_result(verdict);
         let backend = KikimoraRouteBackend::with_test_transport_identity(
             Box::new(Arc::clone(&transport)),
             Some(schema2_identity()),
@@ -1483,13 +1608,16 @@ mod af_unix_tests {
                 Some("0123456789abcdef0123456789abcdef")
             );
             assert_eq!(wire.mode_generation, Some(7));
+            let mut verdict = applied_result("10.0.0.1/32", 4);
+            verdict.activation_id = Some("0123456789abcdef0123456789abcdef".to_string());
+            verdict.mode_generation = Some(7);
             write_frame(
                 &mut conn,
                 &ScriptedResponse {
                     ok: true,
                     error: String::new(),
                     capabilities: FakeTransport::all_capabilities(),
-                    leshy_route: Some(applied_result("10.0.0.1/32", 4)),
+                    leshy_route: Some(verdict),
                 },
             )
             .await
