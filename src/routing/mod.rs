@@ -561,6 +561,31 @@ impl RouteManager {
         Ok(report)
     }
 
+    /// Shut down routing exactly as the reconcile mode requires (08D1 §19.5,
+    /// Production Plan C2).
+    ///
+    /// Local kernels remove exactly the rows this process owns; a foreign row
+    /// is never touched. The managed backend owns its FIB through Kikimora, so
+    /// shutdown sends zero Forget, zero FlushZone and performs zero local FIB
+    /// mutation.
+    #[allow(dead_code)]
+    pub async fn shutdown_routes(&self) -> Result<usize> {
+        match self.backend.reconcile_mode() {
+            ReconcileMode::KernelSnapshot | ReconcileMode::RegistryOnly => {
+                let removed = self
+                    .registry
+                    .remove_all_owned(self.backend.as_ref())
+                    .await?;
+                tracing::info!(removed, "Local owned routes removed at shutdown");
+                Ok(removed)
+            }
+            ReconcileMode::AuthorityOnDemand => {
+                tracing::info!("Managed mode shutdown: no Forget/Flush and no local FIB mutation");
+                Ok(0)
+            }
+        }
+    }
+
     /// Count of dynamic (DNS-sourced) intents currently registered.
     #[allow(dead_code)]
     pub async fn dynamic_route_count(&self) -> u64 {
@@ -1851,6 +1876,72 @@ max_dynamic_routes = 100
         }
     }
 
+    /// Production Plan C2: shutdown removes exactly the local-owned rows.
+    mod shutdown_routes_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn local_shutdown_removes_only_owned_rows() -> Result<()> {
+            let backend = Arc::new(FakeBackend::new());
+            let mgr =
+                RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+            let zone = via_zone("corp", "192.168.1.1");
+            mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
+                .await?;
+            assert_eq!(backend.ensure_count(), 1);
+
+            let removed = mgr.shutdown_routes().await?;
+            assert_eq!(removed, 1, "the owned row must be removed");
+            assert_eq!(backend.remove_count(), 1);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn local_shutdown_skips_unowned_compatible_rows() -> Result<()> {
+            let backend = Arc::new(FakeBackend::new());
+            backend.set_outcome(Ok(EnsureOutcome::AlreadyMatching));
+            let mgr =
+                RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+            let zone = via_zone("corp", "192.168.1.1");
+            mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), &zone)
+                .await?;
+
+            let removed = mgr.shutdown_routes().await?;
+            assert_eq!(removed, 0);
+            assert_eq!(
+                backend.remove_count(),
+                0,
+                "a foreign compatible row must never be deleted"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn managed_shutdown_sends_no_controller_rpc_and_no_local_mutation() -> Result<()> {
+            let transport = Arc::new(FakeTransport::new());
+            transport.set_result(crate::routing::kikimora::fake::applied_result(
+                "10.0.0.1/32",
+                4,
+            ));
+            let backend = managed_backend(&transport);
+            let mgr =
+                RouteManager::with_backend(Arc::clone(&backend), None, DEFAULT_MAX_DYNAMIC_ROUTES);
+            let zone = via_zone("corp", "192.168.1.1");
+            mgr.add_route(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), &zone)
+                .await?;
+            let before = transport.call_count();
+
+            let removed = mgr.shutdown_routes().await?;
+            assert_eq!(removed, 0, "managed shutdown must not retire locally");
+            assert_eq!(
+                transport.call_count(),
+                before,
+                "managed shutdown must send zero Forget/Flush RPC"
+            );
+            assert_eq!(backend.snapshot_calls(), 0);
+            Ok(())
+        }
+    }
     /// 08D1 §16.3/§6.5: the invalidation path reads back exactly the keys the
     /// event named and never turns one kernel notification into a full-FIB
     /// snapshot.

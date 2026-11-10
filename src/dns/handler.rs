@@ -425,6 +425,14 @@ impl DnsHandler {
         route_manager.retire_intents(intents).await
     }
 
+    /// Remove exactly the local-owned routes at shutdown (Production Plan
+    /// C2). Managed mode performs no controller RPC and no local mutation.
+    #[allow(dead_code)]
+    pub async fn shutdown_routes(&self) -> anyhow::Result<usize> {
+        let route_manager = self.route_manager.read().await;
+        route_manager.shutdown_routes().await
+    }
+
     /// Invalidate the affected zones after a config reload (08D1 §19.2).
     ///
     /// Each affected zone is marked through the same targeted `Zone`
