@@ -54,10 +54,17 @@ pub fn default_config_candidates() -> PathBuf {
     }
 }
 
-/// Load the configuration, start the DNS server, and run until the returned
-/// future is dropped or the process exits.
+/// Run the DNS server until the platform shutdown signal resolves.
 pub async fn run_server(config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     run_server_until(config_arg, shutdown_signal()).await
+}
+
+/// Run the DNS server with a caller-supplied shutdown future.
+pub async fn run_server_until<F>(config_arg: Option<PathBuf>, shutdown: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    run_server_until_with_ready(config_arg, shutdown, || {}).await
 }
 
 /// Resolve when the process is asked to stop: SIGTERM or Ctrl-C (08D1 §19.5).
@@ -83,15 +90,27 @@ async fn shutdown_signal() {
     }
 }
 
-/// Run the DNS server until the platform shutdown signal resolves.
+/// Run the DNS server until the platform shutdown signal resolves, then run
+/// the exact shutdown-route cleanup.
 ///
 /// Every background task (static-route retry, config watcher, reload
 /// consumer) is tracked and cancelled before the handler performs the exact
 /// route cleanup, so no detached work outlives the server (Production Plan
 /// C1).
-pub async fn run_server_until<F>(config_arg: Option<PathBuf>, shutdown: F) -> anyhow::Result<()>
+///
+/// `ready` is invoked exactly once, after the configuration is loaded, the
+/// writer lease is held, the initial static-route work is done and the DNS
+/// socket is bound (Production Plan C4). The Windows SCM keeps reporting
+/// StartPending until this fires, so a service is never advertised as Running
+/// before it can answer a query.
+pub async fn run_server_until_with_ready<F, R>(
+    config_arg: Option<PathBuf>,
+    shutdown: F,
+    ready: R,
+) -> anyhow::Result<()>
 where
     F: std::future::Future<Output = ()> + Send,
+    R: FnOnce() + Send,
 {
     let config_path = config_arg.unwrap_or_else(default_config_candidates);
 
@@ -148,6 +167,10 @@ where
 
     // Create and start DNS server
     let server = DnsServer::new(config.server.listen_address, handler.clone()).await?;
+
+    // Readiness: config loaded, writer lease held, initial static-route work
+    // done, DNS socket bound. Only now may the platform layer report Running.
+    ready();
 
     tracing::info!("Leshy DNS server started");
 

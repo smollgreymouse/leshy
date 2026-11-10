@@ -5,6 +5,10 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// The lifecycle coordinator is platform-independent so the SCM contract can
+// be unit-tested on every CI runner (Production Plan C4).
+mod coordinator;
+
 #[cfg(target_os = "windows")]
 pub use windows::{dispatch_service, SERVICE_LAUNCH_FLAG};
 

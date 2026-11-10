@@ -1,3 +1,7 @@
+﻿use crate::service::coordinator::{
+    LifecycleCoordinator, LifecycleState, StatusReport, StatusSink, StopReason,
+    GRACEFUL_STOP_TIMEOUT,
+};
 use anyhow::{Context, Result};
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
@@ -54,7 +58,7 @@ fn build_service_info(
         // None = run as LocalSystem, which holds the rights to install routes.
         account_name: None,
         account_password: None,
-        // SCM dependency on the Kikimora core service (08D1 §31.3): the SCM
+        // SCM dependency on the Kikimora core service (08D1 В§31.3): the SCM
         // does not start this service until the dependency reports Running
         // after application readiness.
         dependencies: dependencies_for(depend_on),
@@ -183,11 +187,19 @@ pub fn uninstall(name: &str) -> Result<()> {
 // --- Service runtime -------------------------------------------------------
 //
 // A process launched by the Service Control Manager must answer the SCM
-// handshake within ~30 seconds or it is killed with error 1053. The block
-// below wires leshy into that contract: dispatch -> StartPending -> run the
-// DNS server -> Running -> stop request -> Stopped.
+// handshake within ~30 seconds or it is killed with error 1053, must not
+// report Running before it can serve, and must answer a stop request
+// gracefully (08D1 Production Plan C4).
+//
+// The state machine itself lives in `crate::service::coordinator`, where it is
+// unit-tested on every platform; this module only maps the SCM events onto it:
+// dispatch -> StartPending -> (config, lease, static routes, DNS bind) ->
+// Running -> stop request -> StopPending -> graceful drain -> Stopped.
 
 windows_service::define_windows_service!(ffi_service_main, leshy_service_main);
+
+/// Wait hint reported while starting: the SCM's own start window.
+const START_PENDING_WAIT_HINT: Duration = Duration::from_secs(30);
 
 /// Entry point for SCM launches: `leshy.exe --service <name> <config>`.
 /// Blocks until the service stops.
@@ -206,6 +218,67 @@ fn leshy_service_main(_arguments: Vec<std::ffi::OsString>) {
     }
 }
 
+/// Maps the coordinator's reports onto `SERVICE_STATUS` records.
+struct ScmStatusSink {
+    handle: windows_service::service_control_handler::ServiceStatusHandle,
+}
+
+impl StatusSink for ScmStatusSink {
+    fn report(&mut self, report: StatusReport) -> Result<()> {
+        let (state, controls, wait_hint) = match report.state {
+            LifecycleState::StartPending => (
+                ServiceState::StartPending,
+                ServiceControlAccept::empty(),
+                START_PENDING_WAIT_HINT,
+            ),
+            LifecycleState::Running => (
+                ServiceState::Running,
+                ServiceControlAccept::STOP,
+                Duration::from_secs(5),
+            ),
+            // The wait hint is this process's own grace window, not the SCM's
+            // 30 s default: the decision to abort or to finish belongs here.
+            LifecycleState::StopPending => (
+                ServiceState::StopPending,
+                ServiceControlAccept::empty(),
+                GRACEFUL_STOP_TIMEOUT,
+            ),
+            LifecycleState::Stopped => (
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                Duration::from_secs(0),
+            ),
+        };
+        let exit_code = if report.exit_code == 0 {
+            ServiceExitCode::NO_ERROR
+        } else {
+            ServiceExitCode::ServiceSpecific(report.exit_code)
+        };
+        self.handle
+            .set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: state,
+                controls_accepted: controls,
+                exit_code,
+                checkpoint: report.checkpoint,
+                wait_hint,
+                process_id: None,
+            })
+            .context("failed to report the service status")
+    }
+}
+
+/// Describe how the server task ended, for the failure log and the SCM record.
+fn describe_join(
+    result: std::result::Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> String {
+    match result {
+        Ok(Ok(())) => "server returned without a stop request".to_string(),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(e) => format!("server task failed: {e}"),
+    }
+}
+
 fn run_service() -> Result<()> {
     let service_name = SERVICE_NAME
         .get()
@@ -213,11 +286,14 @@ fn run_service() -> Result<()> {
         .unwrap_or_else(|| "leshy".to_string());
     let config_path = SERVICE_CONFIG.get().cloned().flatten();
 
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    // Stop requests are stateful: a stop that arrives before the server has
+    // installed its shutdown future is still observed when the future runs.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let stop_from_scm = stop_tx.clone();
     let event_handler = move |control_event: ServiceControl| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
-                let _ = stop_tx.send(());
+                let _ = stop_from_scm.send(true);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -226,8 +302,12 @@ fn run_service() -> Result<()> {
     };
     let status_handle = service_control_handler::register(&service_name, event_handler)
         .context("failed to register the service control handler")?;
-
-    report_status(&status_handle, ServiceState::StartPending, 1)?;
+    let mut lifecycle = LifecycleCoordinator::start_pending(ScmStatusSink {
+        handle: status_handle,
+    })?;
+    // Subscribed immediately so no stop request can fall between the handler
+    // registration and the running phase.
+    let mut stop_wait = stop_tx.subscribe();
 
     // stdout/stderr are invisible under the SCM, so service logs go to a
     // rolling file next to the config (C:\ProgramData\leshy\logs by default).
@@ -237,57 +317,102 @@ fn run_service() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build the tokio runtime")?;
+
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<()>();
     let server_task = runtime.spawn(async move {
-        if let Err(e) = crate::server::run_server(config_path).await {
-            tracing::error!(error = %e, "Leshy server exited with an error");
-        }
-    });
-
-    report_status(&status_handle, ServiceState::Running, 0)?;
-
-    // Wait for a stop request or an unexpected server exit.
-    loop {
-        match stop_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(()) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if server_task.is_finished() {
+        let shutdown = async move {
+            let mut stop = stop_rx;
+            while !*stop.borrow() {
+                if stop.changed().await.is_err() {
                     break;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let ready = move || {
+            // A readiness notification that arrives after the SCM gave up is
+            // harmless: the receiving side is gone, the state machine decides.
+            let _ = ready_tx.send(());
+        };
+        crate::server::run_server_until_with_ready(config_path, shutdown, ready).await
+    });
+
+    let outcome: Result<()> = runtime.block_on(async move {
+        let mut server_task = server_task;
+        // StartPending until config, writer lease, static routes and the DNS
+        // socket are done. A server that dies here never reports Running.
+        let became_ready = tokio::select! {
+            ready = &mut ready_rx => ready.is_ok(),
+            early = &mut server_task => {
+                let detail = describe_join(early);
+                lifecycle.finish(StopReason::FailedBeforeReady)?;
+                anyhow::bail!("Leshy exited before readiness: {detail}");
+            }
+        };
+        if !became_ready {
+            // Readiness sender dropped without a notification: the server is
+            // already unwinding, and it never served a query.
+            let early = (&mut server_task).await;
+            let detail = describe_join(early);
+            lifecycle.finish(StopReason::FailedBeforeReady)?;
+            anyhow::bail!("Leshy exited before readiness: {detail}");
         }
-    }
+        lifecycle.mark_ready()?;
+        tracing::info!("Leshy service is ready; reporting Running to the SCM");
 
-    report_status(&status_handle, ServiceState::StopPending, 1)?;
-    server_task.abort();
-    // Abort cancels at the next await point inside the server; kernel routes
-    // installed so far persist, matching the Linux/macOS stop behavior.
-    let _ = runtime.block_on(server_task);
-    report_status(&status_handle, ServiceState::Stopped, 0)?;
-    Ok(())
-}
+        // Running until a stop request or an unexpected server exit.
+        if !*stop_wait.borrow() {
+            tokio::select! {
+                _ = stop_wait.changed() => {}
+                early = &mut server_task => {
+                    let detail = describe_join(early);
+                    lifecycle.finish(StopReason::EarlyExit)?;
+                    anyhow::bail!("Leshy server exited while running: {detail}");
+                }
+            }
+        }
 
-fn report_status(
-    handle: &windows_service::service_control_handler::ServiceStatusHandle,
-    state: ServiceState,
-    checkpoint: u32,
-) -> Result<()> {
-    let (controls, wait_hint) = match state {
-        ServiceState::Running => (ServiceControlAccept::STOP, Duration::from_secs(5)),
-        ServiceState::Stopped => (ServiceControlAccept::empty(), Duration::from_secs(0)),
-        _ => (ServiceControlAccept::empty(), Duration::from_secs(30)),
-    };
-    handle
-        .set_service_status(ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: controls,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint,
-            wait_hint,
-            process_id: None,
-        })
-        .context("failed to report the service status")
+        lifecycle.begin_stop()?;
+        tracing::info!(
+            timeout_s = GRACEFUL_STOP_TIMEOUT.as_secs(),
+            "Stop requested; draining the Leshy server"
+        );
+
+        match tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, &mut server_task).await {
+            Ok(Ok(Ok(()))) => {
+                tracing::info!("Leshy server stopped cleanly");
+                lifecycle.finish(StopReason::Graceful)?;
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::error!(error = %e, "Leshy server reported an error while stopping");
+                lifecycle.finish(StopReason::GracefulWithError)?;
+                Err(e)
+            }
+            Ok(Err(join_error)) => {
+                tracing::error!(error = %join_error, "Leshy server task failed while stopping");
+                lifecycle.finish(StopReason::GracefulWithError)?;
+                Err(anyhow::anyhow!("Leshy server task failed: {join_error}"))
+            }
+            Err(_) => {
+                // Production Plan C4: the grace window owns the outcome. The
+                // task is aborted only after the bounded graceful attempt.
+                tracing::error!(
+                    timeout_s = GRACEFUL_STOP_TIMEOUT.as_secs(),
+                    "Grace window expired; aborting the Leshy server"
+                );
+                server_task.abort();
+                let _ = server_task.await;
+                lifecycle.finish(StopReason::ForcedAbort)?;
+                anyhow::bail!(
+                    "Leshy did not stop within {}s; forced abort",
+                    GRACEFUL_STOP_TIMEOUT.as_secs()
+                )
+            }
+        }
+    });
+
+    drop(runtime);
+    outcome
 }
 
 /// Install a file-based tracing subscriber for service mode and return the
