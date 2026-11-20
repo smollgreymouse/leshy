@@ -40,10 +40,10 @@ enum Command {
 /// Every managed-routing capability this build advertises (08D1 §31.5).
 ///
 /// Stable, sorted and side-effect free: the command performs no config load,
-/// socket connect, DNS bind or route mutation.
-pub const SUPPORTED_CAPABILITIES: [&str; 4] = [
+/// socket connect, DNS bind or route mutation. The managed wire is v2-only:
+/// the legacy `managed_selected_routes_v1` capability is not advertised.
+pub const SUPPORTED_CAPABILITIES: [&str; 3] = [
     "af_unix_control",
-    "managed_selected_routes_v1",
     "managed_selected_routes_v2",
     "privileged_control_auth_v1",
 ];
@@ -160,7 +160,7 @@ mod cli_tests {
     fn capabilities_json_is_stable_and_sorted() {
         assert_eq!(
             capabilities_json(),
-            r#"["af_unix_control","managed_selected_routes_v1","managed_selected_routes_v2","privileged_control_auth_v1"]"#
+            r#"["af_unix_control","managed_selected_routes_v2","privileged_control_auth_v1"]"#
         );
     }
 

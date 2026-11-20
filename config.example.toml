@@ -45,7 +45,11 @@ cache_negative_ttl = 30
 # - "kikimora": Kikimora is the single route writer; Leshy only sends route
 #   intents over its control socket and never touches the local FIB, with no
 #   fallback to the local writer. Enable this only when the Kikimora core
-#   advertises the `managed_selected_routes_v1` capability.
+#   advertises the `managed_selected_routes_v2` and
+#   `privileged_control_auth_v1` capabilities; the generated config must then
+#   also set kikimora_auth_file plus the schema-2 activation identity
+#   (kikimora_activation_id / kikimora_mode_generation). The legacy
+#   `managed_selected_routes_v1` wire is no longer supported.
 # routing_backend = "local"
 # kikimora_socket = "/run/kikimora/core.sock"
 

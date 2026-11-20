@@ -25,7 +25,7 @@ fn capabilities_json_is_side_effect_free_and_exact() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "[\"af_unix_control\",\"managed_selected_routes_v1\",\"managed_selected_routes_v2\",\"privileged_control_auth_v1\"]"
+        "[\"af_unix_control\",\"managed_selected_routes_v2\",\"privileged_control_auth_v1\"]"
     );
 }
 
@@ -44,7 +44,6 @@ fn capabilities_plain_output_is_sorted_lines() {
         lines,
         vec![
             "af_unix_control",
-            "managed_selected_routes_v1",
             "managed_selected_routes_v2",
             "privileged_control_auth_v1",
         ]

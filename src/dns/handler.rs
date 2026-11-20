@@ -1295,7 +1295,7 @@ route_target = "192.0.2.1"
     #[tokio::test]
     async fn managed_controller_denial_is_servfail_even_with_fallback_configured() {
         use crate::routing::kikimora::{
-            fake::{applied_result, FakeTransport},
+            fake::{applied_result, test_identity, FakeTransport},
             KikimoraRouteBackend,
         };
 
@@ -1306,7 +1306,10 @@ route_target = "192.0.2.1"
         result.state = "denied".to_string();
         transport.set_result(result);
 
-        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            test_identity(),
+        );
         let config = e2e_config(
             RouteFailureMode::Fallback,
             crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
@@ -1335,7 +1338,10 @@ route_target = "192.0.2.1"
 
     #[tokio::test]
     async fn controller_family_not_ready_denial_suppresses_aaaa_with_nodata() {
-        use crate::routing::kikimora::{fake::FakeTransport, KikimoraRouteBackend};
+        use crate::routing::kikimora::{
+            fake::{test_identity, FakeTransport},
+            KikimoraRouteBackend,
+        };
 
         // The controller denies the AAAA intent with the family-not-ready
         // marker: the answer proceeds without AAAA (NODATA) instead of
@@ -1350,7 +1356,10 @@ route_target = "192.0.2.1"
             4,
         ));
 
-        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            test_identity(),
+        );
         let mut config = e2e_config(
             RouteFailureMode::Servfail,
             crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,
@@ -1383,7 +1392,10 @@ route_target = "192.0.2.1"
 
     #[tokio::test]
     async fn controller_capacity_denial_still_servfails_aaaa() {
-        use crate::routing::kikimora::{fake::FakeTransport, KikimoraRouteBackend};
+        use crate::routing::kikimora::{
+            fake::{test_identity, FakeTransport},
+            KikimoraRouteBackend,
+        };
 
         // A non-family denial (capacity) stays a fail-closed SERVFAIL: only the
         // family-not-ready marker suppresses with NODATA.
@@ -1397,7 +1409,10 @@ route_target = "192.0.2.1"
             4,
         ));
 
-        let backend = KikimoraRouteBackend::with_test_transport(Box::new(Arc::clone(&transport)));
+        let backend = KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(&transport)),
+            test_identity(),
+        );
         let mut config = e2e_config(
             RouteFailureMode::Fallback,
             crate::routing::DEFAULT_MAX_DYNAMIC_ROUTES,

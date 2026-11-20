@@ -91,10 +91,13 @@ pub struct ServerConfig {
 
     /// Controller-managed activation identity (schema-2 marker, 08D1 §31.4).
     ///
-    /// When this and `kikimora_mode_generation` are both present, Leshy
-    /// speaks the `managed_selected_routes_v2` protocol: every route intent
-    /// carries this exact ActivationID so a stale Leshy cannot mutate routes
-    /// after Disable/re-Enable. A missing pair keeps the legacy v1 wire shape.
+    /// Required for `routing_backend = "kikimora"`: together with
+    /// `kikimora_mode_generation` it makes Leshy speak the
+    /// `managed_selected_routes_v2` protocol — every route intent carries
+    /// this exact ActivationID so a stale Leshy cannot mutate routes after
+    /// Disable/re-Enable. A kikimora config without the pair is a config
+    /// error (the legacy `managed_selected_routes_v1` wire is no longer
+    /// supported; regenerate the installation).
     #[serde(default)]
     pub kikimora_activation_id: Option<String>,
 
@@ -441,14 +444,15 @@ impl Config {
             );
         }
 
-        // Schema-2 activation identity (08D1 §31.4). The pair is either
-        // entirely absent (legacy v1 managed config) or entirely present
-        // (managed_selected_routes_v2); half a fence is a config error.
+        // Schema-2 activation identity (08D1 §31.4). The managed kikimora
+        // backend speaks `managed_selected_routes_v2` only: the complete
+        // ActivationID/ModeGeneration fence is REQUIRED, and a config without
+        // it is a configuration error. Historical v1 configs (absent pair)
+        // must be regenerated; half a fence is still a config error.
         match (
             self.server.kikimora_activation_id.as_deref(),
             self.server.kikimora_mode_generation,
         ) {
-            (None, None) => {}
             (Some(activation_id), Some(mode_generation)) => {
                 if self.server.routing_backend != RoutingBackend::Kikimora {
                     anyhow::bail!(
@@ -485,6 +489,15 @@ impl Config {
                     anyhow::bail!(
                         "managed_selected_routes_v2 requires kikimora_auth_file \
                          (privileged_control_auth_v1 service credential)"
+                    );
+                }
+            }
+            (None, None) => {
+                if self.server.routing_backend == RoutingBackend::Kikimora {
+                    anyhow::bail!(
+                        "the managed kikimora config requires the schema-2 activation identity: \
+                         set kikimora_activation_id and kikimora_mode_generation \
+                         (the legacy managed_selected_routes_v1 wire is no longer supported)"
                     );
                 }
             }
@@ -898,7 +911,10 @@ domains = ["example.com"]
     }
 
     #[test]
-    fn managed_backend_with_socket_is_valid() {
+    fn managed_backend_requires_the_schema2_activation_identity() {
+        // The legacy v1 managed config (no activation fence) is gone: a
+        // kikimora backend without the complete schema-2 identity is a
+        // configuration failure.
         let config: Config = toml::from_str(
             r#"
 [server]
@@ -915,8 +931,11 @@ domains = ["example.com"]
 "#,
         )
         .unwrap();
-        config.validate().unwrap();
-        assert_eq!(config.server.routing_backend, RoutingBackend::Kikimora);
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("schema-2 activation identity"),
+            "missing schema-2 identity must fail closed: {err}"
+        );
     }
 
     #[test]

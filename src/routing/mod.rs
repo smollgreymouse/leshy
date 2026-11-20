@@ -805,9 +805,12 @@ mod tests {
     }
 
     fn managed_backend(transport: &Arc<FakeTransport>) -> Arc<KikimoraRouteBackend> {
-        Arc::new(KikimoraRouteBackend::with_test_transport(Box::new(
-            Arc::clone(transport),
-        )))
+        // The managed wire is v2-only: even the generic route-manager
+        // fixtures construct the required schema-2 activation identity.
+        Arc::new(KikimoraRouteBackend::with_test_transport_identity(
+            Box::new(Arc::clone(transport)),
+            crate::routing::kikimora::fake::test_identity(),
+        ))
     }
 
     #[test]
@@ -1464,6 +1467,8 @@ listen_address = "127.0.0.1:5399"
 default_upstream = ["127.0.0.1:5300"]
 routing_backend = "kikimora"
 kikimora_socket = "leshy-l14-absent.sock"
+kikimora_activation_id = "0123456789abcdef0123456789abcdef"
+kikimora_mode_generation = 7
 "#,
         )
         .unwrap();
@@ -1511,8 +1516,8 @@ kikimora_socket = "leshy-l14-absent.sock"
                 kikimora_socket: Some("leshy-l14-test.sock".to_string()),
                 writer_lock: None,
                 kikimora_auth_file: None,
-                kikimora_activation_id: None,
-                kikimora_mode_generation: None,
+                kikimora_activation_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                kikimora_mode_generation: Some(7),
             },
             zones: vec![zone.clone()],
         };
@@ -1535,6 +1540,8 @@ listen_address = "127.0.0.1:5399"
 default_upstream = ["127.0.0.1:5300"]
 routing_backend = "kikimora"
 kikimora_socket = "/run/kikimora/core.sock"
+kikimora_activation_id = "0123456789abcdef0123456789abcdef"
+kikimora_mode_generation = 7
 max_dynamic_routes = 100
 "#,
         )
