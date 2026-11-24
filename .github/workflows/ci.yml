@@ -77,12 +77,19 @@ jobs:
       - name: Resolve privileged acceptance binaries
         id: netns_bins
         run: |
-          REGISTRY_BIN="$(ls -t target/debug/deps/linux_route_registry_netns-* | grep -v '\.d$' | head -1)"
-          MONITOR_BIN="$(ls -t target/debug/deps/netns_monitor_probe-* | grep -v '\.d$' | head -1)"
+          # Cargo may place a test executable outside target/debug/deps
+          # (newer toolchains use target/debug/build/<pkg>/<hash>/out).
+          # Read the exact path from Cargo's JSON instead of globbing.
+          cargo test --test linux_route_registry_netns --no-run \
+            --message-format=json > netns-registry-build.json
+          cargo test --test netns_monitor_probe --no-run \
+            --message-format=json > netns-monitor-build.json
+          REGISTRY_BIN="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "linux_route_registry_netns" and .executable != null) | .executable' netns-registry-build.json | tail -1)"
+          MONITOR_BIN="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "netns_monitor_probe" and .executable != null) | .executable' netns-monitor-build.json | tail -1)"
           test -x "$REGISTRY_BIN"
           test -x "$MONITOR_BIN"
-          echo "registry=$PWD/$REGISTRY_BIN" >> "$GITHUB_OUTPUT"
-          echo "monitor=$PWD/$MONITOR_BIN" >> "$GITHUB_OUTPUT"
+          echo "registry=$REGISTRY_BIN" >> "$GITHUB_OUTPUT"
+          echo "monitor=$MONITOR_BIN" >> "$GITHUB_OUTPUT"
 
       - name: Verify required privileged tests are present
         env:
@@ -130,11 +137,14 @@ jobs:
         id: sigterm_bins
         run: |
           LESHY_BIN="$PWD/target/debug/leshy"
-          GATE_BIN="$(ls -t target/debug/deps/linux_sigterm_cleanup-* | grep -v '\.d$' | head -1)"
+          # Same Cargo-layout tolerance as the netns binaries above.
+          cargo test --test linux_sigterm_cleanup --no-run \
+            --message-format=json > sigterm-build.json
+          GATE_BIN="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "linux_sigterm_cleanup" and .executable != null) | .executable' sigterm-build.json | tail -1)"
           test -x "$LESHY_BIN"
           test -x "$GATE_BIN"
           echo "leshy=$LESHY_BIN" >> "$GITHUB_OUTPUT"
-          echo "gate=$PWD/$GATE_BIN" >> "$GITHUB_OUTPUT"
+          echo "gate=$GATE_BIN" >> "$GITHUB_OUTPUT"
 
       - name: Run privileged SIGTERM acceptance
         env:
